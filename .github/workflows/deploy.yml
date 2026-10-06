@@ -1,0 +1,30 @@
+# MedUnderwrite AI — GitHub Actions CI/CD
+# Owner: Persona B (Day 2 PM)
+# TODO: implement per developer guide Section 2 (.github/workflows/deploy.yml)
+#
+# Behaviour:
+#   - On push to main: run all backend tests
+#   - On success: SSH deploy to EC2 (docker-compose up --build)
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO (Persona B): add Python setup, pip install, pytest steps
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      # TODO (Persona B): add SSH deploy to EC2 step

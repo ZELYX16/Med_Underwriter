@@ -1,0 +1,72 @@
+{
+  "_comment": "MedUnderwrite AI — Sample API Responses for all 3 demo scenarios",
+  "_note": "Persona A (Day 2 AM) replaces these with real outputs from test_demos.py",
+
+  "maria_simple": {
+    "success": true,
+    "data": {
+      "case_id": "UW-2026-H-MARIA",
+      "processing_status": "complete",
+      "applicant_profile": {
+        "demographics": { "age": 34, "gender": "F", "region": "DE-Munich" },
+        "icd10_codes": [],
+        "risk_flags": []
+      },
+      "agent2_risk_score": 18,
+      "agent2_recommendation": "accept",
+      "agent2_loading": 0.0,
+      "agent2_confidence": 0.96,
+      "routing_path": "standard",
+      "reasoning_pattern": "plan_and_execute",
+      "final_decision": {
+        "decision": "ACCEPT",
+        "monthly_premium_eur": 240,
+        "base_premium_eur": 240,
+        "loading_pct": 0,
+        "reasoning": "TODO: replace with real Agent 3 output",
+        "confidence": 0.96
+      },
+      "audit_trail": []
+    },
+    "error": null
+  },
+
+  "klaus_complex": {
+    "success": true,
+    "data": {
+      "case_id": "UW-2026-H-KLAUS",
+      "processing_status": "human_review",
+      "agent2_risk_score": 74,
+      "agent2_recommendation": "accept_with_loading",
+      "agent2_loading": 0.40,
+      "agent2_confidence": 0.82,
+      "routing_path": "complex",
+      "reasoning_pattern": "tree_of_thought",
+      "reflection_mode": "full_mar",
+      "reflection_round": 2,
+      "final_decision": {
+        "decision": "ACCEPT_WITH_MODIFICATION",
+        "monthly_premium_eur": 403,
+        "base_premium_eur": 288,
+        "loading_pct": 40,
+        "reasoning": "TODO: replace with real Agent 3 output",
+        "confidence": 0.91
+      },
+      "audit_trail": []
+    },
+    "error": null
+  },
+
+  "stefan_high_risk": {
+    "success": true,
+    "data": {
+      "case_id": "UW-2026-H-STEFAN",
+      "processing_status": "escalated",
+      "routing_path": "hitl_fast_track",
+      "require_human_escalation": true,
+      "final_decision": null,
+      "audit_trail": []
+    },
+    "error": null
+  }
+}

@@ -1,0 +1,25 @@
+# MedUnderwrite AI — AWS CloudFormation Infrastructure
+# Owner: Persona B (Day 2 PM) — optional, for production
+# TODO: define EC2 instance, security groups, and IAM roles for production deployment
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MedUnderwrite AI — AWS infrastructure (optional production setup)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type
+
+Resources:
+  # TODO (Persona B): define EC2 instance, security groups, key pair, IAM role
+  MedUnderwriteInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      # TODO: ImageId, SecurityGroups, KeyName, UserData
+
+Outputs:
+  PublicIP:
+    Description: Public IP of the deployed instance
+    Value: !GetAtt MedUnderwriteInstance.PublicIp
