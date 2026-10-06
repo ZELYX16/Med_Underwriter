@@ -60,7 +60,7 @@ async def underwrite(
         )
 
     except Exception as exc:
-        state_store.update_status(
+        state_store.update_case_status(
             case_id=case_id,
             status="failed",
         )
@@ -259,10 +259,9 @@ async def human_review(
 
     state_store.save_human_review(
         case_id=case_id,
-        reviewer_id=request.reviewer_id,
+        reviewer=request.reviewer_id,
         approved=request.approved,
-        comments=request.comments,
-        decision=request.decision,
+        notes=request.comments or (request.decision or ""),
     )
 
     state_store.save_case(

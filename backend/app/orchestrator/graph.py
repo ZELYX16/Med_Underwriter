@@ -62,7 +62,7 @@ def intake_node(
     }
 
 
-def agent1_node(
+async def agent1_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
     applicant_profile = state.get(
@@ -75,7 +75,7 @@ def agent1_node(
         {},
     )
 
-    result = submission_agent.run(
+    result = await submission_agent.run(
         applicant_profile=applicant_profile,
         submission=submission,
     )
@@ -638,7 +638,7 @@ def build_graph():
     )
 
     graph.add_node(
-        "confidence_gate",
+        "evaluate_confidence",
         confidence_gate_node,
     )
 
@@ -679,11 +679,11 @@ def build_graph():
 
     graph.add_edge(
         "agent2_risk",
-        "confidence_gate",
+        "evaluate_confidence",
     )
 
     graph.add_conditional_edges(
-        "confidence_gate",
+        "evaluate_confidence",
         reflection_router,
         {
             "reflection": "agent3_reflection",

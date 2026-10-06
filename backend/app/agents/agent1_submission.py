@@ -49,6 +49,7 @@ class SubmissionIntelligenceAgent:
     def _retrieve_applicant_evidence(
         self,
         applicant_id: str,
+        query: str = "medical examination health history claims policy",
     ) -> dict[str, list[dict[str, Any]]]:
         if not applicant_id:
             return {
@@ -60,16 +61,20 @@ class SubmissionIntelligenceAgent:
 
         return {
             "medical": retriever.retrieve_medical_evidence(
-                applicant_id=applicant_id
+                applicant_id=applicant_id,
+                query=f"medical examination health record {query}",
             ),
             "claims": retriever.retrieve_claims_evidence(
-                applicant_id=applicant_id
+                applicant_id=applicant_id,
+                query=f"insurance claim history hospitalization {query}",
             ),
             "policy": retriever.retrieve_policy_evidence(
-                applicant_id=applicant_id
+                applicant_id=applicant_id,
+                query=f"existing policy coverage terms {query}",
             ),
             "underwriting": retriever.retrieve_underwriting_submission(
-                applicant_id=applicant_id
+                applicant_id=applicant_id,
+                query=f"underwriting submission proposal {query}",
             ),
         }
 

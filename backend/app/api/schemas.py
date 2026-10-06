@@ -16,6 +16,34 @@ class UnderwriteRequest(BaseModel):
         default_factory=dict
     )
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "case_id": "UW-TEST-001",
+                "applicant_profile": {
+                    "applicant_id": "APP-TEST-001",
+                    "name": "Priya Menon",
+                    "age": 31,
+                    "gender": "F",
+                    "occupation": "Software Engineer",
+                    "bmi": 22.4,
+                    "medical_conditions": [],
+                    "medications": [],
+                    "lifestyle": {
+                        "smoker": False,
+                        "alcohol": "occasional"
+                    }
+                },
+                "submission": {
+                    "product": "Comprehensive Health Plan",
+                    "sum_insured": 500000,
+                    "policy_term_years": 1,
+                    "declared_pre_existing_conditions": []
+                }
+            }
+        }
+    }
+
 
 class UnderwriteResponse(BaseModel):
     case_id: str

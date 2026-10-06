@@ -305,26 +305,42 @@ complexity=<simple|standard|complex>
 
     @staticmethod
     def _get_list(
-        source: dict[str, Any],
+        source: Any,
         key: str,
     ) -> list[Any]:
-        value = source.get(key, [])
+        if isinstance(source, list):
+            items = []
+            for item in source:
+                if isinstance(item, dict) and key in item:
+                    val = item[key]
+                    if isinstance(val, list):
+                        items.extend(val)
+                    else:
+                        items.append(val)
+            return items
 
-        return value if isinstance(value, list) else []
+        if isinstance(source, dict):
+            value = source.get(key, [])
+            return value if isinstance(value, list) else []
+
+        return []
 
     @staticmethod
     def _get_claim_records(
-        claims: dict[str, Any],
+        claims: Any,
     ) -> list[Any]:
-        for key in (
-            "claims",
-            "claim_records",
-            "records",
-        ):
-            value = claims.get(key)
+        if isinstance(claims, list):
+            return claims
 
-            if isinstance(value, list):
-                return value
+        if isinstance(claims, dict):
+            for key in (
+                "claims",
+                "claim_records",
+                "records",
+            ):
+                value = claims.get(key)
+                if isinstance(value, list):
+                    return value
 
         return []
 
