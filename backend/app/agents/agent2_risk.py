@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 from app.config import settings
@@ -108,13 +109,14 @@ class RiskAssessmentAgent:
             {},
         )
 
-        claims = submission.get(
-            "claims",
-            [],
+        claims = (
+            submission.get("claims", [])
+            or enrichment_results.get("claims_evidence", [])
         )
 
-        existing_policy = submission.get(
-            "existing_policy"
+        existing_policy = (
+            submission.get("existing_policy")
+            or (enrichment_results.get("policy_evidence", [{}])[0] if enrichment_results.get("policy_evidence") else None)
         )
 
         coverage_gaps = enrichment_results.get(
@@ -122,34 +124,44 @@ class RiskAssessmentAgent:
             [],
         )
 
+        conditions = (
+            applicant_profile.get("medical_conditions", [])
+            or submission.get("declared_pre_existing_conditions", [])
+            or medical.get("conditions", [])
+        )
+
+        medications = (
+            applicant_profile.get("medications", [])
+            or medical.get("medications", [])
+        )
+
+        procedures = list(medical.get("procedures", []))
+        hospitalizations = list(medical.get("hospitalizations", []))
+
+        if isinstance(enrichment_results.get("medical_evidence"), list):
+            for doc in enrichment_results.get("medical_evidence", []):
+                doc_text = doc.get("document", "") if isinstance(doc, dict) else str(doc)
+                if self._is_procedure(doc_text):
+                    procedures.append("cardiac angioplasty/stent")
+                if self._is_hospitalized(doc_text):
+                    hospitalizations.append(doc_text)
+
         return {
             "age": applicant_profile.get(
                 "age",
                 0,
             ),
-            "conditions": medical.get(
-                "conditions",
-                [],
-            ),
-            "medications": medical.get(
-                "medications",
-                [],
-            ),
-            "procedures": medical.get(
-                "procedures",
-                [],
-            ),
-            "hospitalizations": medical.get(
-                "hospitalizations",
-                [],
-            ),
+            "conditions": conditions,
+            "medications": medications,
+            "procedures": procedures,
+            "hospitalizations": hospitalizations,
             "laboratory_results": medical.get(
                 "laboratory_results",
                 [],
             ),
-            "lifestyle": medical.get(
+            "lifestyle": applicant_profile.get(
                 "lifestyle",
-                {},
+                medical.get("lifestyle", {}),
             ),
             "claims": claims,
             "claim_count": len(claims),
@@ -233,6 +245,7 @@ Do not make a final medical diagnosis.
 Do not create unsupported claims.
 Do not treat a medical event as an insurance claim unless
 claim evidence is present.
+Do not attribute conditions from general medical knowledge or guidelines to the applicant unless confirmed in the applicant's medical report or declared conditions.
 """
 
         response = self.llm.invoke(prompt)
@@ -369,10 +382,8 @@ claim evidence is present.
         )
 
         sum_insured = float(
-            request.get(
-                "sum_insured",
-                0,
-            )
+            submission.get("sum_insured")
+            or request.get("sum_insured", 0)
             or 0
         )
 
@@ -382,9 +393,12 @@ claim evidence is present.
 
         base_rate = self._get_base_rate(
             sum_insured=sum_insured,
-            policy_term_years=request.get(
-                "policy_term_years",
-                1,
+            policy_term_years=int(
+                submission.get(
+                    "policy_term_years",
+                    request.get("policy_term_years", 1),
+                )
+                or 1
             ),
         )
 
@@ -488,7 +502,7 @@ claim evidence is present.
                 ),
             }
 
-        if score >= 45:
+        if score >= 30 or float(pricing.get("loading_percentage", 0) or 0) > 0:
             return {
                 "decision": "accept_with_loading",
                 "reason": (
@@ -516,21 +530,32 @@ claim evidence is present.
             {},
         )
 
-        document_count = sum(
+        doc_count_summary = sum(
             int(value or 0)
             for key, value in evidence_summary.items()
-            if key.endswith("_documents")
+            if (key.endswith("_documents") or key.endswith("_records_count") or key.endswith("_count"))
+            and isinstance(value, (int, float))
         )
+
+        doc_count_direct = (
+            len(enrichment_results.get("medical_evidence", []))
+            + len(enrichment_results.get("claims_evidence", []))
+            + len(enrichment_results.get("policy_evidence", []))
+        )
+
+        document_count = max(doc_count_summary, doc_count_direct)
 
         confidence = 0.55
 
-        if document_count >= 3:
+        if document_count >= 2:
             confidence += 0.15
 
-        if document_count >= 6:
+        if document_count >= 5:
             confidence += 0.10
 
         if enrichment_results.get(
+            "medical_evidence",
+        ) or enrichment_results.get(
             "medical_knowledge",
         ):
             confidence += 0.05
@@ -604,6 +629,34 @@ claim evidence is present.
                 )
 
         return values
+
+    @staticmethod
+    def _is_hospitalized(text: str) -> bool:
+        negation = re.compile(
+            r"\b(no|denies|without|none|zero|negative for)\b(?:\s+\w+){0,3}\s+\b(hospitalization|hospitalized|admission|admitted)\b",
+            re.IGNORECASE,
+        )
+        if negation.search(text):
+            return False
+        positive = re.compile(
+            r"\b(hospitalization|hospitalized|admission|admitted)\b",
+            re.IGNORECASE,
+        )
+        return bool(positive.search(text))
+
+    @staticmethod
+    def _is_procedure(text: str) -> bool:
+        negation = re.compile(
+            r"\b(no|denies|without|none|zero|negative for)\b(?:\s+\w+){0,3}\s+\b(angioplasty|stent|surgery|bypass|procedure)\b",
+            re.IGNORECASE,
+        )
+        if negation.search(text):
+            return False
+        positive = re.compile(
+            r"\b(angioplasty|stent|surgery|bypass)\b",
+            re.IGNORECASE,
+        )
+        return bool(positive.search(text))
 
 
 risk_agent = RiskAssessmentAgent()

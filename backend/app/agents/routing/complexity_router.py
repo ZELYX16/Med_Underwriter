@@ -1,3 +1,4 @@
+import re
 from typing import Any, Literal
 
 from app.llm.factory import get_llm
@@ -72,20 +73,25 @@ class ComplexityRouter:
             [],
         )
 
-        conditions = self._get_list(
-            medical,
-            "conditions",
+        conditions = (
+            applicant_profile.get("medical_conditions", [])
+            or self._get_list(medical, "conditions")
         )
 
-        medications = self._get_list(
-            medical,
-            "medications",
+        medications = (
+            applicant_profile.get("medications", [])
+            or self._get_list(medical, "medications")
         )
 
         hospitalizations = self._get_list(
             medical,
             "hospitalizations",
         )
+        if not hospitalizations and isinstance(medical, list):
+            for doc in medical:
+                text = doc.get("document", "") if isinstance(doc, dict) else str(doc)
+                if self._is_hospitalized(text) or self._is_procedure(text):
+                    hospitalizations.append(text)
 
         claim_records = self._get_claim_records(
             claims
@@ -395,6 +401,34 @@ complexity=<simple|standard|complex>
             term in hospitalization_text
             for term in procedure_terms
         )
+
+    @staticmethod
+    def _is_hospitalized(text: str) -> bool:
+        negation = re.compile(
+            r"\b(no|denies|without|none|zero|negative for)\b(?:\s+\w+){0,3}\s+\b(hospitalization|hospitalized|admission|admitted)\b",
+            re.IGNORECASE,
+        )
+        if negation.search(text):
+            return False
+        positive = re.compile(
+            r"\b(hospitalization|hospitalized|admission|admitted)\b",
+            re.IGNORECASE,
+        )
+        return bool(positive.search(text))
+
+    @staticmethod
+    def _is_procedure(text: str) -> bool:
+        negation = re.compile(
+            r"\b(no|denies|without|none|zero|negative for)\b(?:\s+\w+){0,3}\s+\b(angioplasty|stent|surgery|bypass|procedure)\b",
+            re.IGNORECASE,
+        )
+        if negation.search(text):
+            return False
+        positive = re.compile(
+            r"\b(angioplasty|stent|surgery|bypass)\b",
+            re.IGNORECASE,
+        )
+        return bool(positive.search(text))
 
 
 complexity_router = ComplexityRouter()

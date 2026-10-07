@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.rag.agentic_rag import agentic_rag
+from app.rag.crag import crag
 from app.rag.hybrid_rag import hybrid_rag
 from app.rag.medgraph_rag import medgraph_rag
 from app.rag.retriever import retriever
@@ -38,11 +39,21 @@ class SubmissionIntelligenceAgent:
 
         queries = [
             f"medical underwriting evidence for applicant {applicant_id}",
-            f"medical conditions {conditions}",
-            f"medications {medications}",
-            f"underwriting requirements for {submission.get('product', '')}",
-            "health insurance underwriting regulatory requirements India IRDAI",
         ]
+
+        if conditions:
+            cond_str = ", ".join(conditions) if isinstance(conditions, list) else str(conditions)
+            queries.append(f"medical conditions {cond_str}")
+
+        if medications:
+            med_str = ", ".join(medications) if isinstance(medications, list) else str(medications)
+            queries.append(f"medications {med_str}")
+
+        product = submission.get("product", "")
+        if product:
+            queries.append(f"underwriting requirements for {product}")
+
+        queries.append("health insurance underwriting regulatory requirements India IRDAI")
 
         return [query for query in queries if query.strip()]
 
@@ -92,16 +103,33 @@ class SubmissionIntelligenceAgent:
             submission,
         )
 
+        conditions = applicant_profile.get("medical_conditions", [])
+        medications = applicant_profile.get("medications", [])
+
         medical_knowledge: list[dict[str, Any]] = []
 
-        for query in medical_queries[:3]:
-            try:
-                results = medgraph_rag.search_medical_knowledge(
-                    query=query
-                )
-                medical_knowledge.extend(results)
-            except Exception:
-                continue
+        if conditions or medications:
+            concept_queries = []
+            if conditions:
+                cond_str = ", ".join(conditions) if isinstance(conditions, list) else str(conditions)
+                concept_queries.append(f"medical conditions {cond_str}")
+            if medications:
+                med_str = ", ".join(medications) if isinstance(medications, list) else str(medications)
+                concept_queries.append(f"medications {med_str}")
+
+            for query in concept_queries:
+                try:
+                    results = medgraph_rag.search_medical_knowledge(
+                        query=query
+                    )
+                    if isinstance(results, dict):
+                        medical_knowledge.extend(
+                            results.get("results", [])
+                        )
+                    elif isinstance(results, list):
+                        medical_knowledge.extend(results)
+                except Exception:
+                    continue
 
         regulatory_evidence: list[dict[str, Any]] = []
 
@@ -129,29 +157,27 @@ class SubmissionIntelligenceAgent:
         except Exception:
             underwriting_evidence = []
 
-        coverage_gaps: list[dict[str, Any]] = []
-
+        crag_result: dict[str, Any] = {}
         try:
-            coverage_result = await agentic_rag.retrieve(
-                query=(
-                    f"coverage gaps and missing evidence for "
-                    f"applicant {applicant_id}"
-                ),
-                context={
-                    "applicant_id": applicant_id,
-                    "applicant_profile": applicant_profile,
-                    "submission": submission,
-                },
+            crag_result = crag.retrieve(
+                applicant_id=applicant_id,
+                query="medical examination health record claims policy",
+                applicant_profile=applicant_profile,
             )
-
-            if isinstance(coverage_result, dict):
-                coverage_gaps = coverage_result.get(
-                    "coverage_gaps",
-                    [],
-                )
-
         except Exception:
-            coverage_gaps = []
+            crag_result = {
+                "crag": {
+                    "status": "bypassed",
+                    "attempts": 0,
+                    "correction_applied": False,
+                }
+            }
+
+        coverage_gaps = self._detect_coverage_gaps(
+            applicant_profile=applicant_profile,
+            submission=submission,
+            evidence=evidence,
+        )
 
         enrichment = {
             "applicant_id": applicant_id,
@@ -163,6 +189,7 @@ class SubmissionIntelligenceAgent:
             "underwriting_evidence": underwriting_evidence,
             "medical_knowledge": medical_knowledge,
             "coverage_gaps": coverage_gaps,
+            "crag": crag_result.get("crag", {}),
             "retrieved_at": utc_now(),
         }
 
@@ -177,6 +204,53 @@ class SubmissionIntelligenceAgent:
             "coverage_gaps": coverage_gaps,
             "agent1_completed": True,
         }
+
+    def _detect_coverage_gaps(
+        self,
+        applicant_profile: dict[str, Any],
+        submission: dict[str, Any],
+        evidence: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        gaps: list[dict[str, Any]] = []
+
+        conditions = list(applicant_profile.get("medical_conditions", []))
+        declared_pre_existing = list(submission.get("declared_pre_existing_conditions", []))
+        all_conditions = list(set(conditions + declared_pre_existing))
+
+        # 1. Declared conditions but no medical examination report found
+        if all_conditions and not evidence.get("medical"):
+            gaps.append({
+                "gap_type": "missing_medical_records",
+                "severity": "high",
+                "description": f"Declared conditions ({all_conditions}) but no medical examination report was retrieved.",
+            })
+
+        # 2. Cardiac condition declared: check if cardiology notes or cardiac intervention reports exist
+        has_cardiac = any(
+            term in str(cond).lower()
+            for cond in all_conditions
+            for term in ["cardiac", "coronary", "infarction", "angioplasty", "heart"]
+        )
+        if has_cardiac:
+            med_docs = " ".join(
+                str(d.get("document", "")) for d in evidence.get("medical", [])
+            ).lower()
+            if not any(t in med_docs for t in ["cardiology", "angioplasty", "stent", "ecg", "echo"]):
+                gaps.append({
+                    "gap_type": "missing_cardiology_workup",
+                    "severity": "medium",
+                    "description": "Cardiac history declared without detailed cardiology workup or intervention records.",
+                })
+
+        # 3. Previous policy declared but no existing policy schedule retrieved
+        if submission.get("existing_policy") and not evidence.get("policy"):
+            gaps.append({
+                "gap_type": "missing_policy_schedule",
+                "severity": "low",
+                "description": "Previous policy declared but existing policy schedule could not be retrieved.",
+            })
+
+        return gaps
 
 
 submission_agent = SubmissionIntelligenceAgent()

@@ -73,8 +73,8 @@ class ApplicantRetriever:
         try:
             results = vector_store.query(
                 collection_name=self.COLLECTION_NAME,
-                query_text=query,
-                n_results=limit,
+                query=query,
+                top_k=limit,
                 where=where,
             )
         except Exception:
@@ -130,7 +130,7 @@ class ApplicantRetriever:
         return self.search_by_type(
             applicant_id=applicant_id,
             query=query,
-            document_type="claim",
+            document_type="claims",
             top_k=top_k,
         )
 
@@ -199,6 +199,9 @@ class ApplicantRetriever:
     ) -> list[dict[str, Any]]:
         if not results:
             return []
+
+        if isinstance(results, list):
+            return results
 
         documents = results.get(
             "documents",

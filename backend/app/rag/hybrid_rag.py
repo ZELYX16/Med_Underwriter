@@ -39,8 +39,8 @@ class HybridRAG:
         try:
             results = vector_store.query(
                 collection_name=collection_name,
-                query_text=query,
-                n_results=limit,
+                query=query,
+                top_k=limit,
             )
         except Exception:
             return []
@@ -53,6 +53,9 @@ class HybridRAG:
     ) -> list[dict[str, Any]]:
         if not results:
             return []
+
+        if isinstance(results, list):
+            return results
 
         documents = results.get(
             "documents",

@@ -80,3 +80,19 @@ class HumanReviewResponse(BaseModel):
     status: str
     approved: bool
     message: str
+
+
+class CaseActionRequest(BaseModel):
+    reviewer_id: str = "UW-DEFAULT"
+    comments: str = ""
+    decision: str | None = None
+    loading_percentage: float | None = None
+    final_premium: float | None = None
+
+
+class CaseActionResponse(BaseModel):
+    case_id: str
+    action: str
+    status: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)

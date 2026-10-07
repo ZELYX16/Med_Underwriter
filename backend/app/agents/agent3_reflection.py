@@ -1,5 +1,7 @@
 from typing import Any
 
+from app.agents.reflection.constitutional import constitutional_checker
+from app.agents.reflection.mar_personas import mar_personas
 from app.llm.factory import get_llm
 
 
@@ -140,6 +142,21 @@ class ReflectionAgent:
             "explainability_check": checks[
                 "explainability"
             ],
+            "constitutional_medical_accuracy": checks[
+                "medical_accuracy"
+            ],
+            "constitutional_actuarial_soundness": checks[
+                "actuarial_soundness"
+            ],
+            "constitutional_regulatory_compliance": checks[
+                "regulatory_compliance"
+            ],
+            "constitutional_fairness": checks[
+                "fairness"
+            ],
+            "constitutional_explainability": checks[
+                "explainability"
+            ],
             "reflection_verdict": verdict,
             "require_human_review": human_review_required,
             "human_review_reason": self._human_review_reason(
@@ -187,10 +204,16 @@ class ReflectionAgent:
         enrichment_results: dict[str, Any],
         risk_result: dict[str, Any],
     ) -> dict[str, Any]:
-        prompt = f"""
-You are performing a safety reflection for a medical
-insurance underwriting decision-support system.
-
+        try:
+            mar_persona = mar_personas.get(persona)
+            prompt = mar_persona.build_prompt(
+                applicant_profile=applicant_profile,
+                submission=submission,
+                evidence=enrichment_results,
+                risk_result=risk_result,
+            )
+        except Exception:
+            prompt = f"""
 Reflection persona:
 {persona}
 
@@ -475,6 +498,26 @@ the evidence provided.
                 "findings": [],
             },
             "explainability_check": {
+                "status": "not_required",
+                "findings": [],
+            },
+            "constitutional_medical_accuracy": {
+                "status": "not_required",
+                "findings": [],
+            },
+            "constitutional_actuarial_soundness": {
+                "status": "not_required",
+                "findings": [],
+            },
+            "constitutional_regulatory_compliance": {
+                "status": "not_required",
+                "findings": [],
+            },
+            "constitutional_fairness": {
+                "status": "not_required",
+                "findings": [],
+            },
+            "constitutional_explainability": {
                 "status": "not_required",
                 "findings": [],
             },

@@ -35,8 +35,8 @@ class UnderwritingGuardrails:
     ]
 
     REQUIRED_APPLICANT_FIELDS = [
-        "applicant",
-        "underwriting_request",
+        "applicant_profile",
+        "submission",
     ]
 
     def validate_submission(
@@ -52,11 +52,13 @@ class UnderwritingGuardrails:
                 errors=["Submission must be a JSON object."],
             )
 
-        for field in self.REQUIRED_APPLICANT_FIELDS:
-            if field not in submission:
-                errors.append(
-                    f"Missing required field: {field}"
-                )
+        applicant = submission.get("applicant_profile") or submission.get("applicant")
+        underwriting_request = submission.get("submission") or submission.get("underwriting_request")
+
+        if applicant is None:
+            errors.append("Missing required field: applicant_profile (or applicant)")
+        if underwriting_request is None:
+            errors.append("Missing required field: submission (or underwriting_request)")
 
         if errors:
             return GuardrailResult(
@@ -66,25 +68,27 @@ class UnderwritingGuardrails:
             )
 
         self._validate_applicant(
-            submission.get("applicant"),
+            applicant,
             errors,
         )
 
-        self._validate_medical(
-            submission.get("medical", {}),
-            errors,
-            warnings,
-        )
+        medical_info = submission.get("medical")
+        if medical_info is not None:
+            self._validate_medical(
+                medical_info,
+                errors,
+                warnings,
+            )
 
-        self._validate_claims(
-            submission.get("claims", []),
-            errors,
-        )
+        claims_info = submission.get("claims")
+        if claims_info is not None:
+            self._validate_claims(
+                claims_info,
+                errors,
+            )
 
         self._validate_underwriting_request(
-            submission.get(
-                "underwriting_request"
-            ),
+            underwriting_request,
             errors,
         )
 

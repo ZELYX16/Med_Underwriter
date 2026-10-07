@@ -82,7 +82,10 @@ async def agent1_node(
 
     return {
         "current_node": "agent1_submission",
-        "agent1_enrichment": result,
+        "agent1_enrichment": result.get(
+            "agent1_enrichment",
+            result,
+        ),
         "agent1_completed": True,
         "medical_evidence": result.get(
             "medical_evidence",
@@ -116,10 +119,22 @@ async def agent1_node(
             state,
             "agent1_submission",
             details={
-                "evidence_summary": result.get(
-                    "evidence_summary",
-                    {},
-                ),
+                "evidence_summary": {
+                    "medical_records_count": len(result.get("medical_evidence", [])),
+                    "claims_records_count": len(result.get("claims_evidence", [])),
+                    "policy_records_count": len(result.get("policy_evidence", [])),
+                    "coverage_gaps_count": len(result.get("coverage_gaps", [])),
+                    "regulatory_evidence_found": bool(
+                        result.get("regulatory_evidence", {}).get("results")
+                        if isinstance(result.get("regulatory_evidence"), dict)
+                        else result.get("regulatory_evidence")
+                    ),
+                    "underwriting_evidence_found": bool(
+                        result.get("underwriting_evidence", {}).get("results")
+                        if isinstance(result.get("underwriting_evidence"), dict)
+                        else result.get("underwriting_evidence")
+                    ),
+                },
             },
         ),
     }
@@ -417,6 +432,26 @@ def reflection_node(
             "explainability_check",
             {},
         ),
+        "constitutional_medical_accuracy": result.get(
+            "constitutional_medical_accuracy",
+            {},
+        ),
+        "constitutional_actuarial_soundness": result.get(
+            "constitutional_actuarial_soundness",
+            {},
+        ),
+        "constitutional_regulatory_compliance": result.get(
+            "constitutional_regulatory_compliance",
+            {},
+        ),
+        "constitutional_fairness": result.get(
+            "constitutional_fairness",
+            {},
+        ),
+        "constitutional_explainability": result.get(
+            "constitutional_explainability",
+            {},
+        ),
         "reflection_verdict": result.get(
             "reflection_verdict",
             "not_required",
@@ -478,7 +513,6 @@ def post_reflection_router(
     if verdict in {
         "fail",
         "escalate",
-        "review",
     }:
         return "human_review"
 
@@ -602,6 +636,21 @@ def finalize_node(
         "final_decision": final_decision,
         "final_recommendation": recommendation,
         "final_confidence": confidence,
+        "constitutional_medical_accuracy": state.get(
+            "constitutional_medical_accuracy"
+        ) or {"status": "not_required", "findings": []},
+        "constitutional_actuarial_soundness": state.get(
+            "constitutional_actuarial_soundness"
+        ) or {"status": "not_required", "findings": []},
+        "constitutional_regulatory_compliance": state.get(
+            "constitutional_regulatory_compliance"
+        ) or {"status": "not_required", "findings": []},
+        "constitutional_fairness": state.get(
+            "constitutional_fairness"
+        ) or {"status": "not_required", "findings": []},
+        "constitutional_explainability": state.get(
+            "constitutional_explainability"
+        ) or {"status": "not_required", "findings": []},
         "completed_at": completed_at,
         "processing_time_ms": processing_time_ms,
         "workflow_trace": _trace(
