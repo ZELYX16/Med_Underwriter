@@ -35,6 +35,7 @@ from app.api.schemas import (
 from app.orchestrator.graph import run_workflow
 from app.services.document_service import document_service
 from app.store.state_store import state_store
+from app.security.guardrails import guardrails
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,57 @@ def _case_id() -> str:
     return (
         f"UW-{datetime.now().strftime('%Y')}-"
         f"{uuid.uuid4().hex[:8].upper()}"
+    )
+
+
+def _validate_underwriting_guardrails(
+    request: UnderwriteInput,
+    *,
+    case_id: str | None = None,
+) -> dict[str, Any]:
+    result = guardrails.validate_submission(
+        request.applicant_profile,
+        request.submission,
+    )
+
+    if not result.allowed:
+        if case_id:
+            state_store.add_workflow_event(
+                case_id=case_id,
+                event_type="security_guardrail",
+                node="guardrails",
+                status="blocked",
+                message="Underwriting request blocked by security guardrails.",
+                data=result.to_dict(),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Underwriting request blocked by security guardrails.",
+                "risk_level": result.risk_level,
+                "reasons": result.reasons,
+                "checks": result.checks,
+            },
+        )
+
+    return result.to_dict()
+
+
+def _record_guardrail_result(
+    state: UnderwritingState,
+    result: dict[str, Any],
+) -> None:
+    state.setdefault("audit_trail", []).append(
+        {
+            "node": "guardrails",
+            "timestamp": _now(),
+            "details": {
+                "allowed": result.get("allowed", False),
+                "risk_level": result.get("risk_level", "unknown"),
+                "reasons": result.get("reasons", []),
+                "checks": result.get("checks", {}),
+            },
+        }
     )
 
 
@@ -206,6 +258,39 @@ async def _run_case(
             initial_state=current,
             thread_id=case_id,
         )
+
+        output_guardrail = guardrails.validate_output(
+            result.get("final_decision", result),
+        )
+        output_guardrail_data = output_guardrail.to_dict()
+        result.setdefault("audit_trail", []).append({
+            "node": "guardrails",
+            "timestamp": _now(),
+            "details": {
+                "phase": "output_validation",
+                **output_guardrail_data,
+            },
+        })
+
+        if not output_guardrail.allowed:
+            result["final_status"] = "failed"
+            result["require_human_review"] = True
+            result["human_review_reason"] = (
+                "Final underwriting output blocked by security guardrails."
+            )
+            result.setdefault("errors", []).append({
+                "timestamp": _now(),
+                "type": "OutputGuardrailBlocked",
+                "message": output_guardrail.reasons,
+            })
+            state_store.add_workflow_event(
+                case_id=case_id,
+                event_type="security_guardrail",
+                node="guardrails",
+                status="blocked_output",
+                message="Final underwriting output blocked by security guardrails.",
+                data=output_guardrail.to_dict(),
+            )
 
         result["updated_at"] = _now()
 
@@ -390,22 +475,32 @@ async def create_case(
         {},
     )
 
+    validation_request = UnderwriteInput(
+        applicant_profile={
+            **applicant_profile,
+            "applicant_id": request.applicant_id,
+            "name": applicant.get(
+                "name",
+                applicant_profile.get(
+                    "name",
+                    "",
+                ),
+            ),
+        },
+        submission=request.submission,
+    )
+
+    guardrail_result = _validate_underwriting_guardrails(
+        validation_request,
+    )
+
     state: UnderwritingState = _initial_state(
         case_id=case_id,
-        request=UnderwriteInput(
-            applicant_profile={
-                **applicant_profile,
-                "applicant_id": request.applicant_id,
-                "name": applicant.get(
-                    "name",
-                    applicant_profile.get(
-                        "name",
-                        "",
-                    ),
-                ),
-            },
-            submission=request.submission,
-        ),
+        request=validation_request,
+    )
+    _record_guardrail_result(
+        state,
+        guardrail_result,
     )
 
     state_store.create_case(
@@ -460,6 +555,35 @@ async def start_existing_case(
                 f"'{current_status}'."
             ),
         )
+
+    guardrail_result = guardrails.validate_submission(
+        state.get("applicant_profile", {}),
+        state.get("submission", {}),
+    )
+
+    if not guardrail_result.allowed:
+        state_store.add_workflow_event(
+            case_id=case_id,
+            event_type="security_guardrail",
+            node="guardrails",
+            status="blocked",
+            message="Underwriting request blocked by security guardrails.",
+            data=guardrail_result.to_dict(),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Underwriting request blocked by security guardrails.",
+                "risk_level": guardrail_result.risk_level,
+                "reasons": guardrail_result.reasons,
+                "checks": guardrail_result.checks,
+            },
+        )
+
+    _record_guardrail_result(
+        state,
+        guardrail_result.to_dict(),
+    )
 
     state["final_status"] = "processing"
     state["final_decision"] = ""
@@ -661,9 +785,18 @@ async def start_underwriting(
 ):
     case_id = _case_id()
 
+    guardrail_result = _validate_underwriting_guardrails(
+        request,
+        case_id=case_id,
+    )
+
     state = _initial_state(
         case_id=case_id,
         request=request,
+    )
+    _record_guardrail_result(
+        state,
+        guardrail_result,
     )
 
     _save_state(

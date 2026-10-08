@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from app.config import settings
@@ -16,6 +17,7 @@ class RiskAssessmentAgent:
 
     def __init__(self) -> None:
         self.llm = None
+        self._last_llm_metrics: dict[str, Any] = {}
 
     def run(
         self,
@@ -24,6 +26,8 @@ class RiskAssessmentAgent:
         enrichment_results: dict[str, Any],
         routing_result: dict[str, Any],
     ) -> dict[str, Any]:
+        agent_started = time.perf_counter()
+
         features = self._extract_features(
             applicant_profile,
             submission,
@@ -59,6 +63,18 @@ class RiskAssessmentAgent:
             routing_result=routing_result,
         )
 
+        decision_basis = self._build_decision_basis(
+            risk=risk,
+            pricing=pricing,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+
+        metrics = self._build_metrics(
+            started=agent_started,
+            llm_metrics=getattr(self, "_last_llm_metrics", {}),
+        )
+
         return {
             "risk_assessment": {
                 "medical_risk_score": risk["medical_risk_score"],
@@ -68,6 +84,9 @@ class RiskAssessmentAgent:
                 "risk_factors": risk["risk_factors"],
                 "protective_factors": risk["protective_factors"],
                 "evidence_completeness": risk["evidence_completeness"],
+                "evidence_domains": risk.get("evidence_domains", {}),
+                "evidence_gaps": risk.get("evidence_gaps", []),
+                "decision_basis": decision_basis,
             },
             "medical_risk_score": risk["medical_risk_score"],
             "claims_risk_score": risk["claims_risk_score"],
@@ -80,6 +99,9 @@ class RiskAssessmentAgent:
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": reasoning,
+            "decision_basis": decision_basis,
+            "metrics": metrics,
+            "agent2_metrics": metrics,
             "agent2_completed": True,
         }
 
@@ -380,7 +402,14 @@ class RiskAssessmentAgent:
         }
 
         for condition in conditions:
-            text = self._text(condition).lower()
+            condition_text = self._text(condition)
+            condition_text = (
+                condition_text
+                .replace("Year diagnosed Status (as declared) ", "")
+                .replace("Year diagnosed Status", "")
+                .strip()
+            )
+            text = condition_text.lower()
             matched = False
 
             for keyword, weight in condition_weights.items():
@@ -388,7 +417,7 @@ class RiskAssessmentAgent:
                     medical_score += weight
                     risk_factors.append(
                         "Medical condition requiring assessment: "
-                        + self._text(condition)
+                        + condition_text
                     )
                     matched = True
                     break
@@ -499,6 +528,13 @@ class RiskAssessmentAgent:
                 protective_factors
             ),
             "evidence_completeness": evidence_completeness,
+            "evidence_domains": evidence_domains,
+            "evidence_gaps": [
+                domain
+                for domain, available in evidence_domains.items()
+                if not available
+            ],
+            "coverage_gaps": coverage_gaps,
         }
 
     def _calculate_pricing(
@@ -629,6 +665,140 @@ class RiskAssessmentAgent:
             ),
             2,
         )
+
+    @staticmethod
+    def _extract_token_usage(response: Any) -> dict[str, int]:
+        usage: Any = getattr(response, "usage_metadata", None)
+
+        if not isinstance(usage, dict):
+            metadata = getattr(response, "response_metadata", None)
+            if isinstance(metadata, dict):
+                usage = (
+                    metadata.get("token_usage")
+                    or metadata.get("usage")
+                    or metadata.get("usage_metadata")
+                )
+
+        if not isinstance(usage, dict):
+            usage = getattr(response, "usage", None)
+
+        if not isinstance(usage, dict):
+            usage = {}
+
+        input_tokens = int(
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or usage.get("input_token_count")
+            or 0
+        )
+        output_tokens = int(
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or usage.get("output_token_count")
+            or 0
+        )
+        total_tokens = int(
+            usage.get("total_tokens")
+            or input_tokens + output_tokens
+        )
+
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _build_metrics(
+        started: float,
+        llm_metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        input_tokens = int(llm_metrics.get("input_tokens", 0) or 0)
+        output_tokens = int(llm_metrics.get("output_tokens", 0) or 0)
+        total_tokens = int(
+            llm_metrics.get("total_tokens", 0)
+            or input_tokens + output_tokens
+        )
+
+        return {
+            "latency_sec": round(time.perf_counter() - started, 4),
+            "llm_latency_sec": float(
+                llm_metrics.get("llm_latency_sec", 0.0) or 0.0
+            ),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _build_decision_basis(
+        risk: dict[str, Any],
+        pricing: dict[str, float],
+        recommendation: str,
+        confidence: float,
+    ) -> dict[str, Any]:
+        medical = float(risk["medical_risk_score"])
+        claims = float(risk["claims_risk_score"])
+        coverage = float(risk["coverage_gap_score"])
+        overall = float(risk["overall_risk_score"])
+
+        if overall >= 70:
+            rule = "risk >= 70"
+        elif overall >= 60:
+            rule = "60 <= risk < 70"
+        elif overall >= 45:
+            rule = "45 <= risk < 60"
+        elif overall >= 30:
+            rule = "30 <= risk < 45"
+        else:
+            rule = "risk < 30"
+
+        return {
+            "medical_risk": {
+                "score": medical,
+                "weight": 0.60,
+                "contributors": risk.get("risk_factors", [])[:5],
+            },
+            "claims_risk": {
+                "score": claims,
+                "weight": 0.30,
+            },
+            "coverage_assessment": {
+                "score": coverage,
+                "confirmed_gaps": risk.get("coverage_gaps", []),
+                "evidence_gaps": risk.get("evidence_gaps", []),
+            },
+            "overall_risk": {
+                "score": overall,
+                "formula": (
+                    f"{medical:g} × 0.60 + "
+                    f"{claims:g} × 0.30 + "
+                    f"{coverage:g} × 0.10"
+                ),
+            },
+            "recommendation": {
+                "result": recommendation,
+                "rule": rule,
+            },
+            "confidence": confidence,
+            "pricing": {
+                "base_rate": pricing.get("base_rate", 0.0),
+                "base_premium": pricing.get("base_premium", 0.0),
+                "loading_percentage": pricing.get(
+                    "loading_percentage", 0.0
+                ),
+                "loading_amount": pricing.get(
+                    "loading_amount", 0.0
+                ),
+                "final_premium": pricing.get(
+                    "final_premium", 0.0
+                ),
+                "basis": pricing.get(
+                    "pricing_basis",
+                    "DEMO_UNDERWRITING_MODEL",
+                ),
+            },
+        }
 
     def _reason(
         self,
@@ -846,7 +1016,13 @@ FINAL VALIDATION:
 Return only the underwriting rationale.
 """.strip()
 
+            llm_started = time.perf_counter()
             response = self.llm.invoke(prompt)
+            llm_latency = round(time.perf_counter() - llm_started, 4)
+            self._last_llm_metrics = {
+                **self._extract_token_usage(response),
+                "llm_latency_sec": llm_latency,
+            }
 
             content = getattr(
                 response,
@@ -883,6 +1059,12 @@ Return only the underwriting rationale.
             return reasoning
 
         except Exception as exc:
+            self._last_llm_metrics = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "llm_latency_sec": 0.0,
+            }
             return self._fallback_reasoning(
                 risk=risk,
                 pricing=pricing,

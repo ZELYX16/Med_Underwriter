@@ -14,6 +14,8 @@ from components import (
     evidence_availability,
     evidence_section,
     get_list,
+    agent_metrics,
+    workflow_metrics,
     normalize_response,
     review_actions,
     review_summary,
@@ -865,6 +867,12 @@ def run_underwriting(
                 "escalated",
             }
 
+            progress_bar = st.progress(0.0)
+            stage_placeholder = st.empty()
+            detail_placeholder = st.empty()
+
+            last_stage = None
+
             for _ in range(180):
                 _time.sleep(1)
 
@@ -883,7 +891,7 @@ def run_underwriting(
                 )
 
                 progress = get_progress(current)
-                st.progress(progress)
+                progress_bar.progress(progress)
 
                 current_agent = (
                     current.get("current_agent")
@@ -891,12 +899,31 @@ def run_underwriting(
                     or current.get("current_step")
                     or current_status
                 )
-                st.write(
-                    f"Current stage: **{humanize(current_agent)}**"
+                stage_label = humanize(current_agent)
+
+                if stage_label != last_stage:
+                    stage_placeholder.markdown(
+                        f"**Current stage:** {esc(stage_label)}"
+                    )
+                    last_stage = stage_label
+
+                detail_placeholder.caption(
+                    f"Status: {humanize(current_status)}  ·  "
+                    f"Progress: {progress * 100:.0f}%"
                 )
 
                 if current_status in terminal:
                     break
+            else:
+                status.update(
+                    label="Workflow is taking longer than expected",
+                    state="running",
+                    expanded=True,
+                )
+                st.warning(
+                    "The backend workflow is still processing after 3 minutes. "
+                    "The case remains active; you can refresh the case later to see the final result."
+                )
 
             final_case = normalize_data(
                 api.get_case(case_id)
@@ -3171,22 +3198,15 @@ def render_case_evidence(
     )
 
     case_id = str(
-        case.get(
-            "case_id"
-        )
-        or ""
+        case.get("case_id") or ""
     )
 
-    documents = load_documents(
-        case_id
-    )
+    documents = load_documents(case_id)
 
     evidence = case.get("evidence")
-
     if not isinstance(evidence, dict):
         evidence = {}
 
-    # Backend state keeps evidence in explicit domain fields.
     backend_evidence = {
         "medical_evidence": case.get("medical_evidence", []),
         "claims_evidence": case.get("claims_evidence", []),
@@ -3196,97 +3216,66 @@ def render_case_evidence(
         "medical_knowledge": case.get("medical_knowledge", []),
         "coverage_gaps": case.get("coverage_gaps", []),
     }
+
     for key, value in backend_evidence.items():
         if isinstance(value, list) and value:
             evidence.setdefault(key, value)
 
     if evidence:
-        evidence_availability(
-            evidence
-        )
+        evidence_availability(evidence)
 
     if documents:
-
-        st.markdown(
-            "#### Case Documents"
-        )
-
+        st.markdown("#### Case Documents")
         for document in documents:
-
             filename = (
-                document.get(
-                    "filename"
-                )
-                or document.get(
-                    "name"
-                )
+                document.get("filename")
+                or document.get("name")
                 or "Document"
             )
-
             document_type = humanize(
-                document.get(
-                    "document_type"
-                )
-                or document.get(
-                    "type"
-                )
+                document.get("document_type")
+                or document.get("type")
                 or "Other"
             )
-
             status = humanize(
-                document.get(
-                    "evidence_status"
-                )
+                document.get("evidence_status")
                 or "Provided"
             )
 
-            columns = st.columns(
-                [
-                    3,
-                    1.5,
-                    1.5,
-                ]
-            )
-
+            columns = st.columns([3, 1.5, 1.5])
             with columns[0]:
-                st.markdown(
-                    f"**{esc(filename)}**"
-                )
-
+                st.markdown(f"**{esc(filename)}**")
             with columns[1]:
-                st.caption(
-                    document_type
-                )
-
+                st.caption(document_type)
             with columns[2]:
-                st.caption(
-                    status
-                )
+                st.caption(status)
 
         st.divider()
 
     if evidence:
-
-        st.markdown(
-            "#### Retrieved Evidence"
+        st.markdown("#### Evidence Reader")
+        st.caption(
+            "Evidence is grouped by source document. Retrieval chunks are "
+            "combined and hidden behind the full-evidence reader."
         )
 
-        # IMPORTANT:
-        # evidence_section requires title + evidence.
+        scope_map = {
+            "regulatory_evidence": "regulatory",
+            "medical_knowledge": "knowledge",
+            "underwriting_knowledge_evidence": "knowledge",
+            "underwriting_evidence": "applicant",
+        }
+
         for key, value in evidence.items():
-
-            if not isinstance(
-                value,
-                list,
-            ):
+            if not isinstance(value, list) or not value:
                 continue
-
-            if not value:
+            if key == "coverage_gaps":
                 continue
 
             evidence_section(
                 humanize(key),
                 value,
+                scope=scope_map.get(key, "applicant"),
             )
 
     if not documents and not evidence:
@@ -3345,6 +3334,18 @@ def render_agent_section(
         render_agent2_result(
             case,
             result,
+        )
+
+    metrics = (
+        result.get("metrics")
+        or result.get("agent_metrics")
+        or {}
+    )
+    if metrics:
+        st.divider()
+        agent_metrics(
+            metrics,
+            f"Agent {number}",
         )
 
 
@@ -3860,6 +3861,14 @@ def render_agent3_section(
                 )
 
 
+    metrics = (
+        result.get("metrics")
+        or result.get("agent_metrics")
+        or {}
+    )
+    if metrics:
+        st.divider()
+        agent_metrics(metrics, "Agent 3 / Reflection")
 # ============================================================
 # DECISION SECTION
 # ============================================================
@@ -3975,17 +3984,78 @@ def render_decision_details(
         or []
     )
 
-    reasoning = (
-        final_decision.get(
-            "reasoning"
-        )
-        or case.get(
-            "reasoning"
-        )
-        or risk.get(
-            "reasoning"
-        )
+    state = case.get("state")
+    if not isinstance(state, dict):
+        state = {}
+
+    agent2 = get_agent_result(
+        case,
+        2,
     )
+
+    reasoning = (
+        final_decision.get("reasoning")
+        or final_decision.get("rationale")
+        or case.get("reasoning")
+        or case.get("rationale")
+        or state.get("reasoning")
+        or state.get("rationale")
+        or risk.get("reasoning")
+        or risk.get("rationale")
+        or agent2.get("reasoning")
+        or agent2.get("rationale")
+    )
+
+    if not reasoning:
+        risk_score = overall_risk(case)
+        rec = recommendation(case)
+        loading = extract_loading(case)
+        price = (
+            final_decision.get("pricing")
+            or risk.get("pricing")
+            or agent2.get("pricing")
+            or {}
+        )
+
+        rationale_parts = []
+        if factors:
+            rationale_parts.append(
+                "The decision was based on the identified risk drivers: "
+                + "; ".join(
+                    str(
+                        factor.get("factor")
+                        or factor.get("description")
+                        or factor.get("reason")
+                    )
+                    if isinstance(factor, dict)
+                    else str(factor)
+                    for factor in factors[:4]
+                )
+                + "."
+            )
+        if risk_score is not None:
+            rationale_parts.append(
+                f"The overall risk score is {risk_score:.0f}, "
+                f"which maps to a {risk_band(risk_score).lower()} risk band."
+            )
+        if coverage_gaps:
+            rationale_parts.append(
+                "Coverage considerations were identified and included in the assessment."
+            )
+        else:
+            rationale_parts.append(
+                "No coverage gap was identified by the underwriting assessment."
+            )
+        if loading not in (None, "", "0", "0%", 0):
+            rationale_parts.append(
+                f"The recommendation is {rec} with a pricing loading of {loading}."
+            )
+        elif rec and rec != "Pending":
+            rationale_parts.append(
+                f"The resulting recommendation is {rec}."
+            )
+
+        reasoning = " ".join(rationale_parts)
 
     columns = st.columns(2)
 
@@ -4248,7 +4318,17 @@ def render_workflow_section(
         "Workflow",
         "Execution trace and persisted underwriting events.",
     )
+    workflow_metrics(
+        case.get("workflow_metrics")
+        or case.get("metrics")
+        or {}
+    )
 
+    agent_usage = case.get("agent_metrics")
+    if isinstance(agent_usage, dict) and agent_usage:
+        st.divider()
+        st.markdown("#### Agent Latency & Token Usage")
+        workflow_metrics({"agents": agent_usage})
     trace = case.get(
         "workflow_trace"
     )

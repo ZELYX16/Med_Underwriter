@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -14,6 +15,65 @@ from app.models.state import UnderwritingState
 
 
 MAX_REFLECTION_ROUNDS = 3
+
+
+def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
+    metrics = result.get("metrics") or result.get(f"{agent}_metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    input_tokens = int(
+        metrics.get("input_tokens")
+        or metrics.get("prompt_tokens")
+        or 0
+    )
+    output_tokens = int(
+        metrics.get("output_tokens")
+        or metrics.get("completion_tokens")
+        or 0
+    )
+    total_tokens = int(
+        metrics.get("total_tokens")
+        or input_tokens + output_tokens
+    )
+
+    return {
+        "agent": agent,
+        "latency_sec": round(
+            float(metrics.get("latency_sec", metrics.get("duration_sec", 0.0)) or 0.0),
+            4,
+        ),
+        "llm_latency_sec": round(
+            float(metrics.get("llm_latency_sec", 0.0) or 0.0),
+            4,
+        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _workflow_metrics(
+    started: float,
+    agent_metrics: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = dict(agent_metrics)
+    input_tokens = sum(
+        int(item.get("input_tokens", 0) or 0)
+        for item in normalized.values()
+    )
+    output_tokens = sum(
+        int(item.get("output_tokens", 0) or 0)
+        for item in normalized.values()
+    )
+
+    return {
+        "workflow_latency_sec": round(time.perf_counter() - started, 4),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "agents": normalized,
+    }
 
 
 def _now() -> str:
@@ -137,6 +197,10 @@ async def agent1_node(
             "agent1_enrichment",
             {},
         )
+        agent1_metrics = _agent_metrics(
+            result,
+            "agent1",
+        )
 
         underwriting_submission = result.get(
             "underwriting_submission",
@@ -182,6 +246,10 @@ async def agent1_node(
                 [],
             ),
             "agent1_enrichment": enrichment,
+            "agent1_metrics": agent1_metrics,
+            "agent_metrics": {
+                "agent1": agent1_metrics,
+            },
             "agent1_completed": True,
             "workflow_trace": _trace(
                 state,
@@ -235,6 +303,7 @@ async def agent1_node(
                             [],
                         )
                     ),
+                    "metrics": agent1_metrics,
                 },
             ),
             "audit_trail": _audit(
@@ -393,6 +462,10 @@ def agent2_node(
             "risk_assessment",
             {},
         )
+        agent2_metrics = _agent_metrics(
+            result,
+            "agent2",
+        )
 
         pricing = result.get(
             "pricing_result",
@@ -451,6 +524,15 @@ def agent2_node(
                 "agent2_reasoning",
                 "",
             ),
+            "decision_basis": result.get(
+                "decision_basis",
+                risk_assessment.get("decision_basis", {}),
+            ),
+            "agent2_metrics": agent2_metrics,
+            "agent_metrics": {
+                **state.get("agent_metrics", {}),
+                "agent2": agent2_metrics,
+            },
             "agent2_completed": True,
             "reflection_requires_rescore": False,
             "workflow_trace": _trace(
@@ -468,6 +550,7 @@ def agent2_node(
                         "reflection_round",
                         0,
                     ),
+                    "metrics": agent2_metrics,
                 },
             ),
             "audit_trail": _audit(
@@ -654,6 +737,11 @@ def reflection_node(
             previous_findings=previous_findings,
         )
 
+        agent3_metrics = _agent_metrics(
+            result,
+            "agent3",
+        )
+
         agent3_round = int(
             result.get(
                 "reflection_round",
@@ -790,6 +878,11 @@ def reflection_node(
                 "",
             ),
 
+            "agent3_metrics": agent3_metrics,
+            "agent_metrics": {
+                **state.get("agent_metrics", {}),
+                "agent3": agent3_metrics,
+            },
             "agent3_completed": True,
 
             "workflow_trace": _trace(
@@ -806,6 +899,7 @@ def reflection_node(
                     "confidence_gate": state.get(
                         "confidence_gate"
                     ),
+                    "metrics": agent3_metrics,
                 },
             ),
 
@@ -879,6 +973,11 @@ def post_reflection_router(
     ):
         return "human_review"
 
+    # Progressive-autonomy policy: complex underwriting cases
+    # require human review even when Agent 3 reflection passes.
+    if state.get("complexity_level") == "complex":
+        return "human_review"
+
     reflection_round = int(
         state.get(
             "reflection_round",
@@ -916,8 +1015,17 @@ def human_review_node(
 ) -> dict[str, Any]:
     reason = state.get(
         "human_review_reason",
-        "Manual underwriting review required.",
+        "",
     )
+
+    if not reason and state.get("complexity_level") == "complex":
+        reason = (
+            "Complex underwriting case requires human review "
+            "under the progressive-autonomy policy."
+        )
+
+    if not reason:
+        reason = "Manual underwriting review required."
 
     return {
         "updated_at": _now(),
@@ -1010,6 +1118,8 @@ def finalize_node(
         "final_status": status,
         "final_recommendation": recommendation,
         "final_confidence": confidence,
+        "decision_basis": state.get("decision_basis", {}),
+        "reasoning": state.get("agent2_reasoning", ""),
         "workflow_trace": _trace(
             state,
             "finalize",
@@ -1061,7 +1171,7 @@ def build_graph() -> StateGraph:
     )
 
     graph.add_node(
-        "confidence_gate",
+        "confidence_gate_node",
         confidence_gate_node,
     )
 
@@ -1102,11 +1212,11 @@ def build_graph() -> StateGraph:
 
     graph.add_edge(
         "agent2_risk",
-        "confidence_gate",
+        "confidence_gate_node",
     )
 
     graph.add_conditional_edges(
-        "confidence_gate",
+        "confidence_gate_node",
         reflection_router,
         {
             "reflection": "agent3_reflection",
@@ -1170,7 +1280,31 @@ async def run_workflow(
         }
     }
 
-    return await workflow.ainvoke(
+    started = time.perf_counter()
+
+    result = await workflow.ainvoke(
         initial_state,
         config=config,
     )
+
+    agent_metrics = result.get(
+        "agent_metrics",
+        {},
+    )
+    result["workflow_metrics"] = _workflow_metrics(
+        started=started,
+        agent_metrics=agent_metrics,
+    )
+    result["timing"] = {
+        **result.get("timing", {}),
+        "workflow_latency_sec": result["workflow_metrics"][
+            "workflow_latency_sec"
+        ],
+    }
+    result["token_usage"] = {
+        "input_tokens": result["workflow_metrics"]["input_tokens"],
+        "output_tokens": result["workflow_metrics"]["output_tokens"],
+        "total_tokens": result["workflow_metrics"]["total_tokens"],
+    }
+
+    return result

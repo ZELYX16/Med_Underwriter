@@ -73,6 +73,33 @@ class UnderwriteInput(BaseModel):
         return value
 
 
+class AgentMetrics(BaseModel):
+    agent: str
+    latency_sec: float = Field(default=0.0, ge=0.0)
+    llm_latency_sec: float = Field(default=0.0, ge=0.0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+
+
+class WorkflowMetrics(BaseModel):
+    workflow_latency_sec: float = Field(default=0.0, ge=0.0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    agents: dict[str, AgentMetrics] = Field(default_factory=dict)
+
+
+class DecisionBasis(BaseModel):
+    medical_risk: dict[str, Any] = Field(default_factory=dict)
+    claims_risk: dict[str, Any] = Field(default_factory=dict)
+    coverage_assessment: dict[str, Any] = Field(default_factory=dict)
+    overall_risk: dict[str, Any] = Field(default_factory=dict)
+    recommendation: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    pricing: dict[str, Any] = Field(default_factory=dict)
+
+
 class UnderwritingDecision(BaseModel):
     model_config = ConfigDict(
         extra="allow",
@@ -165,6 +192,36 @@ class UnderwritingDecision(BaseModel):
 
     coverage_gaps: list[dict[str, Any]] = Field(
         default_factory=list,
+    )
+
+    evidence_gaps: list[str] = Field(
+        default_factory=list,
+    )
+
+    evidence_domains: dict[str, bool] = Field(
+        default_factory=dict,
+    )
+
+    decision_basis: DecisionBasis = Field(
+        default_factory=DecisionBasis,
+    )
+
+    reasoning: str = ""
+
+    agent_metrics: dict[str, AgentMetrics] = Field(
+        default_factory=dict,
+    )
+
+    workflow_metrics: WorkflowMetrics = Field(
+        default_factory=WorkflowMetrics,
+    )
+
+    timing: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
+    token_usage: dict[str, int] = Field(
+        default_factory=dict,
     )
 
     reflection_findings: list[dict[str, Any]] = Field(

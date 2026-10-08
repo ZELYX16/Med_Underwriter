@@ -242,17 +242,132 @@ class ApplicantRetriever:
                     ),
                     "applicant_id": result_applicant_id,
                     "document_type": result_document_type,
-                    "document_id": metadata.get(
-                        "document_id"
-                    ),
+                    "document_id": metadata.get("document_id"),
                     "source": metadata.get("source"),
-                    "file_name": metadata.get(
-                        "file_name"
+                    "file_name": (
+                        metadata.get("file_name")
+                        or metadata.get("filename")
+                        or metadata.get("source")
+                    ),
+                    "filename": (
+                        metadata.get("filename")
+                        or metadata.get("file_name")
+                        or metadata.get("source")
+                    ),
+                    "title": (
+                        metadata.get("title")
+                        or metadata.get("filename")
+                        or metadata.get("file_name")
+                        or metadata.get("source")
+                    ),
+                    "evidence_scope": metadata.get(
+                        "evidence_scope",
+                        "applicant",
                     ),
                 }
             )
 
         return normalized
+
+    def group_by_document(
+        self,
+        results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Convert retrieved chunks into document-level evidence records.
+
+        The UI can use this to show one readable evidence item per source
+        document instead of exposing vector-search chunk boundaries.
+        """
+        groups: dict[str, dict[str, Any]] = {}
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            document_id = (
+                item.get("document_id")
+                or metadata.get("document_id")
+                or item.get("filename")
+                or item.get("file_name")
+                or item.get("source")
+                or "evidence"
+            )
+            key = str(document_id)
+
+            group = groups.setdefault(
+                key,
+                {
+                    "document_id": item.get("document_id"),
+                    "filename": (
+                        item.get("filename")
+                        or item.get("file_name")
+                        or metadata.get("filename")
+                        or metadata.get("file_name")
+                        or "Evidence document"
+                    ),
+                    "document_type": (
+                        item.get("document_type")
+                        or metadata.get("document_type")
+                    ),
+                    "applicant_id": (
+                        item.get("applicant_id")
+                        or metadata.get("applicant_id")
+                    ),
+                    "source": (
+                        item.get("source")
+                        or metadata.get("source")
+                    ),
+                    "evidence_scope": (
+                        item.get("evidence_scope")
+                        or metadata.get("evidence_scope")
+                        or "applicant"
+                    ),
+                    "contents": [],
+                    "metadata": metadata,
+                },
+            )
+
+            content = item.get("content")
+            if content:
+                group["contents"].append(str(content).strip())
+
+        grouped = []
+        for group in groups.values():
+            seen: set[str] = set()
+            contents = []
+            for content in group["contents"]:
+                if content and content not in seen:
+                    seen.add(content)
+                    contents.append(content)
+
+            group["content"] = "\n\n".join(contents)
+            group["chunk_count"] = len(contents)
+            group.pop("contents", None)
+            grouped.append(group)
+
+        return grouped
+
+    def retrieve_document_views(
+        self,
+        applicant_id: str,
+        query: str,
+        document_type: str | None = None,
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return document-level readable evidence for UI/review layers."""
+        return self.group_by_document(
+            self.search(
+                applicant_id=applicant_id,
+                query=query,
+                document_type=document_type,
+                top_k=top_k,
+            )
+        )
 
     def has_evidence(
         self,

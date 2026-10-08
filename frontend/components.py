@@ -65,6 +65,15 @@ def normalize_response(
     return response
 
 
+def humanize(value: Any) -> str:
+    if value is None:
+        return ""
+    text_value = str(value).strip()
+    if not text_value:
+        return ""
+    return text_value.replace("_", " ").replace("-", " ").title()
+
+
 def safe_text(
     value: Any,
     default: str = "—",
@@ -1245,15 +1254,61 @@ def risk_factors(
 # EVIDENCE
 # ============================================================
 
+def _source_name(value: Any) -> str:
+    raw = safe_text(value).strip()
+    if not raw:
+        return "Evidence"
+
+    # Handles both Windows and POSIX paths without exposing local directories.
+    raw = raw.replace("\\", "/")
+    return raw.rsplit("/", 1)[-1] or "Evidence"
+
+
+def _evidence_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return safe_text(item).strip()
+
+    value = get_value(
+        item,
+        "text",
+        "content",
+        "summary",
+        "details",
+        "page_content",
+        default="",
+    )
+    return safe_text(value).strip()
+
+
+def _evidence_meta(item: dict[str, Any]) -> str:
+    parts = []
+    document_type = item.get("document_type")
+    jurisdiction = item.get("jurisdiction")
+    applicant_id = item.get("applicant_id")
+    page = item.get("page") or item.get("page_number")
+    source_type = item.get("source_type")
+
+    if document_type:
+        parts.append(str(document_type).replace("_", " ").title())
+    if jurisdiction:
+        parts.append(f"Jurisdiction: {jurisdiction}")
+    if applicant_id:
+        parts.append(f"Applicant: {applicant_id}")
+    if page:
+        parts.append(f"Page {page}")
+    if source_type:
+        parts.append(str(source_type).replace("_", " ").title())
+
+    return " · ".join(parts)
+
+
 def evidence_item(
     item: Any,
     scope: str = "applicant",
+    compact: bool = True,
 ) -> None:
-    if isinstance(
-        item,
-        dict,
-    ):
-        title = get_value(
+    if isinstance(item, dict):
+        source = get_value(
             item,
             "filename",
             "title",
@@ -1262,52 +1317,209 @@ def evidence_item(
             "name",
             default="Evidence",
         )
+        title = _source_name(source)
+        content = _evidence_text(item)
+        meta = _evidence_meta(item)
 
-        text = get_value(
-            item,
-            "text",
-            "content",
-            "summary",
-            "details",
-            "page_content",
-        )
-
-        metadata = []
-
-        for key in (
-            "document_type",
-            "source_type",
-            "knowledge_type",
-            "jurisdiction",
-            "applicant_id",
-        ):
-            value = item.get(key)
-
-            if value not in (
-                None,
-                "",
-            ):
-                metadata.append(
-                    f"{key.replace('_', ' ').title()}: {value}"
-                )
-
-        st.markdown(
-            f"**{safe_text(title)}**"
-        )
-
-        if metadata:
-            st.caption(
-                " · ".join(metadata)
-            )
-
-        if text:
-            st.write(
-                safe_text(text)
-            )
-
+        if compact:
+            with st.expander(title, expanded=False):
+                if meta:
+                    st.caption(meta)
+                if content:
+                    st.write(content)
+                else:
+                    st.caption("No extracted text available.")
+        else:
+            st.markdown(f"**{safe_text(title)}**")
+            if meta:
+                st.caption(meta)
+            if content:
+                st.write(content)
     else:
-        st.write(
-            safe_text(item)
+        st.write(safe_text(item))
+
+
+def _evidence_scope_label(scope: Any) -> str:
+    value = str(scope or "applicant").strip().lower()
+    return {
+        "applicant": "Applicant Evidence",
+        "knowledge": "Medical Knowledge",
+        "regulatory": "Regulatory Evidence",
+        "underwriting": "Underwriting Guidance",
+    }.get(value, value.replace("_", " ").title())
+
+
+def _evidence_reason(scope: Any, document_type: Any) -> str:
+    scope_key = str(scope or "applicant").strip().lower()
+    type_key = str(document_type or "").strip().lower()
+
+    if scope_key == "regulatory":
+        return (
+            "Supports regulatory compliance and underwriting-policy "
+            "requirements for the case jurisdiction."
+        )
+    if scope_key == "knowledge":
+        return (
+            "Provides medical reference knowledge used to interpret "
+            "clinical conditions, treatments, or terminology."
+        )
+    if type_key == "medical":
+        return (
+            "Primary applicant evidence used to establish diagnoses, "
+            "treatment status, medications, and clinical stability."
+        )
+    if type_key == "claims":
+        return (
+            "Applicant evidence used to establish historical claims, "
+            "utilization, hospitalization, and treatment patterns."
+        )
+    if type_key == "policy":
+        return (
+            "Applicant evidence used to establish existing coverage, "
+            "policy status, and relevant coverage terms."
+        )
+    if type_key == "underwriting":
+        return (
+            "Submission or underwriting evidence used to establish the "
+            "requested product, declarations, and underwriting context."
+        )
+    return (
+        "Source evidence retrieved by the underwriting workflow and "
+        "available for reviewer verification."
+    )
+
+
+def _document_label(item: dict[str, Any]) -> str:
+    return _source_name(
+        get_value(
+            item,
+            "filename",
+            "file_name",
+            "title",
+            "document",
+            "source",
+            default="Evidence document",
+        )
+    )
+
+
+def _document_content(item: dict[str, Any]) -> str:
+    value = get_value(
+        item,
+        "content",
+        "text",
+        "page_content",
+        "excerpt",
+        default="",
+    )
+    return safe_text(value, "").strip()
+
+
+def _render_document_reader(
+    title: str,
+    items: list[Any],
+    scope: str,
+) -> None:
+    if not items:
+        return
+
+    first = next(
+        (
+            item
+            for item in items
+            if isinstance(item, dict)
+        ),
+        {},
+    )
+
+    document_type = get_value(
+        first,
+        "document_type",
+        "type",
+        default="",
+    )
+    applicant_id = get_value(
+        first,
+        "applicant_id",
+        default="",
+    )
+
+    contents: list[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        content = (
+            _document_content(item)
+            if isinstance(item, dict)
+            else safe_text(item, "")
+        )
+        if content and content not in seen:
+            seen.add(content)
+            contents.append(content)
+
+    full_text = "\\n\\n".join(contents).strip()
+
+    st.markdown(
+        f"**{title}**"
+    )
+
+    meta_parts = [
+        _evidence_scope_label(scope),
+    ]
+    if document_type:
+        meta_parts.append(humanize(document_type))
+    if applicant_id:
+        meta_parts.append(f"Applicant {safe_text(applicant_id)}")
+
+    st.caption(" · ".join(meta_parts))
+
+    st.markdown(
+        "**Why this evidence matters**"
+    )
+    st.write(
+        _evidence_reason(
+            scope,
+            document_type,
+        )
+    )
+
+    if full_text:
+        st.markdown(
+            "**Relevant evidence**"
+        )
+        preview = full_text[:1400].strip()
+        if len(full_text) > 1400:
+            preview += "…"
+        st.write(preview)
+
+        with st.expander(
+            "View full evidence",
+            expanded=False,
+        ):
+            st.text(full_text)
+    else:
+        st.caption(
+            "The source was retrieved, but readable text is not available."
+        )
+
+
+def evidence_item(
+    item: Any,
+    scope: str = "applicant",
+    compact: bool = False,
+) -> None:
+    if isinstance(item, dict):
+        title = _document_label(item)
+        _render_document_reader(
+            title,
+            [item],
+            scope,
+        )
+    else:
+        _render_document_reader(
+            "Evidence document",
+            [item],
+            scope,
         )
 
 
@@ -1319,14 +1531,31 @@ def evidence_section(
     if not evidence:
         return
 
-    st.markdown(
-        f"### {title}"
-    )
+    st.markdown(f"### {title}")
 
+    groups: dict[str, list[Any]] = {}
     for item in evidence:
-        evidence_item(
-            item,
-            scope=scope,
+        if isinstance(item, dict):
+            source = get_value(
+                item,
+                "filename",
+                "file_name",
+                "title",
+                "document",
+                "source",
+                "name",
+                default="Evidence",
+            )
+            group_name = _source_name(source)
+        else:
+            group_name = "Retrieved evidence"
+        groups.setdefault(group_name, []).append(item)
+
+    for group_name, items in groups.items():
+        _render_document_reader(
+            group_name,
+            items,
+            scope,
         )
 
 
@@ -1489,6 +1718,119 @@ def agent_result(
         st.write(
             safe_text(result)
         )
+
+
+
+def _metric_number(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _metric_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def agent_metrics(
+    agent: dict[str, Any] | None,
+    agent_name: str = "Agent",
+) -> None:
+    data = agent if isinstance(agent, dict) else {}
+
+    latency = _metric_number(
+        data.get("latency_sec")
+    )
+    llm_latency = _metric_number(
+        data.get("llm_latency_sec")
+    )
+    input_tokens = _metric_int(
+        data.get("input_tokens")
+    )
+    output_tokens = _metric_int(
+        data.get("output_tokens")
+    )
+    total_tokens = _metric_int(
+        data.get("total_tokens")
+    )
+
+    st.markdown(
+        f"#### {agent_name} Metrics"
+    )
+
+    columns = st.columns(5)
+    values = [
+        ("Latency", f"{latency:.2f}s"),
+        ("LLM Latency", f"{llm_latency:.2f}s"),
+        ("Input Tokens", f"{input_tokens:,}"),
+        ("Output Tokens", f"{output_tokens:,}"),
+        ("Total Tokens", f"{total_tokens:,}"),
+    ]
+
+    for column, (label, value) in zip(columns, values):
+        with column:
+            metric_card(label, value)
+
+
+def workflow_metrics(
+    metrics: dict[str, Any] | None,
+) -> None:
+    data = metrics if isinstance(metrics, dict) else {}
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+
+    st.markdown("#### Workflow Metrics")
+
+    columns = st.columns(4)
+    values = [
+        (
+            "Workflow Latency",
+            f"{_metric_number(data.get('workflow_latency_sec')):.2f}s",
+        ),
+        (
+            "Input Tokens",
+            f"{_metric_int(data.get('input_tokens')):,}",
+        ),
+        (
+            "Output Tokens",
+            f"{_metric_int(data.get('output_tokens')):,}",
+        ),
+        (
+            "Total Tokens",
+            f"{_metric_int(data.get('total_tokens')):,}",
+        ),
+    ]
+
+    for column, (label, value) in zip(columns, values):
+        with column:
+            metric_card(label, value)
+
+    if agents:
+        st.markdown("##### Agent Usage")
+        rows = []
+        for name, values in agents.items():
+            if not isinstance(values, dict):
+                continue
+            rows.append(
+                {
+                    "Agent": humanize(name),
+                    "Latency": f"{_metric_number(values.get('latency_sec')):.2f}s",
+                    "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.2f}s",
+                    "Input Tokens": _metric_int(values.get("input_tokens")),
+                    "Output Tokens": _metric_int(values.get("output_tokens")),
+                    "Total Tokens": _metric_int(values.get("total_tokens")),
+                }
+            )
+        if rows:
+            st.dataframe(
+                rows,
+                hide_index=True,
+                use_container_width=True,
+            )
 
 
 # ============================================================
