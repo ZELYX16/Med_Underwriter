@@ -1,18 +1,113 @@
-"""
-MedUnderwrite AI — LangSmith Tracing Configuration
+from __future__ import annotations
 
-Owner: Persona A (Day 2 AM)
+import os
+from functools import wraps
+from typing import Any, Callable
 
-Configures LangSmith project and tracing:
-  - Wraps all LLM calls with trace decorator
-  - Tracks: token count, latency, and cost per agent per case
-  - Project: "medunderwrite-ai" (set in .env as LANGSMITH_PROJECT)
+from dotenv import load_dotenv
 
-Environment variables required (.env):
-  LANGSMITH_API_KEY=...
-  LANGSMITH_PROJECT=medunderwrite-ai
-  LANGCHAIN_TRACING_V2=true
+load_dotenv()
 
-TODO (Persona A): connect free LangSmith account, verify traces appear, add cost tracking.
-"""
-# TODO (Persona A): import langsmith and configure tracing decorators here
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "")
+LANGCHAIN_PROJECT = os.getenv(
+    "LANGCHAIN_PROJECT",
+    "medunderwrite-ai",
+)
+LANGCHAIN_TRACING_V2 = os.getenv(
+    "LANGCHAIN_TRACING_V2",
+    "true",
+)
+
+
+def configure_langsmith() -> bool:
+    """Configure LangSmith tracing from environment variables."""
+
+    if not LANGCHAIN_API_KEY:
+        print("[WARN] LANGCHAIN_API_KEY is not configured.")
+        print("[INFO] LangSmith tracing is disabled.")
+        return False
+
+    os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
+    os.environ["LANGCHAIN_PROJECT"] = LANGCHAIN_PROJECT
+    os.environ["LANGCHAIN_TRACING_V2"] = LANGCHAIN_TRACING_V2
+
+    print(
+        f"[OK] LangSmith tracing enabled: "
+        f"{LANGCHAIN_PROJECT}"
+    )
+
+    return True
+
+
+def trace_agent(
+    name: str,
+    *,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+):
+    """
+    Decorator for tracing individual agent functions.
+
+    LangSmith tracing is optional. If LangSmith is unavailable,
+    the original function is returned unchanged.
+    """
+
+    def decorator(func: Callable[..., Any]):
+        try:
+            from langsmith import traceable
+
+            traced_function = traceable(
+                func,
+                name=name,
+                run_type="chain",
+                tags=tags or [],
+                metadata=metadata or {},
+            )
+
+        except Exception as exc:
+            print(
+                f"[WARN] LangSmith tracing unavailable "
+                f"for {name}: {exc}"
+            )
+            traced_function = func
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return traced_function(
+                *args,
+                **kwargs,
+            )
+
+        return wrapper
+
+    return decorator
+
+
+def get_langsmith_status() -> dict[str, Any]:
+    """Return current LangSmith configuration status."""
+
+    return {
+        "enabled": bool(LANGCHAIN_API_KEY),
+        "project": LANGCHAIN_PROJECT,
+        "tracing_v2": (
+            LANGCHAIN_TRACING_V2.lower() == "true"
+        ),
+        "api_key_configured": bool(LANGCHAIN_API_KEY),
+    }
+
+
+def add_case_metadata(
+    case_id: str,
+    agent: str,
+    **metadata: Any,
+) -> dict[str, Any]:
+    """Build consistent metadata for case-level traces."""
+
+    return {
+        "case_id": case_id,
+        "agent": agent,
+        **metadata,
+    }
+
+
+configure_langsmith()

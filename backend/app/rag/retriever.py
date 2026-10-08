@@ -8,19 +8,10 @@ from app.store.vector_store import vector_store
 
 
 class ApplicantRetriever:
-    """
-    Retrieves applicant-specific evidence from the vector store.
-
-    The retriever keeps applicant filtering separate from the
-    higher-level RAG strategies.
-    """
-
     COLLECTION_NAME = "applicant_documents"
 
     def __init__(self) -> None:
-        self.synthetic_data_path = Path(
-            settings.synthetic_data_path
-        )
+        self.synthetic_data_path = Path(settings.synthetic_data_path)
 
     def _build_filter(
         self,
@@ -39,9 +30,7 @@ class ApplicantRetriever:
 
         return {
             "$and": [
-                {
-                    key: value
-                }
+                {key: value}
                 for key, value in filters.items()
             ]
         }
@@ -53,17 +42,16 @@ class ApplicantRetriever:
         document_type: str | None = None,
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Search applicant documents using semantic similarity.
-        """
-
-        if not applicant_id:
+        if not applicant_id or not query.strip():
             return []
 
-        if not query.strip():
-            return []
-
-        limit = top_k or settings.top_k_results
+        limit = max(
+            1,
+            min(
+                top_k or settings.top_k_results,
+                20,
+            ),
+        )
 
         where = self._build_filter(
             applicant_id=applicant_id,
@@ -81,7 +69,9 @@ class ApplicantRetriever:
             return []
 
         return self._normalize_results(
-            results
+            results,
+            applicant_id=applicant_id,
+            document_type=document_type,
         )
 
     def search_by_type(
@@ -91,16 +81,6 @@ class ApplicantRetriever:
         document_type: str,
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Search only one type of applicant evidence.
-
-        Supported types can include:
-        - medical
-        - claim
-        - policy
-        - underwriting
-        """
-
         return self.search(
             applicant_id=applicant_id,
             query=query,
@@ -111,65 +91,72 @@ class ApplicantRetriever:
     def retrieve_medical_evidence(
         self,
         applicant_id: str,
-        query: str,
+        query: str = (
+            "medical examination diagnosis conditions treatment"
+        ),
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.search_by_type(
-            applicant_id=applicant_id,
-            query=query,
-            document_type="medical",
-            top_k=top_k,
+            applicant_id,
+            query,
+            "medical",
+            top_k,
         )
 
     def retrieve_claims_evidence(
         self,
         applicant_id: str,
-        query: str,
+        query: str = (
+            "claims hospitalization treatment claim history"
+        ),
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.search_by_type(
-            applicant_id=applicant_id,
-            query=query,
-            document_type="claim",
-            top_k=top_k,
+            applicant_id,
+            query,
+            "claims",
+            top_k,
         )
 
     def retrieve_policy_evidence(
         self,
         applicant_id: str,
-        query: str,
+        query: str = (
+            "existing policy coverage sum insured claims policy status"
+        ),
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.search_by_type(
-            applicant_id=applicant_id,
-            query=query,
-            document_type="policy",
-            top_k=top_k,
+            applicant_id,
+            query,
+            "policy",
+            top_k,
         )
 
     def retrieve_underwriting_submission(
         self,
         applicant_id: str,
-        query: str,
+        query: str = (
+            "underwriting submission requested product "
+            "sum insured declarations"
+        ),
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.search_by_type(
-            applicant_id=applicant_id,
-            query=query,
-            document_type="underwriting",
-            top_k=top_k,
+            applicant_id,
+            query,
+            "underwriting",
+            top_k,
         )
 
     def retrieve_all(
         self,
         applicant_id: str,
-        query: str,
+        query: str = (
+            "applicant underwriting medical claims policy evidence"
+        ),
         top_k: int | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
-        """
-        Retrieve evidence from each applicant document category.
-        """
-
         return {
             "medical": self.retrieve_medical_evidence(
                 applicant_id,
@@ -196,77 +183,69 @@ class ApplicantRetriever:
     def _normalize_results(
         self,
         results: Any,
+        applicant_id: str | None = None,
+        document_type: str | None = None,
     ) -> list[dict[str, Any]]:
-        if not results:
+        if not isinstance(results, dict):
             return []
 
-        documents = results.get(
-            "documents",
-            [[]],
-        )
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+        distances = results.get("distances", [])
 
-        metadatas = results.get(
-            "metadatas",
-            [[]],
-        )
+        if documents and isinstance(documents[0], list):
+            documents = documents[0]
 
-        distances = results.get(
-            "distances",
-            [[]],
-        )
+        if metadatas and isinstance(metadatas[0], list):
+            metadatas = metadatas[0]
 
-        documents = (
-            documents[0]
-            if documents
-            else []
-        )
+        if distances and isinstance(distances[0], list):
+            distances = distances[0]
 
-        metadatas = (
-            metadatas[0]
-            if metadatas
-            else []
-        )
+        normalized: list[dict[str, Any]] = []
 
-        distances = (
-            distances[0]
-            if distances
-            else []
-        )
-
-        normalized = []
-
-        for index, document in enumerate(
-            documents
-        ):
+        for index, document in enumerate(documents):
             metadata = (
                 metadatas[index]
                 if index < len(metadatas)
+                and isinstance(metadatas[index], dict)
                 else {}
             )
 
-            distance = (
-                distances[index]
-                if index < len(distances)
-                else None
+            result_applicant_id = metadata.get(
+                "applicant_id"
             )
+            result_document_type = metadata.get(
+                "document_type"
+            )
+
+            if (
+                applicant_id
+                and result_applicant_id != applicant_id
+            ):
+                continue
+
+            if (
+                document_type
+                and result_document_type != document_type
+            ):
+                continue
 
             normalized.append(
                 {
                     "content": document,
-                    "metadata": metadata or {},
-                    "distance": distance,
-                    "applicant_id": metadata.get(
-                        "applicant_id"
+                    "metadata": metadata,
+                    "distance": (
+                        distances[index]
+                        if index < len(distances)
+                        else None
                     ),
-                    "document_type": metadata.get(
-                        "document_type"
-                    ),
+                    "applicant_id": result_applicant_id,
+                    "document_type": result_document_type,
                     "document_id": metadata.get(
                         "document_id"
                     ),
-                    "source": metadata.get(
-                        "source"
-                    ),
+                    "source": metadata.get("source"),
                     "file_name": metadata.get(
                         "file_name"
                     ),
@@ -281,14 +260,14 @@ class ApplicantRetriever:
         query: str,
         document_type: str | None = None,
     ) -> bool:
-        results = self.search(
-            applicant_id=applicant_id,
-            query=query,
-            document_type=document_type,
-            top_k=1,
+        return bool(
+            self.search(
+                applicant_id,
+                query,
+                document_type,
+                top_k=1,
+            )
         )
-
-        return len(results) > 0
 
 
 retriever = ApplicantRetriever()

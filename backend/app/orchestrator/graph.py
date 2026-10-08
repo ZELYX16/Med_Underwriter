@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from typing import Any
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.agent1_submission import submission_agent
@@ -10,10 +13,11 @@ from app.agents.routing.complexity_router import complexity_router
 from app.models.state import UnderwritingState
 
 
+MAX_REFLECTION_ROUNDS = 3
+
+
 def _now() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _trace(
@@ -41,241 +45,462 @@ def _trace(
     return trace
 
 
+def _audit(
+    state: UnderwritingState,
+    node: str,
+    details: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    audit = list(
+        state.get(
+            "audit_trail",
+            [],
+        )
+    )
+
+    audit.append(
+        {
+            "node": node,
+            "timestamp": _now(),
+            "details": details or {},
+        }
+    )
+
+    return audit
+
+
+def _append_error(
+    state: UnderwritingState,
+    node: str,
+    exc: Exception,
+) -> list[dict[str, Any]]:
+    errors = list(
+        state.get(
+            "errors",
+            [],
+        )
+    )
+
+    errors.append(
+        {
+            "node": node,
+            "timestamp": _now(),
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+    )
+
+    return errors
+
+
 def intake_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
     return {
-        "current_node": "intake",
-        "workflow_status": "running",
-        "started_at": state.get(
-            "started_at"
-        ) or _now(),
+        "updated_at": _now(),
+        "final_status": "processing",
         "workflow_trace": _trace(
             state,
             "intake",
             details={
-                "case_id": state.get(
-                    "case_id"
+                "case_id": state.get("case_id"),
+                "applicant_id": (
+                    state.get(
+                        "applicant_profile",
+                        {},
+                    ).get("applicant_id")
                 ),
             },
+        ),
+        "audit_trail": _audit(
+            state,
+            "intake",
         ),
     }
 
 
-def agent1_node(
+async def agent1_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
-    applicant_profile = state.get(
-        "applicant_profile",
-        {},
-    )
+    try:
+        result = await submission_agent.run(
+            applicant_profile=state.get(
+                "applicant_profile",
+                {},
+            ),
+            submission=state.get(
+                "submission",
+                {},
+            ),
+        )
 
-    submission = state.get(
-        "submission",
-        {},
-    )
+        enrichment = result.get(
+            "agent1_enrichment",
+            {},
+        )
 
-    result = submission_agent.run(
-        applicant_profile=applicant_profile,
-        submission=submission,
-    )
-
-    return {
-        "current_node": "agent1_submission",
-        "agent1_enrichment": result,
-        "agent1_completed": True,
-        "medical_evidence": result.get(
-            "medical_evidence",
-            {},
-        ),
-        "claims_evidence": result.get(
-            "claims_evidence",
-            {},
-        ),
-        "policy_evidence": result.get(
-            "policy_evidence",
-            {},
-        ),
-        "regulatory_evidence": result.get(
-            "regulatory_evidence",
-            {},
-        ),
-        "underwriting_evidence": result.get(
-            "underwriting_evidence",
-            {},
-        ),
-        "medical_knowledge": result.get(
-            "medical_knowledge",
-            {},
-        ),
-        "coverage_gaps": result.get(
-            "coverage_gaps",
+        underwriting_submission = result.get(
+            "underwriting_submission",
             [],
-        ),
-        "workflow_trace": _trace(
-            state,
-            "agent1_submission",
-            details={
-                "evidence_summary": result.get(
-                    "evidence_summary",
-                    {},
-                ),
-            },
-        ),
-    }
+        )
+
+        underwriting_knowledge = result.get(
+            "underwriting_knowledge_evidence",
+            result.get(
+                "underwriting_evidence",
+                [],
+            ),
+        )
+
+        return {
+            "updated_at": _now(),
+            "final_status": "agent1",
+            "medical_evidence": result.get(
+                "medical_evidence",
+                [],
+            ),
+            "claims_evidence": result.get(
+                "claims_evidence",
+                [],
+            ),
+            "policy_evidence": result.get(
+                "policy_evidence",
+                [],
+            ),
+            "regulatory_evidence": result.get(
+                "regulatory_evidence",
+                [],
+            ),
+            "underwriting_evidence": underwriting_knowledge,
+            "underwriting_submission": underwriting_submission,
+            "underwriting_knowledge_evidence": underwriting_knowledge,
+            "medical_knowledge": result.get(
+                "medical_knowledge",
+                [],
+            ),
+            "coverage_gaps": result.get(
+                "coverage_gaps",
+                [],
+            ),
+            "agent1_enrichment": enrichment,
+            "agent1_completed": True,
+            "workflow_trace": _trace(
+                state,
+                "agent1_submission",
+                details={
+                    "medical_evidence": len(
+                        result.get(
+                            "medical_evidence",
+                            [],
+                        )
+                    ),
+                    "claims_evidence": len(
+                        result.get(
+                            "claims_evidence",
+                            [],
+                        )
+                    ),
+                    "policy_evidence": len(
+                        result.get(
+                            "policy_evidence",
+                            [],
+                        )
+                    ),
+                    "underwriting_submission": (
+                        enrichment.get(
+                            "evidence_summary",
+                            {},
+                        ).get(
+                            "underwriting_submission_documents",
+                            0,
+                        )
+                    ),
+                    "underwriting_knowledge": (
+                        enrichment.get(
+                            "evidence_summary",
+                            {},
+                        ).get(
+                            "underwriting_knowledge_documents",
+                            0,
+                        )
+                    ),
+                    "regulatory_evidence": len(
+                        result.get(
+                            "regulatory_evidence",
+                            [],
+                        )
+                    ),
+                    "coverage_gaps": len(
+                        result.get(
+                            "coverage_gaps",
+                            [],
+                        )
+                    ),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "agent1_submission",
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "updated_at": _now(),
+            "final_status": "failed",
+            "errors": _append_error(
+                state,
+                "agent1_submission",
+                exc,
+            ),
+            "workflow_trace": _trace(
+                state,
+                "agent1_submission",
+                status="failed",
+                details={
+                    "error": str(exc),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "agent1_submission",
+                details={
+                    "error": str(exc),
+                },
+            ),
+        }
 
 
 def complexity_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
-    applicant_profile = state.get(
-        "applicant_profile",
-        {},
-    )
+    try:
+        result = complexity_router.route(
+            applicant_profile=state.get(
+                "applicant_profile",
+                {},
+            ),
+            enrichment_results=state.get(
+                "agent1_enrichment",
+                {},
+            ),
+        )
 
-    enrichment = state.get(
-        "agent1_enrichment",
-        {},
-    )
-
-    result = complexity_router.route(
-        applicant_profile=applicant_profile,
-        enrichment_results=enrichment,
-    )
-
-    return {
-        "current_node": "complexity_router",
-        "complexity_level": result.get(
+        complexity_level = result.get(
             "complexity_level",
             "standard",
-        ),
-        "complexity_reasons": result.get(
-            "complexity_reasons",
-            [],
-        ),
-        "routing_strategy": result.get(
+        )
+
+        routing_strategy = result.get(
             "routing_strategy",
             "plan_and_execute",
-        ),
-        "routing_completed": True,
-        "workflow_trace": _trace(
-            state,
-            "complexity_router",
-            details={
-                "complexity_level": result.get(
-                    "complexity_level"
-                ),
-                "routing_strategy": result.get(
-                    "routing_strategy"
-                ),
-            },
-        ),
-    }
+        )
+
+        return {
+            "updated_at": _now(),
+            "complexity_level": complexity_level,
+            "complexity_reasons": result.get(
+                "complexity_reasons",
+                [],
+            ),
+            "routing_strategy": routing_strategy,
+            "routing_completed": True,
+            "final_status": "agent2",
+            "workflow_trace": _trace(
+                state,
+                "complexity_router",
+                details={
+                    "complexity_level": complexity_level,
+                    "routing_strategy": routing_strategy,
+                    "condition_count": result.get(
+                        "condition_count",
+                        0,
+                    ),
+                    "red_flags": result.get(
+                        "red_flags",
+                        [],
+                    ),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "complexity_router",
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "updated_at": _now(),
+            "final_status": "failed",
+            "errors": _append_error(
+                state,
+                "complexity_router",
+                exc,
+            ),
+            "workflow_trace": _trace(
+                state,
+                "complexity_router",
+                status="failed",
+                details={
+                    "error": str(exc),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "complexity_router",
+                details={
+                    "error": str(exc),
+                },
+            ),
+        }
 
 
 def agent2_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
-    applicant_profile = state.get(
-        "applicant_profile",
-        {},
-    )
+    try:
+        routing_result = {
+            "complexity_level": state.get(
+                "complexity_level",
+                "standard",
+            ),
+            "complexity_reasons": state.get(
+                "complexity_reasons",
+                [],
+            ),
+            "routing_strategy": state.get(
+                "routing_strategy",
+                "plan_and_execute",
+            ),
+        }
 
-    submission = state.get(
-        "submission",
-        {},
-    )
+        result = risk_agent.run(
+            applicant_profile=state.get(
+                "applicant_profile",
+                {},
+            ),
+            submission=state.get(
+                "submission",
+                {},
+            ),
+            enrichment_results=state.get(
+                "agent1_enrichment",
+                {},
+            ),
+            routing_result=routing_result,
+        )
 
-    enrichment = state.get(
-        "agent1_enrichment",
-        {},
-    )
-
-    routing_result = {
-        "complexity_level": state.get(
-            "complexity_level",
-            "standard",
-        ),
-        "complexity_reasons": state.get(
-            "complexity_reasons",
-            [],
-        ),
-        "routing_strategy": state.get(
-            "routing_strategy",
-            "plan_and_execute",
-        ),
-    }
-
-    result = risk_agent.run(
-        applicant_profile=applicant_profile,
-        submission=submission,
-        enrichment_results=enrichment,
-        routing_result=routing_result,
-    )
-
-    risk_assessment = result.get(
-        "risk_assessment",
-        {},
-    )
-
-    pricing = result.get(
-        "pricing_result",
-        {},
-    )
-
-    return {
-        "current_node": "agent2_risk",
-        "risk_assessment": risk_assessment,
-        "medical_risk_score": risk_assessment.get(
-            "medical_risk_score"
-        ),
-        "claims_risk_score": risk_assessment.get(
-            "claims_risk_score"
-        ),
-        "overall_risk_score": risk_assessment.get(
-            "overall_risk_score"
-        ),
-        "pricing_result": pricing,
-        "base_premium": pricing.get(
-            "base_premium"
-        ),
-        "loading_percentage": pricing.get(
-            "loading_percentage"
-        ),
-        "final_premium": pricing.get(
-            "final_premium"
-        ),
-        "agent2_recommendation": result.get(
-            "recommendation",
-            "human_review",
-        ),
-        "agent2_confidence": result.get(
-            "confidence"
-        ),
-        "agent2_reasoning": result.get(
-            "reasoning",
+        risk_assessment = result.get(
+            "risk_assessment",
             {},
-        ).get(
-            "reasoning",
-            "",
-        ),
-        "agent2_completed": True,
-        "workflow_trace": _trace(
-            state,
-            "agent2_risk",
-            details={
-                "risk_score": risk_assessment.get(
-                    "overall_risk_score"
-                ),
-                "recommendation": result.get(
-                    "recommendation"
-                ),
-                "confidence": result.get(
-                    "confidence"
-                ),
-            },
-        ),
-    }
+        )
+
+        pricing = result.get(
+            "pricing_result",
+            {},
+        )
+
+        recommendation = result.get(
+            "agent2_recommendation",
+            "human_review",
+        )
+
+        confidence = float(
+            result.get(
+                "agent2_confidence",
+                0.0,
+            )
+            or 0.0
+        )
+
+        return {
+            "updated_at": _now(),
+            "final_status": "agent2",
+            "risk_assessment": risk_assessment,
+            "medical_risk_score": risk_assessment.get(
+                "medical_risk_score",
+                0.0,
+            ),
+            "claims_risk_score": risk_assessment.get(
+                "claims_risk_score",
+                0.0,
+            ),
+            "coverage_gap_score": risk_assessment.get(
+                "coverage_gap_score",
+                0.0,
+            ),
+            "overall_risk_score": risk_assessment.get(
+                "overall_risk_score",
+                0.0,
+            ),
+            "pricing_result": pricing,
+            "base_premium": pricing.get(
+                "base_premium",
+                0.0,
+            ),
+            "loading_percentage": pricing.get(
+                "loading_percentage",
+                0.0,
+            ),
+            "final_premium": pricing.get(
+                "final_premium",
+                0.0,
+            ),
+            "agent2_recommendation": recommendation,
+            "agent2_confidence": confidence,
+            "agent2_reasoning": result.get(
+                "agent2_reasoning",
+                "",
+            ),
+            "agent2_completed": True,
+            "reflection_requires_rescore": False,
+            "workflow_trace": _trace(
+                state,
+                "agent2_risk",
+                details={
+                    "risk_score": risk_assessment.get(
+                        "overall_risk_score",
+                        0.0,
+                    ),
+                    "recommendation": recommendation,
+                    "confidence": confidence,
+                    "pricing": pricing,
+                    "reflection_round": state.get(
+                        "reflection_round",
+                        0,
+                    ),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "agent2_risk",
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "updated_at": _now(),
+            "final_status": "failed",
+            "errors": _append_error(
+                state,
+                "agent2_risk",
+                exc,
+            ),
+            "workflow_trace": _trace(
+                state,
+                "agent2_risk",
+                status="failed",
+                details={
+                    "error": str(exc),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "agent2_risk",
+                details={
+                    "error": str(exc),
+                },
+            ),
+        }
 
 
 def confidence_gate_node(
@@ -297,41 +522,80 @@ def confidence_gate_node(
         or 0.0
     )
 
-    recommendation = state.get(
-        "agent2_recommendation",
-        "",
+    complexity_level = state.get(
+        "complexity_level",
+        "standard",
     )
 
-    if confidence < 0.60:
-        gate = "human_review"
+    if (
+        confidence >= 0.85
+        and risk_score < 70
+        and complexity_level == "standard"
+    ):
+        confidence_gate = "high"
+        reflection_required = False
 
-    elif confidence < 0.75:
-        gate = "reflection"
-
-    elif risk_score >= 75:
-        gate = "reflection"
-
-    elif recommendation == "human_review":
-        gate = "reflection"
+    elif (
+        complexity_level == "complex"
+        or risk_score >= 70
+        or confidence < 0.70
+    ):
+        confidence_gate = (
+            "medium"
+            if confidence >= 0.70
+            else "low"
+        )
+        reflection_required = True
 
     else:
-        gate = "standard"
-
-    reflection_required = (
-        gate == "reflection"
-    )
+        confidence_gate = "medium"
+        reflection_required = True
 
     return {
-        "current_node": "confidence_gate",
-        "confidence_gate": gate,
+        "updated_at": _now(),
+        "final_status": (
+            "finalize"
+            if not reflection_required
+            else "agent3"
+        ),
+        "confidence_gate": confidence_gate,
         "reflection_required": reflection_required,
+
+        # Agent3 is the single source of truth for the actual
+        # reflection mode. The gate only decides whether reflection
+        # is required.
+        "reflection_type": (
+            "pending"
+            if reflection_required
+            else "none"
+        ),
+
         "workflow_trace": _trace(
             state,
             "confidence_gate",
             details={
                 "confidence": confidence,
                 "risk_score": risk_score,
-                "gate": gate,
+                "complexity_level": complexity_level,
+                "confidence_gate": confidence_gate,
+                "reflection_required": reflection_required,
+                "reflection_mode": (
+                    "pending_agent3"
+                    if reflection_required
+                    else "none"
+                ),
+            },
+        ),
+
+        "audit_trail": _audit(
+            state,
+            "confidence_gate",
+            details={
+                "confidence": confidence,
+                "risk_score": risk_score,
+                "complexity_level": complexity_level,
+                "confidence_gate": confidence_gate,
+                "reflection_required": reflection_required,
             },
         ),
     }
@@ -340,122 +604,267 @@ def confidence_gate_node(
 def reflection_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
-    result = reflection_agent.run(
-        applicant_profile=state.get(
-            "applicant_profile",
-            {},
-        ),
-        submission=state.get(
-            "submission",
-            {},
-        ),
-        enrichment_results=state.get(
-            "agent1_enrichment",
-            {},
-        ),
-        risk_result={
-            "risk_assessment": state.get(
-                "risk_assessment",
-                {},
-            ),
-            "pricing_result": state.get(
-                "pricing_result",
-                {},
-            ),
-            "recommendation": state.get(
-                "agent2_recommendation"
-            ),
-            "confidence": state.get(
-                "agent2_confidence"
-            ),
-            "reasoning": state.get(
-                "agent2_reasoning",
-                "",
-            ),
-        },
-    )
+    try:
+        current_round = int(
+            state.get(
+                "reflection_round",
+                0,
+            )
+            or 0
+        )
 
-    return {
-        "current_node": "agent3_reflection",
-        "reflection_required": result.get(
-            "reflection_required",
-            False,
-        ),
-        "reflection_type": result.get(
-            "reflection_type",
-            "none",
-        ),
-        "reflection_personas": result.get(
-            "reflection_personas",
-            [],
-        ),
-        "reflection_round": result.get(
-            "reflection_round",
-            0,
-        ),
-        "reflection_findings": result.get(
-            "reflection_findings",
-            [],
-        ),
-        "medical_accuracy_check": result.get(
-            "medical_accuracy_check",
-            {},
-        ),
-        "actuarial_soundness_check": result.get(
-            "actuarial_soundness_check",
-            {},
-        ),
-        "regulatory_compliance_check": result.get(
-            "regulatory_compliance_check",
-            {},
-        ),
-        "fairness_check": result.get(
-            "fairness_check",
-            {},
-        ),
-        "explainability_check": result.get(
-            "explainability_check",
-            {},
-        ),
-        "reflection_verdict": result.get(
-            "reflection_verdict",
-            "not_required",
-        ),
-        "require_human_review": result.get(
-            "require_human_review",
-            False,
-        ),
-        "human_review_reason": result.get(
-            "human_review_reason",
-            "",
-        ),
-        "workflow_trace": _trace(
-            state,
-            "agent3_reflection",
-            details={
-                "verdict": result.get(
-                    "reflection_verdict"
+        previous_findings = list(
+            state.get(
+                "reflection_findings",
+                [],
+            )
+        )
+
+        result = reflection_agent.run(
+            applicant_profile=state.get(
+                "applicant_profile",
+                {},
+            ),
+            submission=state.get(
+                "submission",
+                {},
+            ),
+            enrichment_results=state.get(
+                "agent1_enrichment",
+                {},
+            ),
+            risk_result={
+                "risk_assessment": state.get(
+                    "risk_assessment",
+                    {},
                 ),
-                "human_review_required": result.get(
-                    "require_human_review"
+                "pricing_result": state.get(
+                    "pricing_result",
+                    {},
+                ),
+                "agent2_recommendation": state.get(
+                    "agent2_recommendation",
+                    "",
+                ),
+                "agent2_confidence": state.get(
+                    "agent2_confidence",
+                    0.0,
                 ),
             },
-        ),
-    }
+            previous_findings=previous_findings,
+        )
+
+        agent3_round = int(
+            result.get(
+                "reflection_round",
+                1,
+            )
+            or 1
+        )
+
+        next_round = max(
+            current_round + 1,
+            agent3_round,
+        )
+
+        next_round = min(
+            next_round,
+            MAX_REFLECTION_ROUNDS,
+        )
+
+        new_findings = list(
+            result.get(
+                "reflection_findings",
+                [],
+            )
+        )
+
+        combined_findings = (
+            previous_findings
+            + new_findings
+        )
+
+        requires_rescore = bool(
+            result.get(
+                "requires_rescore",
+                False,
+            )
+        )
+
+        require_human = bool(
+            result.get(
+                "require_human_review",
+                False,
+            )
+            or result.get(
+                "require_human_escalation",
+                False,
+            )
+        )
+
+        if next_round >= MAX_REFLECTION_ROUNDS:
+            requires_rescore = False
+
+            if result.get(
+                "reflection_verdict"
+            ) in {
+                "review",
+                "escalate",
+            }:
+                require_human = True
+
+        actual_reflection_type = result.get(
+            "reflection_type",
+            "targeted",
+        )
+
+        return {
+            "updated_at": _now(),
+            "final_status": (
+                "human_review"
+                if require_human
+                else "agent3"
+            ),
+
+            "reflection_required": bool(
+                result.get(
+                    "reflection_required",
+                    True,
+                )
+            ),
+
+            # IMPORTANT:
+            # Store the mode selected by Agent3, not the
+            # preliminary mode from the confidence gate.
+            "reflection_type": actual_reflection_type,
+
+            "reflection_personas": result.get(
+                "reflection_personas",
+                [],
+            ),
+
+            "reflection_round": next_round,
+
+            "reflection_findings": combined_findings,
+
+            "constitutional_medical_accuracy": result.get(
+                "constitutional_medical_accuracy",
+                {},
+            ),
+
+            "constitutional_actuarial_soundness": result.get(
+                "constitutional_actuarial_soundness",
+                {},
+            ),
+
+            "constitutional_regulatory_compliance": result.get(
+                "constitutional_regulatory_compliance",
+                {},
+            ),
+
+            "constitutional_fairness": result.get(
+                "constitutional_fairness",
+                {},
+            ),
+
+            "constitutional_explainability": result.get(
+                "constitutional_explainability",
+                {},
+            ),
+
+            "reflection_verdict": result.get(
+                "reflection_verdict",
+                "pass",
+            ),
+
+            "reflection_requires_rescore": (
+                requires_rescore
+            ),
+
+            "require_human_review": require_human,
+
+            "require_human_escalation": require_human,
+
+            "human_review_reason": result.get(
+                "human_review_reason",
+                "",
+            ),
+
+            "agent3_completed": True,
+
+            "workflow_trace": _trace(
+                state,
+                "agent3_reflection",
+                details={
+                    "reflection_type": actual_reflection_type,
+                    "reflection_round": next_round,
+                    "verdict": result.get(
+                        "reflection_verdict"
+                    ),
+                    "requires_rescore": requires_rescore,
+                    "human_review_required": require_human,
+                    "confidence_gate": state.get(
+                        "confidence_gate"
+                    ),
+                },
+            ),
+
+            "audit_trail": _audit(
+                state,
+                "agent3_reflection",
+                details={
+                    "reflection_type": actual_reflection_type,
+                    "reflection_round": next_round,
+                    "verdict": result.get(
+                        "reflection_verdict"
+                    ),
+                },
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "updated_at": _now(),
+            "final_status": "human_review",
+            "require_human_escalation": True,
+            "human_review_reason": (
+                "Agent 3 reflection failed and requires "
+                "manual underwriting review."
+            ),
+            "errors": _append_error(
+                state,
+                "agent3_reflection",
+                exc,
+            ),
+            "workflow_trace": _trace(
+                state,
+                "agent3_reflection",
+                status="failed",
+                details={
+                    "error": str(exc),
+                },
+            ),
+            "audit_trail": _audit(
+                state,
+                "agent3_reflection",
+                details={
+                    "error": str(exc),
+                },
+            ),
+        }
 
 
 def reflection_router(
     state: UnderwritingState,
 ) -> str:
-    gate = state.get(
-        "confidence_gate",
-        "standard",
+    reflection_required = bool(
+        state.get(
+            "reflection_required",
+            False,
+        )
     )
 
-    if gate == "human_review":
-        return "human_review"
-
-    if gate == "reflection":
+    if reflection_required:
         return "reflection"
 
     return "finalize"
@@ -465,10 +874,27 @@ def post_reflection_router(
     state: UnderwritingState,
 ) -> str:
     if state.get(
-        "require_human_review",
+        "require_human_escalation",
         False,
     ):
         return "human_review"
+
+    reflection_round = int(
+        state.get(
+            "reflection_round",
+            0,
+        )
+        or 0
+    )
+
+    if reflection_round >= MAX_REFLECTION_ROUNDS:
+        return "human_review"
+
+    if state.get(
+        "reflection_requires_rescore",
+        False,
+    ):
+        return "rescore"
 
     verdict = state.get(
         "reflection_verdict",
@@ -476,9 +902,9 @@ def post_reflection_router(
     )
 
     if verdict in {
-        "fail",
-        "escalate",
         "review",
+        "escalate",
+        "fail",
     }:
         return "human_review"
 
@@ -488,20 +914,29 @@ def post_reflection_router(
 def human_review_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
+    reason = state.get(
+        "human_review_reason",
+        "Manual underwriting review required.",
+    )
+
     return {
-        "current_node": "human_review",
-        "workflow_status": "awaiting_human_review",
-        "require_human_review": True,
-        "decision_status": "pending_human_review",
+        "updated_at": _now(),
+        "final_status": "awaiting_human_review",
+        "human_review_status": "awaiting_review",
+        "require_human_escalation": True,
         "workflow_trace": _trace(
             state,
             "human_review",
             status="awaiting",
             details={
-                "reason": state.get(
-                    "human_review_reason",
-                    "Manual review required.",
-                ),
+                "reason": reason,
+            },
+        ),
+        "audit_trail": _audit(
+            state,
+            "human_review",
+            details={
+                "reason": reason,
             },
         ),
     }
@@ -515,104 +950,92 @@ def finalize_node(
         "human_review",
     )
 
-    confidence = state.get(
-        "agent2_confidence"
+    confidence = float(
+        state.get(
+            "agent2_confidence",
+            0.0,
+        )
+        or 0.0
     )
 
-    premium = state.get(
-        "final_premium"
-    )
-
-    loading = state.get(
-        "loading_percentage"
-    )
-
-    reflection_verdict = state.get(
-        "reflection_verdict",
-        "not_required",
+    risk_score = float(
+        state.get(
+            "overall_risk_score",
+            0.0,
+        )
+        or 0.0
     )
 
     if state.get(
-        "require_human_review",
+        "require_human_escalation",
         False,
     ):
-        decision_status = "human_review_required"
+        decision = "human_review_required"
+        status = "awaiting_human_review"
 
     elif recommendation == "standard_acceptance":
-        decision_status = "approved"
+        decision = "approved"
+        status = "completed"
 
     elif recommendation == "accept_with_loading":
-        decision_status = "approved_with_loading"
+        decision = "approved_with_loading"
+        status = "completed"
+
+    elif recommendation == "accept_with_exclusion":
+        decision = "approved_with_exclusion"
+        status = "completed"
+
+    elif recommendation == "postpone":
+        decision = "postponed"
+        status = "completed"
+
+    elif recommendation == "decline":
+        decision = "declined"
+        status = "completed"
+
+    elif recommendation == "human_review":
+        decision = "human_review_required"
+        status = "awaiting_human_review"
 
     else:
-        decision_status = "pending"
-
-    final_decision = {
-        "status": decision_status,
-        "recommendation": recommendation,
-        "confidence": confidence,
-        "premium": premium,
-        "loading_percentage": loading,
-        "risk_score": state.get(
-            "overall_risk_score"
-        ),
-        "reflection_verdict": reflection_verdict,
-        "human_review_required": state.get(
-            "require_human_review",
-            False,
-        ),
-    }
-
-    completed_at = _now()
-
-    started_at = state.get(
-        "started_at"
-    )
-
-    processing_time_ms = None
-
-    if started_at:
-        try:
-            start = datetime.fromisoformat(
-                started_at
-            )
-
-            end = datetime.fromisoformat(
-                completed_at
-            )
-
-            processing_time_ms = round(
-                (
-                    end - start
-                ).total_seconds()
-                * 1000,
-                2,
-            )
-        except ValueError:
-            processing_time_ms = None
+        decision = (
+            recommendation
+            or "pending"
+        )
+        status = "completed"
 
     return {
-        "current_node": "finalize",
-        "workflow_status": (
-            "completed"
-            if decision_status != "human_review_required"
-            else "awaiting_human_review"
-        ),
-        "decision_status": decision_status,
-        "final_decision": final_decision,
+        "updated_at": _now(),
+        "final_decision": decision,
+        "final_status": status,
         "final_recommendation": recommendation,
         "final_confidence": confidence,
-        "completed_at": completed_at,
-        "processing_time_ms": processing_time_ms,
         "workflow_trace": _trace(
             state,
             "finalize",
-            details=final_decision,
+            details={
+                "decision": decision,
+                "recommendation": recommendation,
+                "confidence": confidence,
+                "risk_score": risk_score,
+                "premium": state.get(
+                    "final_premium",
+                    0.0,
+                ),
+                "loading_percentage": state.get(
+                    "loading_percentage",
+                    0.0,
+                ),
+            },
+        ),
+        "audit_trail": _audit(
+            state,
+            "finalize",
         ),
     }
 
 
-def build_graph():
+def build_graph() -> StateGraph:
     graph = StateGraph(
         UnderwritingState
     )
@@ -687,7 +1110,6 @@ def build_graph():
         reflection_router,
         {
             "reflection": "agent3_reflection",
-            "human_review": "human_review",
             "finalize": "finalize",
         },
     )
@@ -696,6 +1118,7 @@ def build_graph():
         "agent3_reflection",
         post_reflection_router,
         {
+            "rescore": "agent2_risk",
             "human_review": "human_review",
             "finalize": "finalize",
         },
@@ -711,7 +1134,43 @@ def build_graph():
         END,
     )
 
-    return graph.compile()
+    return graph
 
 
-underwriting_graph = build_graph()
+memory_saver = MemorySaver()
+
+
+workflow = build_graph().compile(
+    checkpointer=memory_saver,
+    interrupt_before=[
+        "human_review",
+    ],
+)
+
+
+def create_async_graph():
+    return workflow
+
+
+async def run_workflow(
+    initial_state: UnderwritingState,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
+    case_id = initial_state.get(
+        "case_id",
+        "unknown",
+    )
+
+    config = {
+        "configurable": {
+            "thread_id": (
+                thread_id
+                or case_id
+            ),
+        }
+    }
+
+    return await workflow.ainvoke(
+        initial_state,
+        config=config,
+    )

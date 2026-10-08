@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Literal
 
@@ -8,6 +10,7 @@ LLMProvider = Literal["ollama", "groq", "gemini"]
 
 
 class Settings(BaseSettings):
+    # Application
     app_name: str = "MedUnderwrite AI"
     app_version: str = "1.0.0"
     environment: str = "development"
@@ -41,9 +44,9 @@ class Settings(BaseSettings):
     raw_data_path: str = "data/raw"
     synthetic_data_path: str = "data/synthetic"
     processed_data_path: str = "data/processed"
-
-    # Vector database
     chroma_path: str = "data/processed/chroma"
+
+    # RAG
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     top_k_results: int = 5
 
@@ -52,9 +55,8 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "medunderwrite-ai"
 
-    # API
-    cors_origins: str = "http://localhost:4200"
-
+    # API / Security
+    cors_origins: str = "http://localhost:4200,http://localhost:8501"
     secret_key: str = "development-secret-key"
 
     model_config = SettingsConfigDict(
@@ -70,15 +72,39 @@ class Settings(BaseSettings):
 
     @property
     def sqlite_file(self) -> Path:
-        return self.base_path / self.sqlite_path
+        path = self.base_path / self.sqlite_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def data_directory(self) -> Path:
-        return self.base_path / self.data_root
+        path = self.base_path / self.data_root
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def raw_data_directory(self) -> Path:
+        path = self.base_path / self.raw_data_path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def synthetic_data_directory(self) -> Path:
+        path = self.base_path / self.synthetic_data_path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def processed_data_directory(self) -> Path:
+        path = self.base_path / self.processed_data_path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def chroma_directory(self) -> Path:
-        return self.base_path / self.chroma_path
+        path = self.base_path / self.chroma_path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def allowed_origins(self) -> list[str]:
@@ -98,12 +124,14 @@ class Settings(BaseSettings):
                 "reasoning": self.reasoning_model,
                 "reflection": self.reflection_model,
             }
+
         elif self.llm_provider == "groq":
             models = {
                 "planner": self.groq_planner_model,
                 "reasoning": self.groq_reasoning_model,
                 "reflection": self.groq_reflection_model,
             }
+
         else:
             models = {
                 "planner": self.gemini_planner_model,
@@ -122,7 +150,4 @@ class Settings(BaseSettings):
         return model
 
 
-# IMPORTANT:
-# Other modules import this object as:
-# from app.config import settings
 settings = Settings()

@@ -1,393 +1,393 @@
+from __future__ import annotations
+
 import re
 from typing import Any
+
+from app.config import settings
 
 
 class GuardrailResult:
     def __init__(
         self,
         allowed: bool,
-        errors: list[str] | None = None,
-        warnings: list[str] | None = None,
-    ):
+        risk_level: str,
+        reasons: list[str],
+        sanitized_prompt: str,
+        checks: dict[str, Any],
+    ) -> None:
         self.allowed = allowed
-        self.errors = errors or []
-        self.warnings = warnings or []
+        self.risk_level = risk_level
+        self.reasons = reasons
+        self.sanitized_prompt = sanitized_prompt
+        self.checks = checks
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "allowed": self.allowed,
-            "errors": self.errors,
-            "warnings": self.warnings,
+            "risk_level": self.risk_level,
+            "reasons": self.reasons,
+            "sanitized_prompt": self.sanitized_prompt,
+            "checks": self.checks,
         }
 
 
-class UnderwritingGuardrails:
-    MAX_TEXT_LENGTH = 20_000
-    MAX_LIST_ITEMS = 100
+class Guardrails:
+    """
+    Security and safety validation layer for LLM requests.
 
-    BLOCKED_PATTERNS = [
-        r"<script\b",
-        r"javascript:",
+    The guardrail is intentionally deterministic so that unsafe input
+    is rejected before it reaches an LLM.
+    """
+
+    INJECTION_PATTERNS = [
         r"ignore\s+(all\s+)?previous\s+instructions",
+        r"ignore\s+(all\s+)?prior\s+instructions",
         r"disregard\s+(all\s+)?previous\s+instructions",
-        r"system\s*prompt",
+        r"forget\s+(all\s+)?previous\s+instructions",
+        r"system\s+prompt",
+        r"reveal\s+(your\s+)?hidden\s+instructions",
+        r"show\s+(your\s+)?hidden\s+prompt",
         r"developer\s+message",
+        r"jailbreak",
+        r"bypass\s+(the\s+)?safety",
+        r"disable\s+(the\s+)?guardrails",
     ]
 
-    REQUIRED_APPLICANT_FIELDS = [
-        "applicant",
-        "underwriting_request",
+    SECRET_PATTERNS = [
+        r"sk-[A-Za-z0-9]{20,}",
+        r"ghp_[A-Za-z0-9]{20,}",
+        r"AIza[A-Za-z0-9_-]{20,}",
+        r"AKIA[0-9A-Z]{16}",
+        r"-----BEGIN\s+(RSA|OPENSSH|EC|PRIVATE)\s+KEY-----",
     ]
+
+    PII_PATTERNS = {
+        "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "phone": r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)",
+        "aadhaar": r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)",
+        "pan": r"\b[A-Z]{5}\d{4}[A-Z]\b",
+    }
+
+    MEDICAL_DECISION_PATTERNS = [
+        r"guarantee\s+(acceptance|approval)",
+        r"guarantee\s+coverage",
+        r"automatically\s+approve",
+        r"automatically\s+reject",
+        r"deny\s+because\s+of\s+race",
+        r"deny\s+because\s+of\s+religion",
+        r"deny\s+because\s+of\s+gender",
+        r"deny\s+because\s+of\s+caste",
+    ]
+
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def validate_prompt(
+        self,
+        prompt: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> GuardrailResult:
+        if not isinstance(prompt, str):
+            return GuardrailResult(
+                allowed=False,
+                risk_level="high",
+                reasons=["Prompt must be a string."],
+                sanitized_prompt="",
+                checks={"input_type": False},
+            )
+
+        if not prompt.strip():
+            return GuardrailResult(
+                allowed=False,
+                risk_level="high",
+                reasons=["Prompt cannot be empty."],
+                sanitized_prompt="",
+                checks={"non_empty": False},
+            )
+
+        reasons: list[str] = []
+        checks: dict[str, Any] = {}
+
+        normalized = self._normalize(prompt)
+
+        injection_matches = self._find_matches(
+            normalized,
+            self.INJECTION_PATTERNS,
+        )
+
+        secret_matches = self._find_matches(
+            prompt,
+            self.SECRET_PATTERNS,
+        )
+
+        medical_decision_matches = self._find_matches(
+            normalized,
+            self.MEDICAL_DECISION_PATTERNS,
+        )
+
+        pii_matches = self._find_pii(prompt)
+
+        checks["prompt_injection"] = {
+            "passed": not injection_matches,
+            "matches": injection_matches,
+        }
+
+        checks["secrets"] = {
+            "passed": not secret_matches,
+            "matches": secret_matches,
+        }
+
+        checks["pii"] = {
+            "passed": True,
+            "detected": pii_matches,
+        }
+
+        checks["medical_decision_safety"] = {
+            "passed": not medical_decision_matches,
+            "matches": medical_decision_matches,
+        }
+
+        if injection_matches:
+            reasons.append(
+                "Potential prompt injection or instruction override detected."
+            )
+
+        if secret_matches:
+            reasons.append(
+                "Potential API key or secret detected in the prompt."
+            )
+
+        if medical_decision_matches:
+            reasons.append(
+                "Prompt attempts to force an unsafe or predetermined "
+                "underwriting decision."
+            )
+
+        sanitized_prompt = self._sanitize(prompt)
+
+        if pii_matches:
+            reasons.append(
+                "Potential personal identifiers detected and masked."
+            )
+
+        if len(prompt) > 30000:
+            reasons.append("Prompt exceeds the maximum permitted length.")
+
+        checks["length"] = {
+            "passed": len(prompt) <= 30000,
+            "characters": len(prompt),
+        }
+
+        checks["context"] = self._validate_context(context)
+
+        hard_block = bool(
+            injection_matches
+            or secret_matches
+            or medical_decision_matches
+            or len(prompt) > 30000
+        )
+
+        risk_level = self._risk_level(
+            hard_block=hard_block,
+            pii_detected=bool(pii_matches),
+        )
+
+        return GuardrailResult(
+            allowed=not hard_block,
+            risk_level=risk_level,
+            reasons=self._unique(reasons),
+            sanitized_prompt=sanitized_prompt,
+            checks=checks,
+        )
 
     def validate_submission(
         self,
+        applicant_profile: dict[str, Any],
         submission: dict[str, Any],
     ) -> GuardrailResult:
-        errors = []
-        warnings = []
+        if not isinstance(applicant_profile, dict):
+            return GuardrailResult(
+                allowed=False,
+                risk_level="high",
+                reasons=["Applicant profile must be an object."],
+                sanitized_prompt="",
+                checks={"applicant_profile": False},
+            )
 
         if not isinstance(submission, dict):
             return GuardrailResult(
                 allowed=False,
-                errors=["Submission must be a JSON object."],
+                risk_level="high",
+                reasons=["Submission must be an object."],
+                sanitized_prompt="",
+                checks={"submission": False},
             )
 
-        for field in self.REQUIRED_APPLICANT_FIELDS:
-            if field not in submission:
-                errors.append(
-                    f"Missing required field: {field}"
-                )
+        serialized = f"{applicant_profile}\n{submission}"
 
-        if errors:
-            return GuardrailResult(
-                allowed=False,
-                errors=errors,
-                warnings=warnings,
-            )
-
-        self._validate_applicant(
-            submission.get("applicant"),
-            errors,
+        return self.validate_prompt(
+            serialized,
+            context={
+                "type": "underwriting_submission",
+                "applicant_id": applicant_profile.get("applicant_id"),
+            },
         )
 
-        self._validate_medical(
-            submission.get("medical", {}),
-            errors,
-            warnings,
-        )
-
-        self._validate_claims(
-            submission.get("claims", []),
-            errors,
-        )
-
-        self._validate_underwriting_request(
-            submission.get(
-                "underwriting_request"
-            ),
-            errors,
-        )
-
-        self._scan_for_prompt_injection(
-            submission,
-            errors,
-        )
-
-        return GuardrailResult(
-            allowed=len(errors) == 0,
-            errors=errors,
-            warnings=warnings,
-        )
-
-    def validate_query(
+    def validate_output(
         self,
-        query: str,
+        output: Any,
     ) -> GuardrailResult:
-        errors = []
-        warnings = []
-
-        if not isinstance(query, str):
+        if output is None:
             return GuardrailResult(
                 allowed=False,
-                errors=["Query must be a string."],
+                risk_level="high",
+                reasons=["LLM returned an empty response."],
+                sanitized_prompt="",
+                checks={"output_present": False},
             )
 
-        query = query.strip()
+        text = (
+            output
+            if isinstance(output, str)
+            else str(output)
+        )
 
-        if not query:
-            errors.append(
-                "Query cannot be empty."
-            )
+        normalized = self._normalize(text)
 
-        if len(query) > self.MAX_TEXT_LENGTH:
-            errors.append(
-                "Query exceeds the maximum allowed length."
-            )
+        forbidden = [
+            r"guaranteed\s+approval",
+            r"guaranteed\s+coverage",
+            r"guaranteed\s+acceptance",
+        ]
 
-        if self._contains_blocked_pattern(query):
-            errors.append(
-                "Query contains a blocked instruction pattern."
-            )
+        matches = self._find_matches(
+            normalized,
+            forbidden,
+        )
 
         return GuardrailResult(
-            allowed=len(errors) == 0,
-            errors=errors,
-            warnings=warnings,
+            allowed=not bool(matches),
+            risk_level="high" if matches else "low",
+            reasons=(
+                ["Output contains an unsupported guarantee."]
+                if matches
+                else []
+            ),
+            sanitized_prompt=text,
+            checks={
+                "output_present": True,
+                "unsupported_guarantee": {
+                    "passed": not bool(matches),
+                    "matches": matches,
+                },
+            },
         )
 
-    def sanitize_text(
-        self,
-        value: str,
-    ) -> str:
-        if not isinstance(value, str):
-            return ""
+    def _sanitize(self, text: str) -> str:
+        sanitized = text
 
-        value = value.replace(
-            "\x00",
-            "",
-        )
-
-        value = re.sub(
-            r"<script\b[^>]*>.*?</script>",
-            "",
-            value,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        return value.strip()
-
-    def _validate_applicant(
-        self,
-        applicant: Any,
-        errors: list[str],
-    ) -> None:
-        if not isinstance(applicant, dict):
-            errors.append(
-                "Applicant must be an object."
-            )
-            return
-
-        applicant_id = applicant.get(
-            "applicant_id"
-        )
-
-        if not applicant_id:
-            errors.append(
-                "Applicant ID is required."
-            )
-        elif not self._valid_identifier(
-            applicant_id
-        ):
-            errors.append(
-                "Applicant ID contains invalid characters."
-            )
-
-        age = applicant.get("age")
-
-        if age is not None:
-            if not isinstance(age, int):
-                errors.append(
-                    "Applicant age must be an integer."
-                )
-            elif age < 0 or age > 120:
-                errors.append(
-                    "Applicant age must be between 0 and 120."
-                )
-
-    def _validate_medical(
-        self,
-        medical: Any,
-        errors: list[str],
-        warnings: list[str],
-    ) -> None:
-        if not isinstance(medical, dict):
-            errors.append(
-                "Medical information must be an object."
-            )
-            return
-
-        for field in [
-            "conditions",
-            "icd10_codes",
-            "medications",
-            "procedures",
-        ]:
-            value = medical.get(
-                field,
-                [],
-            )
-
-            if not isinstance(value, list):
-                errors.append(
-                    f"Medical field '{field}' must be a list."
-                )
-                continue
-
-            if len(value) > self.MAX_LIST_ITEMS:
-                errors.append(
-                    f"Medical field '{field}' contains too many items."
-                )
-
-        if not medical.get("conditions"):
-            warnings.append(
-                "No medical conditions were provided."
-            )
-
-    def _validate_claims(
-        self,
-        claims: Any,
-        errors: list[str],
-    ) -> None:
-        if not isinstance(claims, list):
-            errors.append(
-                "Claims must be a list."
-            )
-            return
-
-        if len(claims) > self.MAX_LIST_ITEMS:
-            errors.append(
-                "Submission contains too many claims."
-            )
-
-        for index, claim in enumerate(claims):
-            if not isinstance(claim, dict):
-                errors.append(
-                    f"Claim {index} must be an object."
-                )
-                continue
-
-            if not claim.get("claim_id"):
-                errors.append(
-                    f"Claim {index} is missing claim_id."
-                )
-
-    def _validate_underwriting_request(
-        self,
-        request: Any,
-        errors: list[str],
-    ) -> None:
-        if not isinstance(request, dict):
-            errors.append(
-                "Underwriting request must be an object."
-            )
-            return
-
-        product = request.get("product")
-
-        if not isinstance(product, str) or not product.strip():
-            errors.append(
-                "Underwriting product is required."
-            )
-
-        sum_insured = request.get(
-            "sum_insured"
-        )
-
-        if not isinstance(
-            sum_insured,
-            (int, float),
-        ):
-            errors.append(
-                "Sum insured must be numeric."
-            )
-        elif sum_insured <= 0:
-            errors.append(
-                "Sum insured must be greater than zero."
-            )
-
-        policy_term = request.get(
-            "policy_term_years",
-            1,
-        )
-
-        if not isinstance(policy_term, int):
-            errors.append(
-                "Policy term must be an integer."
-            )
-        elif policy_term < 1 or policy_term > 10:
-            errors.append(
-                "Policy term must be between 1 and 10 years."
-            )
-
-    def _scan_for_prompt_injection(
-        self,
-        value: Any,
-        errors: list[str],
-    ) -> None:
-        text_values = self._extract_strings(
-            value
-        )
-
-        for text in text_values:
-            if self._contains_blocked_pattern(
-                text
-            ):
-                errors.append(
-                    "Potential prompt injection detected "
-                    "in submission content."
-                )
-                return
-
-    def _contains_blocked_pattern(
-        self,
-        value: str,
-    ) -> bool:
-        for pattern in self.BLOCKED_PATTERNS:
-            if re.search(
+        for name, pattern in self.PII_PATTERNS.items():
+            sanitized = re.sub(
                 pattern,
-                value,
+                f"[REDACTED_{name.upper()}]",
+                sanitized,
                 flags=re.IGNORECASE,
-            ):
-                return True
+            )
 
-        return False
+        for pattern in self.SECRET_PATTERNS:
+            sanitized = re.sub(
+                pattern,
+                "[REDACTED_SECRET]",
+                sanitized,
+                flags=re.IGNORECASE,
+            )
+
+        return sanitized
 
     @staticmethod
-    def _valid_identifier(
-        value: Any,
-    ) -> bool:
-        if not isinstance(value, str):
-            return False
-
-        return bool(
-            re.fullmatch(
-                r"[A-Za-z0-9_-]+",
-                value,
-            )
+    def _normalize(text: str) -> str:
+        return re.sub(
+            r"\s+",
+            " ",
+            text.lower().strip(),
         )
 
     @staticmethod
-    def _extract_strings(
-        value: Any,
+    def _find_matches(
+        text: str,
+        patterns: list[str],
     ) -> list[str]:
-        if isinstance(value, str):
-            return [value]
+        matches: list[str] = []
 
-        if isinstance(value, dict):
-            strings = []
+        for pattern in patterns:
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    matches.append(pattern)
+            except re.error:
+                continue
 
-            for item in value.values():
-                strings.extend(
-                    UnderwritingGuardrails._extract_strings(
-                        item
-                    )
-                )
+        return matches
 
-            return strings
+    def _find_pii(self, text: str) -> list[str]:
+        detected: list[str] = []
 
-        if isinstance(value, list):
-            strings = []
+        for name, pattern in self.PII_PATTERNS.items():
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    detected.append(name)
+            except re.error:
+                continue
 
-            for item in value:
-                strings.extend(
-                    UnderwritingGuardrails._extract_strings(
-                        item
-                    )
-                )
+        return detected
 
-            return strings
+    @staticmethod
+    def _validate_context(
+        context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if context is None:
+            return {
+                "provided": False,
+                "passed": True,
+            }
 
-        return []
+        if not isinstance(context, dict):
+            return {
+                "provided": True,
+                "passed": False,
+            }
+
+        return {
+            "provided": True,
+            "passed": True,
+            "keys": list(context.keys())[:20],
+        }
+
+    @staticmethod
+    def _risk_level(
+        *,
+        hard_block: bool,
+        pii_detected: bool,
+    ) -> str:
+        if hard_block:
+            return "high"
+
+        if pii_detected:
+            return "medium"
+
+        return "low"
+
+    @staticmethod
+    def _unique(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+
+        return result
 
 
-guardrails = UnderwritingGuardrails()
+guardrails = Guardrails()

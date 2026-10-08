@@ -2,194 +2,215 @@ from pathlib import Path
 from typing import Any
 
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.config import Settings as ChromaSettings
+from sentence_transformers import SentenceTransformer
 
 from app.config import settings
 
 
 class VectorStore:
-    def __init__(
-        self,
-        persist_path: str | Path | None = None,
-        embedding_model: str | None = None,
-    ):
-        self.persist_path = Path(
-            persist_path or settings.chroma_path
+    def __init__(self):
+        self.persist_directory = Path(
+            settings.chroma_directory
         )
 
-        if not self.persist_path.is_absolute():
-            self.persist_path = (
-                settings.base_path / self.persist_path
-            )
-
-        self.persist_path.mkdir(
+        self.persist_directory.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        self.embedding_model = (
-            embedding_model or settings.embedding_model
+        self.embedding_model = SentenceTransformer(
+            settings.embedding_model
         )
+
+        self.embedding_model.max_seq_length = 256
 
         self.client = chromadb.PersistentClient(
-            path=str(self.persist_path)
+            path=str(self.persist_directory),
+            settings=ChromaSettings(
+                anonymized_telemetry=False,
+            ),
         )
 
-        self.embedding_function = (
-            SentenceTransformerEmbeddingFunction(
-                model_name=self.embedding_model
-            )
-        )
-
-    def get_or_create_collection(
-        self,
-        name: str,
-    ):
+    def get_collection(self, collection_name: str):
         return self.client.get_or_create_collection(
-            name=name,
-            embedding_function=self.embedding_function,
+            name=collection_name,
+            metadata={
+                "hnsw:space": "cosine",
+            },
         )
+
+    def list_collections(self) -> list[str]:
+        return [
+            collection.name
+            for collection in self.client.list_collections()
+        ]
+
+    def _embed_documents(
+        self,
+        documents: list[str],
+    ) -> list[list[float]]:
+        if not documents:
+            return []
+
+        embeddings = self.embedding_model.encode(
+            documents,
+            batch_size=8,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+
+        return embeddings.tolist()
+
+    def _embed_query(
+        self,
+        query_text: str,
+    ) -> list[float]:
+        embedding = self.embedding_model.encode(
+            [query_text],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+
+        return embedding[0].tolist()
 
     def add_documents(
         self,
         collection_name: str,
         documents: list[str],
-        ids: list[str],
         metadatas: list[dict[str, Any]] | None = None,
-    ) -> None:
+        ids: list[str] | None = None,
+    ) -> int:
         if not documents:
-            return
+            return 0
 
-        if len(documents) != len(ids):
+        if metadatas is not None and len(metadatas) != len(documents):
             raise ValueError(
-                "documents and ids must have the same length."
+                "metadatas length must match documents length"
             )
 
-        if metadatas and len(metadatas) != len(documents):
+        if ids is not None and len(ids) != len(documents):
             raise ValueError(
-                "metadatas and documents must have the same length."
+                "ids length must match documents length"
             )
 
-        collection = self.get_or_create_collection(
+        collection = self.get_collection(
             collection_name
         )
 
+        if ids is None:
+            ids = [
+                f"{collection_name}_{index}"
+                for index in range(len(documents))
+            ]
+
+        embeddings = self._embed_documents(
+            documents
+        )
+
         collection.upsert(
-            documents=documents,
             ids=ids,
+            documents=documents,
+            embeddings=embeddings,
             metadatas=metadatas,
         )
+
+        return len(documents)
 
     def query(
         self,
         collection_name: str,
-        query: str,
-        top_k: int | None = None,
+        query_text: str,
+        n_results: int = 5,
         where: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        collection = self.get_or_create_collection(
+    ) -> dict[str, Any]:
+        if not query_text or not query_text.strip():
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+            }
+
+        collection = self.get_collection(
             collection_name
         )
 
-        count = collection.count()
+        collection_count = collection.count()
 
-        if count == 0:
-            return []
+        if collection_count == 0:
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+            }
 
-        requested_k = top_k or settings.top_k_results
-        n_results = min(requested_k, count)
-
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            where=where,
-            include=[
-                "documents",
-                "metadatas",
-                "distances",
-            ],
+        query_embedding = self._embed_query(
+            query_text
         )
 
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        ids = results.get("ids", [[]])[0]
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": min(
+                n_results,
+                collection_count,
+            ),
+        }
 
-        output = []
+        if where:
+            kwargs["where"] = where
 
-        for index, document in enumerate(documents):
-            output.append(
-                {
-                    "id": ids[index] if index < len(ids) else None,
-                    "document": document,
-                    "metadata": (
-                        metadatas[index]
-                        if index < len(metadatas)
-                        else {}
-                    ),
-                    "distance": (
-                        distances[index]
-                        if index < len(distances)
-                        else None
-                    ),
-                }
-            )
-
-        return output
+        return collection.query(**kwargs)
 
     def get_documents(
         self,
         collection_name: str,
-        ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
+        limit: int = 100,
     ) -> dict[str, Any]:
-        collection = self.get_or_create_collection(
+        collection = self.get_collection(
             collection_name
         )
 
-        if ids:
-            return collection.get(
-                ids=ids,
-                include=[
-                    "documents",
-                    "metadatas",
-                ],
-            )
+        kwargs: dict[str, Any] = {
+            "limit": limit,
+        }
 
-        return collection.get(
-            include=[
-                "documents",
-                "metadatas",
-            ],
-        )
+        if where:
+            kwargs["where"] = where
 
-    def delete_documents(
+        return collection.get(**kwargs)
+
+    def count(
         self,
         collection_name: str,
-        ids: list[str],
-    ) -> None:
-        if not ids:
-            return
-
-        collection = self.get_or_create_collection(
+    ) -> int:
+        collection = self.get_collection(
             collection_name
         )
 
-        collection.delete(ids=ids)
+        return collection.count()
 
-    def delete_collection(
-        self,
-        collection_name: str,
-    ) -> None:
+    def health_check(self) -> dict[str, Any]:
         try:
-            self.client.delete_collection(
-                name=collection_name
-            )
-        except Exception:
-            pass
+            collections = self.list_collections()
 
-    def list_collections(self) -> list[str]:
-        collections = self.client.list_collections()
-        return [collection.name for collection in collections]
+            return {
+                "status": "healthy",
+                "persist_directory": str(
+                    self.persist_directory
+                ),
+                "collections": collections,
+            }
+
+        except Exception as exc:
+            return {
+                "status": "unhealthy",
+                "error": str(exc),
+            }
 
 
 vector_store = VectorStore()

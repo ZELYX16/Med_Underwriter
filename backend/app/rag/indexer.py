@@ -9,13 +9,6 @@ from app.store.vector_store import vector_store
 
 
 class DocumentIndexer:
-    """
-    Indexes MedUnderwrite documents into Chroma.
-
-    Applicant documents are stored in the applicant_documents
-    collection with metadata required for filtered retrieval.
-    """
-
     COLLECTION_NAME = "applicant_documents"
 
     DOCUMENT_TYPE_MAP = {
@@ -26,25 +19,36 @@ class DocumentIndexer:
         "applicants": "applicant_profile",
     }
 
+    SUPPORTED_EXTENSIONS = {
+        ".pdf",
+        ".txt",
+        ".json",
+        ".csv",
+    }
+
     def index_applicant(
         self,
         applicant_id: str,
         applicant_directory: str | Path,
     ) -> dict[str, Any]:
-        directory = Path(applicant_directory)
+        directory = Path(
+            applicant_directory
+        )
 
         if not directory.exists():
             raise FileNotFoundError(
                 f"Applicant directory not found: {directory}"
             )
 
-        files = [
+        files = sorted(
             path
             for path in directory.rglob("*")
-            if path.is_file()
-            and path.suffix.lower()
-            in {".pdf", ".txt", ".json", ".csv"}
-        ]
+            if (
+                path.is_file()
+                and path.suffix.lower()
+                in self.SUPPORTED_EXTENSIONS
+            )
+        )
 
         if not files:
             return {
@@ -52,34 +56,67 @@ class DocumentIndexer:
                 "indexed": False,
                 "documents": 0,
                 "chunks": 0,
-                "message": "No supported documents found.",
+                "details": [],
+                "message": (
+                    "No supported documents found."
+                ),
             }
 
         total_chunks = 0
-        indexed_documents = []
+        indexed_documents: list[
+            dict[str, Any]
+        ] = []
 
         for file_path in files:
-            document_type = self._get_document_type(
-                file_path
+            document_type = (
+                self._get_document_type(
+                    file_path
+                )
             )
 
-            document_id = self._extract_document_id(
-                file_path
+            document_id = (
+                self._extract_document_id(
+                    file_path
+                )
             )
 
-            chunks = document_loader.load_file(
-                file_path
-            )
+            try:
+                chunks = (
+                    document_loader.load_file(
+                        file_path
+                    )
+                )
+            except Exception as exc:
+                indexed_documents.append(
+                    {
+                        "document_id": document_id,
+                        "document_type": document_type,
+                        "file_name": file_path.name,
+                        "chunks": 0,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
 
             if not chunks:
                 continue
 
-            documents = []
-            metadatas = []
-            ids = []
+            documents: list[str] = []
+            metadatas: list[
+                dict[str, Any]
+            ] = []
+            ids: list[str] = []
 
-            for index, chunk in enumerate(chunks):
-                text = chunk.get("text", "").strip()
+            for index, chunk in enumerate(
+                chunks
+            ):
+                text = str(
+                    chunk.get(
+                        "text",
+                        "",
+                    )
+                ).strip()
 
                 if not text:
                     continue
@@ -94,7 +131,10 @@ class DocumentIndexer:
                     "applicant_id": applicant_id,
                     "document_id": document_id,
                     "document_type": document_type,
-                    "source": "synthetic_applicant_document",
+                    "evidence_scope": "applicant",
+                    "source": (
+                        "synthetic_applicant_document"
+                    ),
                     "file_name": file_path.name,
                     "file_path": str(file_path),
                     "chunk_index": index,
@@ -104,15 +144,22 @@ class DocumentIndexer:
                 metadatas.append(metadata)
                 ids.append(chunk_id)
 
-            if documents:
+            if not documents:
+                continue
+
+            try:
                 vector_store.add_documents(
-                    collection_name=self.COLLECTION_NAME,
+                    collection_name=(
+                        self.COLLECTION_NAME
+                    ),
                     documents=documents,
                     metadatas=metadatas,
                     ids=ids,
                 )
 
-                total_chunks += len(documents)
+                total_chunks += len(
+                    documents
+                )
 
                 indexed_documents.append(
                     {
@@ -120,13 +167,39 @@ class DocumentIndexer:
                         "document_type": document_type,
                         "file_name": file_path.name,
                         "chunks": len(documents),
+                        "status": "indexed",
                     }
                 )
 
+            except Exception as exc:
+                indexed_documents.append(
+                    {
+                        "document_id": document_id,
+                        "document_type": document_type,
+                        "file_name": file_path.name,
+                        "chunks": 0,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
+        successful_documents = sum(
+            1
+            for item in indexed_documents
+            if item.get("status") == "indexed"
+        )
+
+        failed_documents = sum(
+            1
+            for item in indexed_documents
+            if item.get("status") == "failed"
+        )
+
         return {
             "applicant_id": applicant_id,
-            "indexed": bool(indexed_documents),
-            "documents": len(indexed_documents),
+            "indexed": successful_documents > 0,
+            "documents": successful_documents,
+            "failed_documents": failed_documents,
             "chunks": total_chunks,
             "details": indexed_documents,
         }
@@ -149,39 +222,68 @@ class DocumentIndexer:
                 f"Applicants directory not found: {root}"
             )
 
-        applicant_directories = [
+        applicant_directories = sorted(
             path
             for path in root.iterdir()
             if path.is_dir()
-        ]
+        )
 
-        results = []
+        results: list[
+            dict[str, Any]
+        ] = []
 
-        for directory in sorted(
-            applicant_directories
-        ):
-            applicant_id = directory.name
-
+        for directory in applicant_directories:
             result = self.index_applicant(
-                applicant_id=applicant_id,
+                applicant_id=directory.name,
                 applicant_directory=directory,
             )
-
             results.append(result)
 
         return {
             "root": str(root),
-            "applicants_processed": len(results),
+            "applicants_processed": len(
+                results
+            ),
             "documents_indexed": sum(
-                result["documents"]
+                result.get(
+                    "documents",
+                    0,
+                )
+                for result in results
+            ),
+            "documents_failed": sum(
+                result.get(
+                    "failed_documents",
+                    0,
+                )
                 for result in results
             ),
             "chunks_indexed": sum(
-                result["chunks"]
+                result.get(
+                    "chunks",
+                    0,
+                )
                 for result in results
             ),
             "results": results,
         }
+
+    def index_directory(
+        self,
+        directory: str | Path,
+        applicant_id: str | None = None,
+    ) -> dict[str, Any]:
+        path = Path(directory)
+
+        resolved_applicant_id = (
+            applicant_id
+            or path.name
+        )
+
+        return self.index_applicant(
+            applicant_id=resolved_applicant_id,
+            applicant_directory=path,
+        )
 
     def _get_document_type(
         self,
@@ -192,22 +294,26 @@ class DocumentIndexer:
             for part in file_path.parts
         }
 
-        for folder, document_type in (
-            self.DOCUMENT_TYPE_MAP.items()
-        ):
+        for (
+            folder,
+            document_type,
+        ) in self.DOCUMENT_TYPE_MAP.items():
             if folder in parts:
                 return document_type
 
         return "other"
 
+    @staticmethod
     def _extract_document_id(
-        self,
         file_path: Path,
     ) -> str:
         filename = file_path.stem
 
         if "_" in filename:
-            return filename.split("_", 1)[0]
+            return filename.split(
+                "_",
+                1,
+            )[0]
 
         return filename
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.config import settings
@@ -8,92 +9,384 @@ from app.store.vector_store import vector_store
 
 class MedGraphRAG:
     """
-    MedGraphRAG-inspired medical retrieval layer.
+    Medical Graph RAG.
 
-    The medical graph concept connects:
-        applicant evidence
-            ↓
-        medical concepts
-            ↓
-        disease / medication / comorbidity relationships
-            ↓
-        relevant medical evidence
+    Uses two retrieval paths:
 
-    Medical knowledge is kept separate from regulatory
-    and underwriting knowledge.
+    1. Top-down:
+       Exact ICD-10 / SNOMED / concept metadata matching.
+
+    2. Bottom-up:
+       Semantic retrieval followed by graph-context enrichment.
+
+    This layer contains medical knowledge only.
+    Regulatory and underwriting knowledge remain separate.
     """
 
-    MEDICAL_COLLECTION = "medical_knowledge"
-    APPLICANT_COLLECTION = "applicant_documents"
+    COLLECTION_NAME = "medical_knowledge"
+
+    CODE_PATTERNS = [
+        re.compile(
+            r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b"
+        ),
+    ]
 
     def __init__(self) -> None:
         self.top_k = settings.top_k_results
 
-    def _search(
+    def search_medical_knowledge(
         self,
-        collection_name: str,
         query: str,
         top_k: int | None = None,
-        where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        if not query.strip():
+        if not query or not query.strip():
             return []
 
-        limit = top_k or self.top_k
+        limit = max(
+            1,
+            min(
+                top_k or self.top_k,
+                20,
+            ),
+        )
 
+        exact_results = self._exact_code_search(
+            query=query,
+            top_k=limit,
+        )
+
+        semantic_results = self._semantic_search(
+            query=query,
+            top_k=limit,
+        )
+
+        combined = self._merge_results(
+            exact_results,
+            semantic_results,
+        )
+
+        return self._enrich_graph_context(
+            combined[:limit]
+        )
+
+    def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.search_medical_knowledge(
+            query=query,
+            top_k=top_k,
+        )
+
+    def retrieve_for_applicant(
+        self,
+        applicant_profile: dict[str, Any],
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        queries = self._build_applicant_queries(
+            applicant_profile
+        )
+
+        limit = max(
+            1,
+            min(
+                top_k or self.top_k,
+                20,
+            ),
+        )
+
+        combined: list[
+            dict[str, Any]
+        ] = []
+
+        seen: set[str] = set()
+
+        for query in queries:
+            results = self.search_medical_knowledge(
+                query=query,
+                top_k=limit,
+            )
+
+            for result in results:
+                key = self._result_key(
+                    result
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                combined.append(result)
+
+                if len(combined) >= limit:
+                    return combined[:limit]
+
+        return combined[:limit]
+
+    def _exact_code_search(
+        self,
+        query: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        codes = self._extract_codes(
+            query
+        )
+
+        if not codes:
+            return []
+
+        results: list[
+            dict[str, Any]
+        ] = []
+
+        for code in codes:
+            for metadata_filter in (
+                {
+                    "code": code,
+                },
+                {
+                    "concept_id": code,
+                },
+            ):
+                try:
+                    raw = vector_store.query(
+                        collection_name=(
+                            self.COLLECTION_NAME
+                        ),
+                        query_text=query,
+                        n_results=top_k,
+                        where=metadata_filter,
+                    )
+
+                except Exception:
+                    continue
+
+                results.extend(
+                    self._normalize_results(
+                        raw
+                    )
+                )
+
+        return self._deduplicate(
+            results
+        )
+
+    def _semantic_search(
+        self,
+        query: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
         try:
             results = vector_store.query(
-                collection_name=collection_name,
+                collection_name=(
+                    self.COLLECTION_NAME
+                ),
                 query_text=query,
-                n_results=limit,
-                where=where,
+                n_results=top_k,
             )
+
         except Exception:
             return []
 
-        return self._normalize_results(results)
+        return self._normalize_results(
+            results
+        )
 
-    def _normalize_results(
+    def _build_applicant_queries(
         self,
-        results: dict[str, Any] | None,
+        applicant_profile: dict[str, Any],
+    ) -> list[str]:
+        conditions = applicant_profile.get(
+            "medical_conditions",
+            [],
+        )
+
+        medications = applicant_profile.get(
+            "medications",
+            [],
+        )
+
+        queries: list[str] = []
+
+        if conditions:
+            queries.append(
+                "medical conditions "
+                + " ".join(
+                    str(condition)
+                    for condition in conditions
+                )
+            )
+
+            queries.extend(
+                str(condition)
+                for condition in conditions
+                if str(condition).strip()
+            )
+
+        if medications:
+            queries.append(
+                "medications "
+                + " ".join(
+                    str(medication)
+                    for medication in medications
+                )
+            )
+
+            queries.extend(
+                str(medication)
+                for medication in medications
+                if str(medication).strip()
+            )
+
+        if not queries:
+            queries.append(
+                "medical conditions "
+                "diagnosis treatment "
+                "comorbidity medication"
+            )
+
+        return [
+            query.strip()
+            for query in queries
+            if query.strip()
+        ]
+
+    @staticmethod
+    def _extract_codes(
+        query: str,
+    ) -> list[str]:
+        codes: list[str] = []
+
+        for pattern in MedGraphRAG.CODE_PATTERNS:
+            for match in pattern.findall(query):
+                normalized = str(match).upper()
+
+                if normalized not in codes:
+                    codes.append(normalized)
+
+        return codes
+
+    @staticmethod
+    def _merge_results(
+        exact_results: list[
+            dict[str, Any]
+        ],
+        semantic_results: list[
+            dict[str, Any]
+        ],
     ) -> list[dict[str, Any]]:
-        if not results:
+        return MedGraphRAG._deduplicate(
+            exact_results
+            + semantic_results
+        )
+
+    @staticmethod
+    def _enrich_graph_context(
+        results: list[
+            dict[str, Any]
+        ],
+    ) -> list[dict[str, Any]]:
+        enriched: list[
+            dict[str, Any]
+        ] = []
+
+        for result in results:
+            metadata = result.get(
+                "metadata",
+                {},
+            )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+                metadata = {}
+
+            graph_context = {
+                "concept_id": metadata.get(
+                    "concept_id"
+                ),
+                "concept_type": metadata.get(
+                    "concept_type"
+                ),
+                "code_system": metadata.get(
+                    "code_system"
+                ),
+                "code": metadata.get(
+                    "code"
+                ),
+                "related_concepts": (
+                    metadata.get(
+                        "related_concepts",
+                        [],
+                    )
+                ),
+                "relationships": (
+                    metadata.get(
+                        "relationships",
+                        [],
+                    )
+                ),
+            }
+
+            enriched.append(
+                {
+                    **result,
+                    "graph_context": (
+                        graph_context
+                    ),
+                }
+            )
+
+        return enriched
+
+    @staticmethod
+    def _normalize_results(
+        results: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(
+            results,
+            dict,
+        ):
             return []
 
         documents = results.get(
             "documents",
-            [[]],
+            [],
         )
 
         metadatas = results.get(
             "metadatas",
-            [[]],
+            [],
         )
 
         distances = results.get(
             "distances",
-            [[]],
+            [],
         )
 
-        documents = (
-            documents[0]
-            if documents
-            else []
-        )
+        if documents and isinstance(
+            documents[0],
+            list,
+        ):
+            documents = documents[0]
 
-        metadatas = (
-            metadatas[0]
-            if metadatas
-            else []
-        )
+        if metadatas and isinstance(
+            metadatas[0],
+            list,
+        ):
+            metadatas = metadatas[0]
 
-        distances = (
-            distances[0]
-            if distances
-            else []
-        )
+        if distances and isinstance(
+            distances[0],
+            list,
+        ):
+            distances = distances[0]
 
-        output: list[dict[str, Any]] = []
+        normalized: list[
+            dict[str, Any]
+        ] = []
 
         for index, document in enumerate(
             documents
@@ -101,6 +394,10 @@ class MedGraphRAG:
             metadata = (
                 metadatas[index]
                 if index < len(metadatas)
+                and isinstance(
+                    metadatas[index],
+                    dict,
+                )
                 else {}
             )
 
@@ -110,297 +407,101 @@ class MedGraphRAG:
                 else None
             )
 
-            output.append(
+            normalized.append(
                 {
                     "content": document,
-                    "metadata": metadata or {},
+                    "metadata": metadata,
                     "distance": distance,
+                    "document_id": (
+                        metadata.get(
+                            "document_id"
+                        )
+                    ),
                     "source": metadata.get(
-                        "source",
-                        "unknown",
+                        "source"
                     ),
-                    "concept_id": metadata.get(
-                        "concept_id"
+                    "file_name": metadata.get(
+                        "file_name"
                     ),
-                    "concept_type": metadata.get(
-                        "concept_type"
+                    "concept_id": (
+                        metadata.get(
+                            "concept_id"
+                        )
                     ),
-                    "concept_name": metadata.get(
-                        "concept_name"
+                    "concept_type": (
+                        metadata.get(
+                            "concept_type"
+                        )
+                    ),
+                    "code_system": (
+                        metadata.get(
+                            "code_system"
+                        )
+                    ),
+                    "code": metadata.get(
+                        "code"
                     ),
                 }
             )
 
-        return output
+        return normalized
 
-    def search_medical_knowledge(
-        self,
-        query: str,
-        top_k: int | None = None,
-    ) -> dict[str, Any]:
-        """
-        Search the medical knowledge collection.
-
-        Expected knowledge sources include:
-        - ICD-10-CM
-        - RxNorm
-        - medical reference material
-        """
-
-        results = self._search(
-            collection_name=self.MEDICAL_COLLECTION,
-            query=query,
-            top_k=top_k,
+    @staticmethod
+    def _result_key(
+        result: dict[str, Any],
+    ) -> str:
+        metadata = result.get(
+            "metadata",
+            {},
         )
 
-        return {
-            "query": query,
-            "results": results,
-            "result_count": len(results),
-        }
+        if not isinstance(
+            metadata,
+            dict,
+        ):
+            metadata = {}
 
-    def search_applicant_evidence(
-        self,
-        applicant_id: str,
-        query: str,
-        top_k: int | None = None,
+        return str(
+            result.get("document_id")
+            or metadata.get(
+                "document_id"
+            )
+            or result.get("file_name")
+            or metadata.get(
+                "file_name"
+            )
+            or result.get(
+                "content",
+                "",
+            )[:150]
+        )
+
+    @staticmethod
+    def _deduplicate(
+        results: list[
+            dict[str, Any]
+        ],
     ) -> list[dict[str, Any]]:
-        """
-        Retrieve medical evidence belonging to one applicant.
-        """
-
-        if not applicant_id:
-            return []
-
-        return self._search(
-            collection_name=self.APPLICANT_COLLECTION,
-            query=query,
-            top_k=top_k,
-            where={
-                "$and": [
-                    {
-                        "applicant_id": applicant_id
-                    },
-                    {
-                        "document_type": "medical"
-                    },
-                ]
-            },
-        )
-
-    def retrieve_medical_concepts(
-        self,
-        conditions: list[str],
-        medications: list[str],
-        top_k: int | None = None,
-    ) -> dict[str, Any]:
-        """
-        Retrieve medical knowledge for the applicant's
-        conditions and medications.
-        """
-
-        condition_results: list[
+        unique: list[
             dict[str, Any]
         ] = []
 
-        medication_results: list[
-            dict[str, Any]
-        ] = []
+        seen: set[str] = set()
 
-        for condition in conditions:
-            condition_results.extend(
-                self._search(
-                    collection_name=self.MEDICAL_COLLECTION,
-                    query=condition,
-                    top_k=top_k,
+        for result in results:
+            key = (
+                MedGraphRAG._result_key(
+                    result
                 )
             )
 
-        for medication in medications:
-            medication_results.extend(
-                self._search(
-                    collection_name=self.MEDICAL_COLLECTION,
-                    query=medication,
-                    top_k=top_k,
-                )
-            )
+            if key in seen:
+                continue
 
-        return {
-            "conditions": conditions,
-            "medications": medications,
-            "condition_knowledge": condition_results,
-            "medication_knowledge": medication_results,
-        }
+            seen.add(key)
+            unique.append(result)
 
-    def retrieve_for_applicant(
-        self,
-        applicant_id: str,
-        applicant_profile: dict[str, Any],
-        top_k: int | None = None,
-    ) -> dict[str, Any]:
-        """
-        Main MedGraphRAG retrieval entry point for Agent 1.
-        """
-
-        conditions = self._extract_conditions(
-            applicant_profile
-        )
-
-        medications = self._extract_medications(
-            applicant_profile
-        )
-
-        condition_query = (
-            ", ".join(conditions)
-            if conditions
-            else "general medical health"
-        )
-
-        medical_evidence = (
-            self.search_applicant_evidence(
-                applicant_id=applicant_id,
-                query=condition_query,
-                top_k=top_k,
-            )
-        )
-
-        medical_knowledge = (
-            self.retrieve_medical_concepts(
-                conditions=conditions,
-                medications=medications,
-                top_k=top_k,
-            )
-        )
-
-        relationships = self._build_relationships(
-            conditions=conditions,
-            medications=medications,
-            knowledge=medical_knowledge,
-        )
-
-        return {
-            "applicant_id": applicant_id,
-            "conditions": conditions,
-            "medications": medications,
-            "medical_evidence": medical_evidence,
-            "medical_knowledge": medical_knowledge,
-            "relationships": relationships,
-            "evidence_count": len(
-                medical_evidence
-            ),
-        }
-
-    def _extract_conditions(
-        self,
-        applicant_profile: dict[str, Any],
-    ) -> list[str]:
-        conditions = applicant_profile.get(
-            "medical_conditions",
-            applicant_profile.get(
-                "conditions",
-                [],
-            ),
-        )
-
-        if isinstance(
-            conditions,
-            str,
-        ):
-            return [conditions]
-
-        return [
-            str(condition)
-            for condition in conditions
-            if condition
-        ]
-
-    def _extract_medications(
-        self,
-        applicant_profile: dict[str, Any],
-    ) -> list[str]:
-        medications = applicant_profile.get(
-            "medications",
-            [],
-        )
-
-        if isinstance(
-            medications,
-            str,
-        ):
-            return [medications]
-
-        return [
-            str(medication)
-            for medication in medications
-            if medication
-        ]
-
-    def _build_relationships(
-        self,
-        conditions: list[str],
-        medications: list[str],
-        knowledge: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """
-        Build a lightweight relationship representation.
-
-        This does not invent medical relationships. It only
-        connects concepts when they are present in retrieved
-        knowledge metadata.
-        """
-
-        relationships: list[
-            dict[str, Any]
-        ] = []
-
-        condition_knowledge = knowledge.get(
-            "condition_knowledge",
-            [],
-        )
-
-        medication_knowledge = knowledge.get(
-            "medication_knowledge",
-            [],
-        )
-
-        for result in (
-            condition_knowledge
-            + medication_knowledge
-        ):
-            metadata = result.get(
-                "metadata",
-                {},
-            )
-
-            relation_type = metadata.get(
-                "relation_type"
-            )
-
-            source_concept = metadata.get(
-                "source_concept"
-            )
-
-            target_concept = metadata.get(
-                "target_concept"
-            )
-
-            if (
-                relation_type
-                and source_concept
-                and target_concept
-            ):
-                relationships.append(
-                    {
-                        "source": source_concept,
-                        "relation": relation_type,
-                        "target": target_concept,
-                        "source_document": result.get(
-                            "source"
-                        ),
-                    }
-                )
-
-        return relationships
+        return unique
 
 
 medgraph_rag = MedGraphRAG()

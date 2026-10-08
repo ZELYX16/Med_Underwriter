@@ -1,204 +1,223 @@
+from __future__ import annotations
+
 from typing import Any
 
 
-class ReflectionPersona:
-    def __init__(
-        self,
-        name: str,
-        objective: str,
-        checks: list[str],
-    ):
-        self.name = name
-        self.objective = objective
-        self.checks = checks
+class MARPersonas:
+    PERSONAS = {
+        "medical_expert": (
+            "Review clinical accuracy, medical evidence, "
+            "conditions, treatments, and medical risk."
+        ),
+        "actuary": (
+            "Review risk scoring, loading, pricing logic, "
+            "and actuarial consistency."
+        ),
+        "compliance_officer": (
+            "Review regulatory evidence, underwriting rules, "
+            "and compliance concerns."
+        ),
+        "customer_advocate": (
+            "Review fairness, explainability, proportionality, "
+            "and unsupported demographic influence."
+        ),
+    }
 
-    def build_prompt(
+    def review(
         self,
         applicant_profile: dict[str, Any],
-        submission: dict[str, Any],
+        risk_assessment: dict[str, Any],
+        pricing_result: dict[str, Any],
+        recommendation: str,
         evidence: dict[str, Any],
-        risk_result: dict[str, Any],
-    ) -> str:
-        checks = "\n".join(
-            f"- {check}"
-            for check in self.checks
+        selected_personas: list[str] | None = None,
+        previous_findings: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        outputs: dict[str, dict[str, Any]] = {}
+
+        active_personas = (
+            selected_personas
+            if selected_personas
+            else list(self.PERSONAS.keys())
         )
 
-        return f"""
-You are the {self.name} reviewer in a
-multi-agent medical insurance underwriting system.
+        for persona in active_personas:
+            if persona not in self.PERSONAS:
+                continue
 
-Objective:
-{self.objective}
-
-Review these areas:
-{checks}
-
-Applicant:
-{applicant_profile}
-
-Submission:
-{submission}
-
-Available evidence:
-{evidence}
-
-Proposed risk assessment:
-{risk_result}
-
-Review rules:
-- Use only the supplied evidence.
-- Do not invent facts.
-- Do not create medical diagnoses.
-- Do not invent regulations or policy terms.
-- Clearly identify unsupported assumptions.
-- Recommend human review when the evidence is insufficient.
-
-Return:
-
-verdict=<pass|concern|fail>
-finding=<short finding>
-evidence=<supporting evidence>
-action=<recommended action>
-"""
-
-
-class MedicalReviewer(ReflectionPersona):
-    def __init__(self):
-        super().__init__(
-            name="Medical Accuracy Reviewer",
-            objective=(
-                "Verify that the medical interpretation "
-                "is consistent with the available clinical "
-                "evidence."
-            ),
-            checks=[
-                "diagnoses and medical conditions",
-                "medication interpretation",
-                "hospitalization history",
-                "procedures and clinical events",
-                "medical risk reasoning",
-            ],
-        )
-
-
-class ActuarialReviewer(ReflectionPersona):
-    def __init__(self):
-        super().__init__(
-            name="Actuarial Soundness Reviewer",
-            objective=(
-                "Check whether the risk assessment and "
-                "pricing logic are internally consistent "
-                "and supported by approved evidence."
-            ),
-            checks=[
-                "risk score consistency",
-                "risk factor weighting",
-                "loading rationale",
-                "premium calculation",
-                "unsupported actuarial assumptions",
-            ],
-        )
-
-
-class RegulatoryReviewer(ReflectionPersona):
-    def __init__(self):
-        super().__init__(
-            name="Regulatory Compliance Reviewer",
-            objective=(
-                "Verify that regulatory conclusions are "
-                "supported by the applicable regulatory "
-                "evidence."
-            ),
-            checks=[
-                "jurisdiction",
-                "IRDAI requirements",
-                "regulatory evidence",
-                "compliance reasoning",
-                "unsupported regulatory claims",
-            ],
-        )
-
-
-class FairnessReviewer(ReflectionPersona):
-    def __init__(self):
-        super().__init__(
-            name="Fairness Reviewer",
-            objective=(
-                "Check whether the underwriting recommendation "
-                "relies on legitimate risk evidence rather "
-                "than irrelevant demographic characteristics."
-            ),
-            checks=[
-                "relevance of demographic attributes",
-                "medical evidence versus demographic assumptions",
-                "consistent treatment of comparable risk",
-                "unsupported bias",
-                "explainable risk factors",
-            ],
-        )
-
-
-class ExplainabilityReviewer(ReflectionPersona):
-    def __init__(self):
-        super().__init__(
-            name="Explainability Reviewer",
-            objective=(
-                "Verify that the proposed underwriting "
-                "recommendation can be clearly explained "
-                "using traceable evidence."
-            ),
-            checks=[
-                "evidence-to-decision traceability",
-                "decision rationale",
-                "risk factor explanation",
-                "pricing explanation",
-                "missing evidence",
-            ],
-        )
-
-
-class MARPersonaRegistry:
-    def __init__(self):
-        self._personas = {
-            "medical_accuracy": MedicalReviewer(),
-            "actuarial_soundness": ActuarialReviewer(),
-            "regulatory_compliance": RegulatoryReviewer(),
-            "fairness": FairnessReviewer(),
-            "explainability": ExplainabilityReviewer(),
-        }
-
-    def get(
-        self,
-        name: str,
-    ) -> ReflectionPersona:
-        if name not in self._personas:
-            raise ValueError(
-                f"Unknown reflection persona: {name}"
+            outputs[persona] = self._review_persona(
+                persona=persona,
+                focus=self.PERSONAS[persona],
+                applicant_profile=applicant_profile,
+                risk_assessment=risk_assessment,
+                pricing_result=pricing_result,
+                recommendation=recommendation,
+                evidence=evidence,
+                previous_findings=previous_findings or [],
             )
 
-        return self._personas[name]
+        synthesis = self._synthesize(outputs)
 
-    def get_many(
+        return {
+            "persona_outputs": outputs,
+            "consensus": synthesis["consensus"],
+            "verdict": synthesis["verdict"],
+            "disagreements": synthesis["disagreements"],
+            "requires_rescore": synthesis["requires_rescore"],
+        }
+
+    def _review_persona(
         self,
-        names: list[str],
-    ) -> list[ReflectionPersona]:
-        return [
-            self.get(name)
-            for name in names
+        persona: str,
+        focus: str,
+        applicant_profile: dict[str, Any],
+        risk_assessment: dict[str, Any],
+        pricing_result: dict[str, Any],
+        recommendation: str,
+        evidence: dict[str, Any],
+        previous_findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        concerns: list[str] = []
+        previous_persona_findings = [
+            finding.get("finding", "")
+            for finding in previous_findings
+            if finding.get("persona") == persona
+            and finding.get("finding")
         ]
 
-    def all(
+        previous_context = ""
+
+        if previous_persona_findings:
+            previous_context = (
+                "Previous reflection finding was reconsidered: "
+                + previous_persona_findings[-1]
+            )
+        if not evidence:
+            concerns.append(
+                "Insufficient evidence available for independent review."
+            )
+
+        if not risk_assessment:
+            concerns.append(
+                "Risk assessment is missing."
+            )
+
+        if not pricing_result:
+            concerns.append(
+                "Pricing assessment is missing."
+            )
+
+        if not recommendation:
+            concerns.append(
+                "Underwriting recommendation is missing."
+            )
+
+        if persona == "compliance_officer":
+            regulatory = evidence.get(
+                "regulatory_evidence",
+                [],
+            )
+
+            if not regulatory:
+                concerns.append(
+                    "Regulatory evidence is unavailable."
+                )
+
+        if persona == "actuary":
+            risk_score = risk_assessment.get(
+                "overall_risk_score"
+            )
+
+            if risk_score is None:
+                concerns.append(
+                    "Overall risk score is unavailable."
+                )
+
+        if persona == "medical_expert":
+            medical = evidence.get(
+                "medical_evidence",
+                [],
+            )
+
+            if not medical and risk_assessment.get(
+                "risk_factors"
+            ):
+                concerns.append(
+                    "Medical risk factors are not directly "
+                    "supported by retrieved medical evidence."
+                )
+
+        previous_concern_findings = [
+            finding.get("finding", "")
+            for finding in previous_findings
+            if finding.get("persona") == persona
+            and finding.get("verdict") in {
+                "concern",
+                "flag",
+                "review",
+            }
+            and finding.get("finding")
+        ]
+
+        if previous_concern_findings and not concerns:
+            concerns.append(
+                "Previous reflection concern remains unresolved: "
+                + previous_concern_findings[-1]
+            )
+
+        verdict = (
+            "flag"
+            if concerns
+            else "pass"
+        )
+
+        return {
+            "persona": persona,
+            "focus": focus,
+            "verdict": verdict,
+            "concerns": concerns,
+            "reasoning": (
+                "Review identified one or more concerns."
+                if concerns
+                else "Review completed with no material concerns."
+            ),
+        }
+
+    def _synthesize(
         self,
-    ) -> list[ReflectionPersona]:
-        return list(
-            self._personas.values()
-        )
+        outputs: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        verdicts = [
+            result.get("verdict", "flag")
+            for result in outputs.values()
+        ]
 
-    def names(self) -> list[str]:
-        return list(
-            self._personas.keys()
-        )
+        passes = verdicts.count("pass")
+        flags = verdicts.count("flag")
+
+        disagreements: list[str] = []
+
+        if passes and flags:
+            disagreements.append(
+                "Reflection personas did not reach unanimous consensus."
+            )
+
+        if flags >= 2:
+            verdict = "escalate"
+            requires_rescore = True
+        elif flags == 1:
+            verdict = "review"
+            requires_rescore = True
+        else:
+            verdict = "pass"
+            requires_rescore = False
+
+        return {
+            "consensus": len(set(verdicts)) == 1,
+            "verdict": verdict,
+            "disagreements": disagreements,
+            "requires_rescore": requires_rescore,
+        }
 
 
-mar_personas = MARPersonaRegistry()
+mar_personas = MARPersonas()

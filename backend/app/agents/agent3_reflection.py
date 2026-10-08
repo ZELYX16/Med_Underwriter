@@ -1,24 +1,17 @@
+from __future__ import annotations
+
 from typing import Any
 
-from app.llm.factory import get_llm
+from app.agents.reflection.constitutional import (
+    constitutional_checker,
+)
+from app.agents.reflection.mar_personas import (
+    mar_personas,
+)
 
 
 class ReflectionAgent:
-    PERSONAS = [
-        "medical_accuracy",
-        "actuarial_soundness",
-        "regulatory_compliance",
-        "fairness",
-        "explainability",
-    ]
-
-    MAX_REFLECTION_ROUNDS = 2
-
-    def __init__(self):
-        self.llm = get_llm(
-            role="reflection",
-            temperature=0.0,
-        )
+    MAX_REFLECTION_ROUNDS = 3
 
     def run(
         self,
@@ -26,105 +19,139 @@ class ReflectionAgent:
         submission: dict[str, Any],
         enrichment_results: dict[str, Any],
         risk_result: dict[str, Any],
+        previous_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         confidence = float(
             risk_result.get(
-                "confidence",
-                0.0,
+                "agent2_confidence",
+                risk_result.get("confidence", 0.0),
             )
             or 0.0
         )
+        previous_findings = previous_findings or []
 
         risk_assessment = risk_result.get(
             "risk_assessment",
             {},
         )
 
-        overall_risk = float(
-            risk_assessment.get(
-                "overall_risk_score",
-                0.0,
-            )
-            or 0.0
+        pricing_result = risk_result.get(
+            "pricing_result",
+            {},
         )
 
-        reflection_required = (
-            confidence < 0.75
-            or overall_risk >= 60
-            or risk_result.get(
-                "recommendation"
-            )
-            == "human_review"
+        recommendation = risk_result.get(
+            "agent2_recommendation",
+            risk_result.get("recommendation", ""),
         )
 
-        if not reflection_required:
-            return self._build_no_reflection_result(
-                risk_result
+        evidence = enrichment_results or {}
+
+        constitutional = constitutional_checker.check(
+            applicant_profile=applicant_profile,
+            risk_assessment=risk_assessment,
+            pricing_result=pricing_result,
+            recommendation=recommendation,
+            evidence=evidence,
+        )
+
+        flag_count = sum(
+            1
+            for result in constitutional.values()
+            if result.get("status") == "flag"
+        )
+
+        reflection_type = self._select_reflection_type(
+            confidence=confidence,
+            flag_count=flag_count,
+            risk_assessment=risk_assessment,
+        )
+
+        if reflection_type == "none":
+            return self._no_reflection_result(
+                recommendation=recommendation,
+                confidence=confidence,
+                constitutional=constitutional,
+            )
+
+        if reflection_type == "lightweight":
+            return self._lightweight_result(
+                recommendation=recommendation,
+                confidence=confidence,
+                constitutional=constitutional,
             )
 
         personas = self._select_personas(
-            confidence=confidence,
-            overall_risk=overall_risk,
-            enrichment_results=enrichment_results,
+            reflection_type=reflection_type,
+            constitutional=constitutional,
         )
 
-        findings = []
+        findings: list[dict[str, Any]] = []
+        reflection_round = 1
+        final_mar: dict[str, Any] = {}
 
-        for round_number in range(
-            1,
-            self.MAX_REFLECTION_ROUNDS + 1,
-        ):
-            round_findings = self._run_reflection_round(
-                round_number=round_number,
-                personas=personas,
+        while reflection_round <= self.MAX_REFLECTION_ROUNDS:
+            mar_result = mar_personas.review(
                 applicant_profile=applicant_profile,
-                submission=submission,
-                enrichment_results=enrichment_results,
-                risk_result=risk_result,
+                risk_assessment=risk_assessment,
+                pricing_result=pricing_result,
+                recommendation=recommendation,
+                evidence=evidence,
+                selected_personas=personas,
+                previous_findings=previous_findings,
+            )
+
+            round_findings = self._convert_mar_findings(
+                round_number=reflection_round,
+                mar_result=mar_result,
             )
 
             findings.extend(round_findings)
+            previous_findings = round_findings
+            final_mar = mar_result
 
-            if not self._needs_another_round(
-                round_findings
-            ):
+            if mar_result.get("consensus"):
                 break
 
-        checks = self._build_checks(
-            findings
-        )
+            reflection_round += 1
+
+        if reflection_round > self.MAX_REFLECTION_ROUNDS:
+            reflection_round = self.MAX_REFLECTION_ROUNDS
 
         verdict = self._determine_verdict(
-            findings=findings,
-            risk_result=risk_result,
+            mar_result=final_mar,
+            constitutional=constitutional,
+            flag_count=flag_count,
         )
 
-        human_review_required = (
-            verdict in {
-                "fail",
-                "escalate",
-            }
-            or confidence < 0.60
+        require_human_review = (
+            reflection_round >= self.MAX_REFLECTION_ROUNDS
+            and not final_mar.get("consensus", False)
+        ) or verdict == "escalate"
+
+        requires_rescore = (
+            bool(final_mar.get("requires_rescore"))
+            and not require_human_review
+        )
+
+        human_reason = self._human_review_reason(
+            verdict=verdict,
+            findings=findings,
+            consensus=final_mar.get("consensus", False),
+        )
+
+        checks = self._build_checks(
+            constitutional=constitutional,
+            findings=findings,
         )
 
         return {
             "reflection_required": True,
-            "reflection_type": "multi_persona",
+            "reflection_type": reflection_type,
             "reflection_personas": personas,
-            "reflection_round": min(
-                self.MAX_REFLECTION_ROUNDS,
-                max(
-                    (
-                        finding.get(
-                            "round",
-                            1,
-                        )
-                        for finding in findings
-                    ),
-                    default=1,
-                ),
-            ),
+            "reflection_round": reflection_round,
             "reflection_findings": findings,
+
             "medical_accuracy_check": checks[
                 "medical_accuracy"
             ],
@@ -134,323 +161,374 @@ class ReflectionAgent:
             "regulatory_compliance_check": checks[
                 "regulatory_compliance"
             ],
-            "fairness_check": checks[
-                "fairness"
-            ],
+            "fairness_check": checks["fairness"],
             "explainability_check": checks[
                 "explainability"
             ],
+
+            "constitutional_medical_accuracy": constitutional.get(
+                "medical_accuracy",
+                {},
+            ),
+            "constitutional_actuarial_soundness": constitutional.get(
+                "actuarial_soundness",
+                {},
+            ),
+            "constitutional_regulatory_compliance": constitutional.get(
+                "regulatory_compliance",
+                {},
+            ),
+            "constitutional_fairness": constitutional.get(
+                "fairness",
+                {},
+            ),
+            "constitutional_explainability": constitutional.get(
+                "explainability",
+                {},
+            ),
+
             "reflection_verdict": verdict,
-            "require_human_review": human_review_required,
-            "human_review_reason": self._human_review_reason(
-                verdict,
-                findings,
-            ),
-            "advisory": self._build_advisory(
-                verdict,
-                findings,
-                risk_result,
-            ),
+            "require_human_review": require_human_review,
+            "require_human_escalation": require_human_review,
+            "human_review_reason": human_reason,
+
+            "requires_rescore": requires_rescore,
+            "advisory": {
+                "verdict": verdict,
+                "consensus": final_mar.get(
+                    "consensus",
+                    False,
+                ),
+                "disagreements": final_mar.get(
+                    "disagreements",
+                    [],
+                ),
+                "recommended_actions": [
+                    finding.get("action", "")
+                    for finding in findings
+                    if finding.get("action")
+                ],
+                "original_recommendation": recommendation,
+                "original_confidence": confidence,
+            },
         }
 
-    def _run_reflection_round(
-        self,
-        round_number: int,
-        personas: list[str],
-        applicant_profile: dict[str, Any],
-        submission: dict[str, Any],
-        enrichment_results: dict[str, Any],
-        risk_result: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        findings = []
-
-        for persona in personas:
-            finding = self._evaluate_persona(
-                round_number=round_number,
-                persona=persona,
-                applicant_profile=applicant_profile,
-                submission=submission,
-                enrichment_results=enrichment_results,
-                risk_result=risk_result,
+    @staticmethod
+    def _select_reflection_type(
+        confidence: float,
+        flag_count: int,
+        risk_assessment: dict[str, Any],
+    ) -> str:
+        medical_risk_score = float(
+            risk_assessment.get(
+                "medical_risk_score",
+                0.0,
             )
-
-            findings.append(finding)
-
-        return findings
-
-    def _evaluate_persona(
-        self,
-        round_number: int,
-        persona: str,
-        applicant_profile: dict[str, Any],
-        submission: dict[str, Any],
-        enrichment_results: dict[str, Any],
-        risk_result: dict[str, Any],
-    ) -> dict[str, Any]:
-        prompt = f"""
-You are performing a safety reflection for a medical
-insurance underwriting decision-support system.
-
-Reflection persona:
-{persona}
-
-Applicant:
-{applicant_profile}
-
-Submission:
-{submission}
-
-Evidence:
-{enrichment_results}
-
-Proposed risk assessment:
-{risk_result}
-
-Evaluate only from the perspective of your assigned
-persona.
-
-Do not invent missing evidence.
-Do not make a new medical diagnosis.
-Do not create regulatory requirements.
-Do not assume unsupported pricing rules.
-
-Return exactly:
-
-verdict=<pass|concern|fail>
-finding=<short finding>
-evidence=<evidence supporting the finding>
-action=<recommended corrective action>
-
-Persona guidance:
-
-medical_accuracy:
-Check whether medical reasoning is supported by the
-available medical evidence.
-
-actuarial_soundness:
-Check whether risk and pricing reasoning is internally
-consistent and whether unsupported actuarial assumptions
-are being made.
-
-regulatory_compliance:
-Check whether regulatory claims are supported by the
-retrieved regulatory evidence.
-
-fairness:
-Check whether the recommendation relies improperly on
-protected or irrelevant demographic characteristics.
-
-explainability:
-Check whether the recommendation can be explained using
-the evidence provided.
-"""
-
-        response = self.llm.invoke(prompt)
-
-        parsed = self._parse_response(
-            response.content
+            or 0.0
         )
 
-        return {
-            "round": round_number,
-            "persona": persona,
-            "verdict": parsed["verdict"],
-            "finding": parsed["finding"],
-            "evidence": parsed["evidence"],
-            "action": parsed["action"],
+        overall_risk_score = float(
+            risk_assessment.get(
+                "overall_risk_score",
+                0.0,
+            )
+            or 0.0
+        )
+
+        risk_factors = risk_assessment.get(
+            "risk_factors",
+            [],
+        )
+
+        high_risk_factor = any(
+            any(
+                keyword in str(factor).lower()
+                for keyword in (
+                    "myocardial infarction",
+                    "heart attack",
+                    "coronary artery disease",
+                    "cad",
+                    "major cardiac",
+                    "cancer",
+                    "malignancy",
+                    "organ failure",
+                    "transplant",
+                )
+            )
+            for factor in risk_factors
+        )
+
+        if (
+            medical_risk_score >= 80
+            or overall_risk_score >= 70
+            or high_risk_factor
+            or flag_count >= 2
+        ):
+            return "full_mar"
+
+        if (
+            confidence >= 0.85
+            and flag_count == 0
+            and medical_risk_score < 60
+            and overall_risk_score < 60
+        ):
+            return "lightweight"
+
+        if 0.70 <= confidence < 0.85:
+            return "targeted"
+
+        if confidence < 0.70:
+            return "full_mar"
+
+        return "targeted"
+
+    @staticmethod
+    def _select_personas(
+        reflection_type: str,
+        constitutional: dict[str, Any],
+    ) -> list[str]:
+        if reflection_type == "full_mar":
+            return [
+                "medical_expert",
+                "actuary",
+                "compliance_officer",
+                "customer_advocate",
+            ]
+
+        personas = []
+
+        mapping = {
+            "medical_accuracy": "medical_expert",
+            "actuarial_soundness": "actuary",
+            "regulatory_compliance": "compliance_officer",
+            "fairness": "customer_advocate",
+            "explainability": "customer_advocate",
         }
 
-    def _select_personas(
-        self,
-        confidence: float,
-        overall_risk: float,
-        enrichment_results: dict[str, Any],
-    ) -> list[str]:
-        personas = [
-            "medical_accuracy",
-            "regulatory_compliance",
-            "explainability",
-        ]
-
-        if overall_risk >= 45:
-            personas.append(
-                "actuarial_soundness"
+        for principle, persona in mapping.items():
+            result = constitutional.get(
+                principle,
+                {},
             )
 
-        if confidence < 0.75:
-            personas.append(
-                "fairness"
-            )
+            if result.get("status") == "flag":
+                if persona not in personas:
+                    personas.append(persona)
+
+        if not personas:
+            personas = [
+                "medical_expert",
+                "customer_advocate",
+            ]
 
         return personas
 
     @staticmethod
-    def _needs_another_round(
-        findings: list[dict[str, Any]],
-    ) -> bool:
-        return any(
-            finding.get("verdict")
-            in {
-                "concern",
-                "fail",
-            }
-            for finding in findings
+    def _convert_mar_findings(
+        round_number: int,
+        mar_result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        findings = []
+
+        persona_outputs = mar_result.get(
+            "persona_outputs",
+            {},
         )
+
+        for persona, output in persona_outputs.items():
+            verdict = output.get(
+                "verdict",
+                "flag",
+            )
+
+            if verdict == "pass":
+                normalized = "pass"
+            elif verdict == "flag":
+                normalized = "concern"
+            else:
+                normalized = "fail"
+
+            concerns = output.get(
+                "concerns",
+                [],
+            )
+
+            findings.append(
+                {
+                    "round": round_number,
+                    "persona": persona,
+                    "verdict": normalized,
+                    "finding": (
+                        output.get("reasoning")
+                        or "; ".join(concerns)
+                    ),
+                    "evidence": (
+                        concerns
+                        if concerns
+                        else [
+                            "Review completed using "
+                            "available evidence."
+                        ]
+                    ),
+                    "action": (
+                        "Re-score the underwriting assessment."
+                        if normalized != "pass"
+                        else ""
+                    ),
+                }
+            )
+
+        return findings
+
+    @staticmethod
+    def _determine_verdict(
+        mar_result: dict[str, Any],
+        constitutional: dict[str, Any],
+        flag_count: int,
+    ) -> str:
+        if flag_count >= 2:
+            return "escalate"
+
+        if not mar_result:
+            return "review"
+
+        if mar_result.get("verdict") == "escalate":
+            return "escalate"
+
+        if mar_result.get("requires_rescore"):
+            return "review"
+
+        if flag_count == 1:
+            return "review"
+
+        if mar_result.get("consensus"):
+            if mar_result.get("verdict") == "pass":
+                return "pass"
+
+            if mar_result.get("verdict") == "review":
+                return "review"
+
+        return "review"
 
     @staticmethod
     def _build_checks(
+        constitutional: dict[str, Any],
         findings: list[dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        checks = {}
+        checks: dict[str, dict[str, Any]] = {}
 
-        for persona in ReflectionAgent.PERSONAS:
-            persona_findings = [
+        principles = [
+            "medical_accuracy",
+            "actuarial_soundness",
+            "regulatory_compliance",
+            "fairness",
+            "explainability",
+        ]
+
+        for principle in principles:
+            constitutional_result = constitutional.get(
+                principle,
+                {},
+            )
+
+            principle_findings = [
                 finding
                 for finding in findings
                 if finding.get("persona")
-                == persona
-            ]
-
-            if not persona_findings:
-                checks[persona] = {
-                    "status": "not_run",
-                    "findings": [],
+                in {
+                    "medical_expert"
+                    if principle == "medical_accuracy"
+                    else "actuary"
+                    if principle == "actuarial_soundness"
+                    else "compliance_officer"
+                    if principle == "regulatory_compliance"
+                    else "customer_advocate"
+                    if principle in {
+                        "fairness",
+                        "explainability",
+                    }
+                    else ""
                 }
-                continue
-
-            verdicts = [
-                finding.get(
-                    "verdict"
-                )
-                for finding in persona_findings
+                and finding.get("verdict") != "pass"
             ]
 
-            if "fail" in verdicts:
-                status = "fail"
-            elif "concern" in verdicts:
-                status = "concern"
-            else:
-                status = "pass"
-
-            checks[persona] = {
-                "status": status,
-                "findings": persona_findings,
+            checks[principle] = {
+                "status": constitutional_result.get(
+                    "status",
+                    "flag",
+                ),
+                "passed": constitutional_result.get(
+                    "passed",
+                    False,
+                ),
+                "reason": constitutional_result.get(
+                    "reason",
+                    "",
+                ),
+                "findings": principle_findings,
             }
 
         return checks
 
     @staticmethod
-    def _determine_verdict(
-        findings: list[dict[str, Any]],
-        risk_result: dict[str, Any],
-    ) -> str:
-        if any(
-            finding.get("verdict") == "fail"
-            for finding in findings
-        ):
-            return "fail"
-
-        concern_count = sum(
-            finding.get("verdict") == "concern"
-            for finding in findings
+    def _lightweight_result(
+        recommendation: str,
+        confidence: float,
+        constitutional: dict[str, Any],
+    ) -> dict[str, Any]:
+        flag_count = sum(
+            1
+            for result in constitutional.values()
+            if result.get("status") == "flag"
         )
 
-        if concern_count >= 2:
-            return "escalate"
-
-        if concern_count == 1:
-            return "review"
-
-        return "pass"
-
-    @staticmethod
-    def _human_review_reason(
-        verdict: str,
-        findings: list[dict[str, Any]],
-    ) -> str:
-        if verdict == "fail":
-            return (
-                "Reflection identified a critical "
-                "issue requiring human underwriting review."
-            )
-
-        if verdict == "escalate":
-            return (
-                "Multiple reflection concerns require "
-                "human underwriting review."
-            )
-
-        if verdict == "review":
-            return (
-                "A reflection concern was identified "
-                "and should be reviewed."
-            )
-
-        return ""
-
-    @staticmethod
-    def _build_advisory(
-        verdict: str,
-        findings: list[dict[str, Any]],
-        risk_result: dict[str, Any],
-    ) -> dict[str, Any]:
-        actions = [
-            finding.get("action")
-            for finding in findings
-            if finding.get("action")
-        ]
+        verdict = "review" if flag_count else "pass"
 
         return {
-            "verdict": verdict,
-            "recommended_actions": actions,
-            "original_recommendation": risk_result.get(
-                "recommendation"
+            "reflection_required": True,
+            "reflection_type": "lightweight",
+            "reflection_personas": [],
+            "reflection_round": 1,
+            "reflection_findings": [],
+            "medical_accuracy_check": constitutional.get(
+                "medical_accuracy",
+                {},
             ),
-            "original_confidence": risk_result.get(
-                "confidence"
+            "actuarial_soundness_check": constitutional.get(
+                "actuarial_soundness",
+                {},
             ),
+            "regulatory_compliance_check": constitutional.get(
+                "regulatory_compliance",
+                {},
+            ),
+            "fairness_check": constitutional.get(
+                "fairness",
+                {},
+            ),
+            "explainability_check": constitutional.get(
+                "explainability",
+                {},
+            ),
+            "reflection_verdict": verdict,
+            "require_human_review": False,
+            "require_human_escalation": False,
+            "human_review_reason": "",
+            "requires_rescore": False,
+            "advisory": {
+                "verdict": verdict,
+                "consensus": flag_count == 0,
+                "disagreements": [],
+                "recommended_actions": [],
+                "original_recommendation": recommendation,
+                "original_confidence": confidence,
+            },
         }
-
     @staticmethod
-    def _parse_response(
-        response: str,
-    ) -> dict[str, str]:
-        parsed = {
-            "verdict": "concern",
-            "finding": "",
-            "evidence": "",
-            "action": "",
-        }
-
-        for line in response.splitlines():
-            line = line.strip()
-
-            if "=" not in line:
-                continue
-
-            key, value = line.split(
-                "=",
-                1,
-            )
-
-            key = key.strip().lower()
-            value = value.strip()
-
-            if key in parsed:
-                parsed[key] = value
-
-        if parsed["verdict"] not in {
-            "pass",
-            "concern",
-            "fail",
-        }:
-            parsed["verdict"] = "concern"
-
-        return parsed
-
-    @staticmethod
-    def _build_no_reflection_result(
-        risk_result: dict[str, Any],
+    def _no_reflection_result(
+        recommendation: str,
+        confidence: float,
+        constitutional: dict[str, Any],
     ) -> dict[str, Any]:
         return {
             "reflection_required": False,
@@ -458,40 +536,77 @@ the evidence provided.
             "reflection_personas": [],
             "reflection_round": 0,
             "reflection_findings": [],
-            "medical_accuracy_check": {
-                "status": "not_required",
-                "findings": [],
-            },
-            "actuarial_soundness_check": {
-                "status": "not_required",
-                "findings": [],
-            },
-            "regulatory_compliance_check": {
-                "status": "not_required",
-                "findings": [],
-            },
-            "fairness_check": {
-                "status": "not_required",
-                "findings": [],
-            },
-            "explainability_check": {
-                "status": "not_required",
-                "findings": [],
-            },
+            "medical_accuracy_check": constitutional.get(
+                "medical_accuracy",
+                {},
+            ),
+            "actuarial_soundness_check": constitutional.get(
+                "actuarial_soundness",
+                {},
+            ),
+            "regulatory_compliance_check": constitutional.get(
+                "regulatory_compliance",
+                {},
+            ),
+            "fairness_check": constitutional.get(
+                "fairness",
+                {},
+            ),
+            "explainability_check": constitutional.get(
+                "explainability",
+                {},
+            ),
             "reflection_verdict": "not_required",
             "require_human_review": False,
+            "require_human_escalation": False,
             "human_review_reason": "",
+            "requires_rescore": False,
             "advisory": {
                 "verdict": "not_required",
+                "consensus": True,
+                "disagreements": [],
                 "recommended_actions": [],
-                "original_recommendation": risk_result.get(
-                    "recommendation"
-                ),
-                "original_confidence": risk_result.get(
-                    "confidence"
-                ),
+                "original_recommendation": recommendation,
+                "original_confidence": confidence,
             },
         }
+
+    @staticmethod
+    def _human_review_reason(
+        verdict: str,
+        findings: list[dict[str, Any]],
+        consensus: bool,
+    ) -> str:
+        if verdict == "escalate":
+            return (
+                "Multiple constitutional or MAR concerns "
+                "require senior underwriting review."
+            )
+
+        if not consensus:
+            return (
+                "MAR personas did not reach consensus within "
+                "the maximum reflection rounds."
+            )
+
+        if findings:
+            concerns = [
+                finding.get("finding", "")
+                for finding in findings
+                if finding.get("verdict") != "pass"
+                and finding.get("finding")
+            ]
+
+            if concerns:
+                return concerns[0]
+
+        if verdict == "review":
+            return (
+                "Reflection identified concerns requiring "
+                "additional underwriting review."
+            )
+
+        return ""
 
 
 reflection_agent = ReflectionAgent()

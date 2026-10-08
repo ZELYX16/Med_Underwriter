@@ -1,76 +1,57 @@
 version: "1.0"
 
-input_validation:
+enabled: true
+
+prompt_validation:
+  max_length: 30000
+  reject_empty: true
+
+  prompt_injection:
+    enabled: true
+    action: block
+
+  secret_detection:
+    enabled: true
+    action: block
+
+  pii_detection:
+    enabled: true
+    action: sanitize
+
+medical_underwriting:
+  prevent_forced_decisions: true
+  prevent_guaranteed_approval: true
+  prevent_guaranteed_coverage: true
+
+  protected_attributes:
+    - race
+    - ethnicity
+    - religion
+    - caste
+    - gender
+    - sexual_orientation
+    - disability
+
+  fairness:
+    enabled: true
+    action: review
+
+output_validation:
   enabled: true
-  max_text_length: 20000
-  max_list_items: 100
-  reject_empty_submission: true
+  reject_unsupported_guarantees: true
 
-prompt_injection:
-  enabled: true
-  action: "block"
+risk_levels:
+  low:
+    action: allow
 
-  patterns:
-    - "ignore all previous instructions"
-    - "ignore previous instructions"
-    - "disregard all previous instructions"
-    - "disregard previous instructions"
-    - "system prompt"
-    - "developer message"
-    - "jailbreak"
-    - "bypass safety"
-    - "override instructions"
+  medium:
+    action: allow_with_sanitization
 
-document_validation:
-  enabled: true
-  allowed_extensions:
-    - ".pdf"
-    - ".txt"
-    - ".json"
-    - ".csv"
-
-  max_file_size_mb: 25
-
-retrieval:
-  enabled: true
-  minimum_results: 1
-  maximum_results: 10
-
-  require_metadata:
-    - "source"
-    - "file_name"
-
-medical_safety:
-  enabled: true
-  require_evidence_for_medical_claims: true
-  require_evidence_for_risk_decisions: true
-  require_evidence_for_pricing_decisions: true
-
-regulatory_safety:
-  enabled: true
-  require_source_for_regulatory_claims: true
-  preferred_jurisdiction: "India"
-  regulatory_authority: "IRDAI"
-
-human_review:
-  enabled: true
-
-  escalation_conditions:
-    - "low_confidence"
-    - "insufficient_evidence"
-    - "regulatory_uncertainty"
-    - "fairness_concern"
-    - "medical_uncertainty"
-    - "reflection_failure"
-    - "high_complexity"
+  high:
+    action: block
 
 audit:
   enabled: true
-  record:
-    - "case_id"
-    - "workflow_node"
-    - "retrieval_sources"
-    - "decision"
-    - "confidence"
-    - "human_review"
-    - "timestamp"
+  record_blocked_requests: true
+  record_sanitization: true
+  record_validation_results: true

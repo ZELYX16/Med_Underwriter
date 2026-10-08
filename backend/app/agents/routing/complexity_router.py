@@ -1,384 +1,216 @@
-from typing import Any, Literal
+from __future__ import annotations
 
-from app.llm.factory import get_llm
-
-
-ComplexityLevel = Literal[
-    "simple",
-    "standard",
-    "complex",
-]
+from typing import Any
 
 
 class ComplexityRouter:
-    def __init__(self):
-        self.llm = get_llm(
-            role="planner",
-            temperature=0.0,
-        )
+    COMPLEXITY_THRESHOLDS = {
+        "simple": 0,
+        "standard": 2,
+    }
+
+    HIGH_RISK_KEYWORDS = {
+        "myocardial infarction",
+        "nstemi",
+        "stroke",
+        "cancer",
+        "malignancy",
+        "renal failure",
+        "heart failure",
+        "organ failure",
+        "transplant",
+        "severe copd",
+    }
 
     def route(
         self,
         applicant_profile: dict[str, Any],
         enrichment_results: dict[str, Any],
     ) -> dict[str, Any]:
-        features = self._extract_features(
+        conditions = self._extract_conditions(
             applicant_profile,
             enrichment_results,
         )
 
-        complexity = self._rule_based_complexity(
-            features
+        condition_count = len(conditions)
+
+        red_flags = self._find_red_flags(
+            conditions
         )
 
-        if complexity is None:
-            complexity = self._llm_complexity(
-                features
+        reasons: list[str] = []
+
+        if condition_count <= 2:
+            complexity_level = "standard"
+            routing_strategy = "plan_and_execute"
+
+            if condition_count == 0:
+                reasons.append(
+                    "No active medical conditions identified."
+                )
+            else:
+                reasons.append(
+                    f"{condition_count} medical condition(s) identified."
+                )
+
+        else:
+            complexity_level = "complex"
+            routing_strategy = "tree_of_thought"
+            reasons.append(
+                f"{condition_count} medical conditions identified."
             )
 
-        strategy = self._select_strategy(
-            complexity
-        )
+        if red_flags:
+            complexity_level = "complex"
+            routing_strategy = "tree_of_thought"
+            reasons.append(
+                "High-risk medical indicators require "
+                "deeper reasoning."
+            )
 
-        reasons = self._build_reasons(
-            features,
-            complexity,
-        )
+        if self._has_conflicting_evidence(
+            enrichment_results
+        ):
+            complexity_level = "complex"
+            routing_strategy = "tree_of_thought"
+            reasons.append(
+                "Conflicting evidence requires "
+                "additional analysis."
+            )
 
         return {
-            "complexity_level": complexity,
-            "routing_strategy": strategy,
+            "complexity_level": complexity_level,
             "complexity_reasons": reasons,
-            "features": features,
+            "routing_strategy": routing_strategy,
+            "condition_count": condition_count,
+            "conditions": conditions,
+            "red_flags": red_flags,
         }
 
-    def _extract_features(
+    def _extract_conditions(
         self,
         applicant_profile: dict[str, Any],
         enrichment_results: dict[str, Any],
-    ) -> dict[str, Any]:
-        medical = enrichment_results.get(
-            "medical_evidence",
-            {},
-        )
+    ) -> list[str]:
+        conditions: list[str] = []
 
-        claims = enrichment_results.get(
-            "claims_evidence",
-            {},
-        )
-
-        coverage_gaps = enrichment_results.get(
-            "coverage_gaps",
+        profile_conditions = applicant_profile.get(
+            "medical_conditions",
             [],
         )
 
-        conditions = self._get_list(
-            medical,
-            "conditions",
+        if isinstance(profile_conditions, list):
+            conditions.extend(
+                str(condition).strip()
+                for condition in profile_conditions
+                if str(condition).strip()
+            )
+        elif profile_conditions:
+            conditions.append(
+                str(profile_conditions).strip()
+            )
+
+        medical = applicant_profile.get(
+            "medical",
+            {},
         )
 
-        medications = self._get_list(
-            medical,
-            "medications",
+        if isinstance(medical, dict):
+            medical_conditions = medical.get(
+                "conditions",
+                [],
+            )
+
+            if isinstance(
+                medical_conditions,
+                list,
+            ):
+                conditions.extend(
+                    str(condition).strip()
+                    for condition in medical_conditions
+                    if str(condition).strip()
+                )
+
+        medical_evidence = enrichment_results.get(
+            "medical_evidence",
+            [],
         )
 
-        hospitalizations = self._get_list(
-            medical,
-            "hospitalizations",
+        if isinstance(medical_evidence, list):
+            for item in medical_evidence:
+                if not isinstance(item, dict):
+                    continue
+
+                extracted = item.get(
+                    "conditions",
+                    [],
+                )
+
+                if isinstance(extracted, list):
+                    conditions.extend(
+                        str(condition).strip()
+                        for condition in extracted
+                        if str(condition).strip()
+                    )
+
+        return self._deduplicate(
+            conditions
         )
 
-        claim_records = self._get_claim_records(
-            claims
-        )
-
-        age = applicant_profile.get(
-            "age",
-            0,
-        )
-
-        return {
-            "age": age,
-            "condition_count": len(conditions),
-            "medication_count": len(medications),
-            "hospitalization_count": len(
-                hospitalizations
-            ),
-            "claim_count": len(claim_records),
-            "coverage_gap_count": len(
-                coverage_gaps
-            ),
-            "has_chronic_condition": self._has_chronic_condition(
-                conditions
-            ),
-            "has_major_procedure": self._has_major_procedure(
-                hospitalizations
-            ),
-            "has_multiple_claims": len(
-                claim_records
-            ) >= 3,
-            "has_multiple_conditions": len(
-                conditions
-            ) >= 3,
-        }
-
-    def _rule_based_complexity(
+    def _find_red_flags(
         self,
-        features: dict[str, Any],
-    ) -> ComplexityLevel | None:
-        complexity_score = 0
-
-        if features["age"] >= 60:
-            complexity_score += 2
-        elif features["age"] >= 50:
-            complexity_score += 1
-
-        if features["condition_count"] >= 3:
-            complexity_score += 3
-        elif features["condition_count"] >= 2:
-            complexity_score += 2
-        elif features["condition_count"] == 1:
-            complexity_score += 1
-
-        if features["has_chronic_condition"]:
-            complexity_score += 1
-
-        if features["medication_count"] >= 5:
-            complexity_score += 2
-        elif features["medication_count"] >= 3:
-            complexity_score += 1
-
-        if features["hospitalization_count"] >= 2:
-            complexity_score += 2
-        elif features["hospitalization_count"] == 1:
-            complexity_score += 1
-
-        if features["claim_count"] >= 5:
-            complexity_score += 3
-        elif features["claim_count"] >= 3:
-            complexity_score += 2
-        elif features["claim_count"] >= 1:
-            complexity_score += 1
-
-        if features["coverage_gap_count"] >= 2:
-            complexity_score += 2
-        elif features["coverage_gap_count"] == 1:
-            complexity_score += 1
-
-        if features["has_major_procedure"]:
-            complexity_score += 2
-
-        if complexity_score >= 8:
-            return "complex"
-
-        if complexity_score >= 3:
-            return "standard"
-
-        if complexity_score >= 0:
-            return "simple"
-
-        return None
-
-    def _llm_complexity(
-        self,
-        features: dict[str, Any],
-    ) -> ComplexityLevel:
-        prompt = f"""
-Classify this medical insurance underwriting case.
-
-Choose exactly one:
-simple
-standard
-complex
-
-Case features:
-{features}
-
-Guidance:
-- simple: low medical complexity, limited history,
-  and little evidence requiring cross-domain reasoning.
-- standard: one or more meaningful risk factors requiring
-  normal underwriting analysis.
-- complex: multiple conditions, significant medical history,
-  repeated claims, major procedures, substantial coverage
-  gaps, or conflicting evidence.
-
-Return only:
-complexity=<simple|standard|complex>
-"""
-
-        response = self.llm.invoke(prompt)
-        content = response.content.strip().lower()
-
-        for level in (
-            "complex",
-            "standard",
-            "simple",
-        ):
-            if f"complexity={level}" in content:
-                return level
-
-        return "standard"
-
-    @staticmethod
-    def _select_strategy(
-        complexity: ComplexityLevel,
-    ) -> str:
-        if complexity == "simple":
-            return "plan_and_execute"
-
-        if complexity == "standard":
-            return "plan_and_execute"
-
-        return "tree_of_thought"
-
-    @staticmethod
-    def _build_reasons(
-        features: dict[str, Any],
-        complexity: ComplexityLevel,
+        conditions: list[str],
     ) -> list[str]:
-        reasons = []
+        red_flags: list[str] = []
 
-        if features["age"] >= 60:
-            reasons.append(
-                "Applicant age is 60 or above."
-            )
-        elif features["age"] >= 50:
-            reasons.append(
-                "Applicant age is 50 or above."
-            )
+        for condition in conditions:
+            normalized = condition.lower()
 
-        if features["has_multiple_conditions"]:
-            reasons.append(
-                "Multiple medical conditions are present."
-            )
+            for keyword in self.HIGH_RISK_KEYWORDS:
+                if keyword in normalized:
+                    red_flags.append(condition)
+                    break
 
-        elif features["condition_count"] == 1:
-            reasons.append(
-                "A medical condition is present."
-            )
-
-        if features["has_chronic_condition"]:
-            reasons.append(
-                "Chronic medical condition identified."
-            )
-
-        if features["medication_count"] >= 5:
-            reasons.append(
-                "Multiple medications require consideration."
-            )
-
-        if features["hospitalization_count"] >= 2:
-            reasons.append(
-                "Multiple hospitalization events are present."
-            )
-
-        elif features["hospitalization_count"] == 1:
-            reasons.append(
-                "Previous hospitalization is present."
-            )
-
-        if features["has_multiple_claims"]:
-            reasons.append(
-                "Multiple historical claims are present."
-            )
-
-        if features["coverage_gap_count"] > 0:
-            reasons.append(
-                "Coverage gap evidence requires review."
-            )
-
-        if features["has_major_procedure"]:
-            reasons.append(
-                "Major medical procedure requires additional assessment."
-            )
-
-        if not reasons:
-            reasons.append(
-                "Limited risk factors were identified."
-            )
-
-        reasons.append(
-            f"Case classified as {complexity}."
+        return self._deduplicate(
+            red_flags
         )
 
-        return reasons
-
     @staticmethod
-    def _get_list(
-        source: dict[str, Any],
-        key: str,
-    ) -> list[Any]:
-        value = source.get(key, [])
-
-        return value if isinstance(value, list) else []
-
-    @staticmethod
-    def _get_claim_records(
-        claims: dict[str, Any],
-    ) -> list[Any]:
-        for key in (
-            "claims",
-            "claim_records",
-            "records",
-        ):
-            value = claims.get(key)
-
-            if isinstance(value, list):
-                return value
-
-        return []
-
-    @staticmethod
-    def _has_chronic_condition(
-        conditions: list[Any],
+    def _has_conflicting_evidence(
+        enrichment_results: dict[str, Any],
     ) -> bool:
-        chronic_terms = {
-            "diabetes",
-            "hypertension",
-            "rheumatoid",
-            "arthritis",
-            "asthma",
-            "coronary",
-            "cardiac",
-            "dyslipidemia",
-            "hypothyroidism",
-            "chronic",
-        }
-
-        condition_text = " ".join(
-            str(condition).lower()
-            for condition in conditions
+        value = enrichment_results.get(
+            "conflicting_evidence",
+            False,
         )
 
-        return any(
-            term in condition_text
-            for term in chronic_terms
+        if isinstance(value, bool):
+            return value
+
+        conflicts = enrichment_results.get(
+            "evidence_conflicts",
+            [],
         )
+
+        return bool(conflicts)
 
     @staticmethod
-    def _has_major_procedure(
-        hospitalizations: list[Any],
-    ) -> bool:
-        procedure_terms = {
-            "angioplasty",
-            "stent",
-            "surgery",
-            "transplant",
-            "bypass",
-            "replacement",
-            "cholecystectomy",
-            "lithotripsy",
-        }
+    def _deduplicate(
+        values: list[str],
+    ) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
 
-        hospitalization_text = " ".join(
-            str(item).lower()
-            for item in hospitalizations
-        )
+        for value in values:
+            normalized = value.lower()
 
-        return any(
-            term in hospitalization_text
-            for term in procedure_terms
-        )
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            result.append(value)
+
+        return result
 
 
 complexity_router = ComplexityRouter()

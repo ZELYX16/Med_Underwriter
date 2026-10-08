@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import json
 from pathlib import Path
@@ -19,7 +21,17 @@ class DocumentLoader:
         self,
         chunk_size: int = 1200,
         chunk_overlap: int = 200,
-    ):
+    ) -> None:
+        if chunk_size <= 0:
+            raise ValueError(
+                "chunk_size must be greater than zero."
+            )
+
+        if chunk_overlap < 0:
+            raise ValueError(
+                "chunk_overlap cannot be negative."
+            )
+
         if chunk_overlap >= chunk_size:
             raise ValueError(
                 "chunk_overlap must be smaller than chunk_size."
@@ -39,20 +51,17 @@ class DocumentLoader:
                 f"Document not found: {path}"
             )
 
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            raise ValueError(
-                f"Unsupported file type: {path.suffix}"
-            )
-
         extension = path.suffix.lower()
+
+        if extension not in SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file type: {extension}"
+            )
 
         if extension == ".pdf":
             text = self._load_pdf(path)
         elif extension == ".txt":
-            text = path.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
+            text = self._load_text(path)
         elif extension == ".json":
             text = self._load_json(path)
         elif extension == ".csv":
@@ -89,13 +98,18 @@ class DocumentLoader:
 
         pattern = "**/*" if recursive else "*"
 
-        documents = []
+        documents: list[
+            dict[str, Any]
+        ] = []
 
         for path in directory.glob(pattern):
             if not path.is_file():
                 continue
 
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            if (
+                path.suffix.lower()
+                not in SUPPORTED_EXTENSIONS
+            ):
                 continue
 
             documents.extend(
@@ -110,18 +124,41 @@ class DocumentLoader:
     ) -> str:
         reader = PdfReader(str(path))
 
-        pages = []
+        pages: list[str] = []
 
-        for page in reader.pages:
-            text = page.extract_text() or ""
+        for page_number, page in enumerate(
+            reader.pages,
+            start=1,
+        ):
+            try:
+                text = (
+                    page.extract_text()
+                    or ""
+                ).strip()
+            except Exception as exc:
+                text = (
+                    f"[PDF page {page_number} "
+                    f"could not be extracted: {exc}]"
+                )
 
-            if text.strip():
-                pages.append(text.strip())
+            if text:
+                pages.append(
+                    f"[Page {page_number}]\n{text}"
+                )
 
         return "\n\n".join(pages)
 
+    @staticmethod
+    def _load_text(
+        path: Path,
+    ) -> str:
+        return path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+    @staticmethod
     def _load_json(
-        self,
         path: Path,
     ) -> str:
         with path.open(
@@ -136,11 +173,11 @@ class DocumentLoader:
             ensure_ascii=False,
         )
 
+    @staticmethod
     def _load_csv(
-        self,
         path: Path,
     ) -> str:
-        rows = []
+        rows: list[str] = []
 
         with path.open(
             "r",
@@ -149,10 +186,17 @@ class DocumentLoader:
         ) as file:
             reader = csv.DictReader(file)
 
+            if reader.fieldnames:
+                rows.append(
+                    " | ".join(
+                        reader.fieldnames
+                    )
+                )
+
             for row in reader:
                 rows.append(
                     " | ".join(
-                        f"{key}: {value}"
+                        f"{key}: {value or ''}"
                         for key, value in row.items()
                     )
                 )
@@ -171,7 +215,8 @@ class DocumentLoader:
         if len(text) <= self.chunk_size:
             return [text]
 
-        chunks = []
+        chunks: list[str] = []
+
         start = 0
         text_length = len(text)
 
@@ -189,7 +234,14 @@ class DocumentLoader:
             if end >= text_length:
                 break
 
-            start = end - self.chunk_overlap
+            next_start = (
+                end - self.chunk_overlap
+            )
+
+            if next_start <= start:
+                next_start = end
+
+            start = next_start
 
         return chunks
 
