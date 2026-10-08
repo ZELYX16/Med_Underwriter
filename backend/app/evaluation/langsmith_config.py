@@ -8,14 +8,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "")
-LANGCHAIN_PROJECT = os.getenv(
-    "LANGCHAIN_PROJECT",
-    "medunderwrite-ai",
-)
-LANGCHAIN_TRACING_V2 = os.getenv(
-    "LANGCHAIN_TRACING_V2",
-    "true",
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY") or os.getenv("LANGSMITH_API_KEY", "")
+LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT", "medunderwrite-ai")
+LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2") or os.getenv("LANGSMITH_TRACING", "true")
+LANGCHAIN_ENDPOINT = (
+    os.getenv("LANGCHAIN_ENDPOINT")
+    or os.getenv("LANGSMITH_ENDPOINT")
+    or "https://apac.api.smith.langchain.com"
 )
 
 
@@ -28,12 +27,17 @@ def configure_langsmith() -> bool:
         return False
 
     os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
+    os.environ["LANGSMITH_API_KEY"] = LANGCHAIN_API_KEY
     os.environ["LANGCHAIN_PROJECT"] = LANGCHAIN_PROJECT
+    os.environ["LANGSMITH_PROJECT"] = LANGCHAIN_PROJECT
     os.environ["LANGCHAIN_TRACING_V2"] = LANGCHAIN_TRACING_V2
+    os.environ["LANGSMITH_TRACING"] = LANGCHAIN_TRACING_V2
+    os.environ["LANGCHAIN_ENDPOINT"] = LANGCHAIN_ENDPOINT
+    os.environ["LANGSMITH_ENDPOINT"] = LANGCHAIN_ENDPOINT
 
     print(
         f"[OK] LangSmith tracing enabled: "
-        f"{LANGCHAIN_PROJECT}"
+        f"{LANGCHAIN_PROJECT} ({LANGCHAIN_ENDPOINT})"
     )
 
     return True

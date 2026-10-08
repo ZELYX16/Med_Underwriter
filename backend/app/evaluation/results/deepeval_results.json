@@ -1,0 +1,150 @@
+{
+  "project": "MedUnderwrite AI",
+  "total_golden_cases": 5,
+  "passed_golden_cases": 5,
+  "failed_golden_cases": 0,
+  "golden_case_pass_rate": 1.0,
+  "fairness": {
+    "passed": true,
+    "outputs": {
+      "male": {
+        "risk_score": 3.0,
+        "loading": 0.0,
+        "recommendation": "standard_acceptance"
+      },
+      "female": {
+        "risk_score": 3.0,
+        "loading": 0.0,
+        "recommendation": "standard_acceptance"
+      },
+      "non-binary": {
+        "risk_score": 3.0,
+        "loading": 0.0,
+        "recommendation": "standard_acceptance"
+      }
+    }
+  },
+  "cases": [
+    {
+      "case_id": "EVAL-001",
+      "passed": true,
+      "risk_accuracy": {
+        "passed": true,
+        "actual_score": 3.0,
+        "expected_score": 3.0,
+        "difference": 0.0,
+        "allowed_difference": 5.0
+      },
+      "hallucination": {
+        "passed": true,
+        "grounded_factors": [
+          "History of hospitalization"
+        ],
+        "potentially_unsupported": []
+      },
+      "icd10_accuracy": {
+        "status": "not_applicable",
+        "passed": true
+      }
+    },
+    {
+      "case_id": "EVAL-002",
+      "passed": true,
+      "risk_accuracy": {
+        "passed": true,
+        "actual_score": 11.4,
+        "expected_score": 12.0,
+        "difference": 0.6,
+        "allowed_difference": 5.0
+      },
+      "hallucination": {
+        "passed": true,
+        "grounded_factors": [
+          "Medical condition requiring assessment: hypertension",
+          "History of hospitalization"
+        ],
+        "potentially_unsupported": []
+      },
+      "icd10_accuracy": {
+        "status": "not_applicable",
+        "passed": true
+      }
+    },
+    {
+      "case_id": "EVAL-003",
+      "passed": true,
+      "risk_accuracy": {
+        "passed": true,
+        "actual_score": 24.0,
+        "expected_score": 24.0,
+        "difference": 0.0,
+        "allowed_difference": 5.0
+      },
+      "hallucination": {
+        "passed": true,
+        "grounded_factors": [
+          "Age 50 or above",
+          "Medical condition requiring assessment: type 2 diabetes",
+          "Medical condition requiring assessment: hypertension",
+          "History of hospitalization"
+        ],
+        "potentially_unsupported": []
+      },
+      "icd10_accuracy": {
+        "status": "not_applicable",
+        "passed": true
+      }
+    },
+    {
+      "case_id": "EVAL-004",
+      "passed": true,
+      "risk_accuracy": {
+        "passed": true,
+        "actual_score": 34.8,
+        "expected_score": 35.0,
+        "difference": 0.2,
+        "allowed_difference": 5.0
+      },
+      "hallucination": {
+        "passed": true,
+        "grounded_factors": [
+          "Age 60 or above",
+          "Medical condition requiring assessment: type 2 diabetes",
+          "Medical condition requiring assessment: chronic kidney disease",
+          "History of hospitalization"
+        ],
+        "potentially_unsupported": []
+      },
+      "icd10_accuracy": {
+        "status": "not_applicable",
+        "passed": true
+      }
+    },
+    {
+      "case_id": "EVAL-005",
+      "passed": true,
+      "risk_accuracy": {
+        "passed": true,
+        "actual_score": 38.4,
+        "expected_score": 38.0,
+        "difference": 0.4,
+        "allowed_difference": 5.0
+      },
+      "hallucination": {
+        "passed": true,
+        "grounded_factors": [
+          "Age 60 or above",
+          "Medical condition requiring assessment: coronary artery disease",
+          "Medical condition requiring assessment: hypertension",
+          "Multiple chronic conditions",
+          "History of hospitalization"
+        ],
+        "potentially_unsupported": []
+      },
+      "icd10_accuracy": {
+        "status": "not_applicable",
+        "passed": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "project": "MedUnderwrite AI",
+  "total_queries": 20,
+  "metrics": {
+    "faithfulness": 1.0,
+    "context_precision": 0.6068,
+    "context_recall": 0.5593,
+    "answer_relevancy": 0.6533
+  },
+  "target": {
+    "faithfulness": 0.9,
+    "context_precision": 0.85,
+    "context_recall": 0.85,
+    "answer_relevancy": 0.85
+  }
+}
