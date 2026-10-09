@@ -5,6 +5,8 @@ from typing import Any
 
 from app.config import settings
 from app.store.vector_store import vector_store
+from app.store.state_store import state_store
+from app.rag.document_loader import document_loader
 
 
 class ApplicantRetriever:
@@ -345,12 +347,89 @@ class ApplicantRetriever:
                     seen.add(content)
                     contents.append(content)
 
-            group["content"] = "\n\n".join(contents)
+            retrieved_text = "\n\n".join(contents)
+            human_text = self._load_human_readable_text(group)
+            group["retrieved_content"] = retrieved_text
+            group["human_readable_content"] = human_text or retrieved_text
+            group["content"] = group["human_readable_content"]
             group["chunk_count"] = len(contents)
             group.pop("contents", None)
             grouped.append(group)
 
         return grouped
+
+    def _resolve_source_path(self, group: dict[str, Any]) -> Path | None:
+        """Resolve the original applicant document path from evidence metadata."""
+        metadata = group.get("metadata") or {}
+
+        path_value = (
+            metadata.get("storage_path")
+            or metadata.get("file_path")
+        )
+
+        if path_value:
+            path = Path(str(path_value))
+            if path.exists():
+                return path
+
+        document_id = (
+            group.get("document_id")
+            or metadata.get("document_id")
+        )
+
+        if document_id:
+            try:
+                document = state_store.get_applicant_document(
+                    str(document_id)
+                )
+                state_path = (document or {}).get("file_path")
+                if state_path:
+                    path = Path(str(state_path))
+                    if path.exists():
+                        return path
+            except Exception:
+                pass
+
+        # Compatibility fallback for older Chroma records that contain only
+        # applicant_id + filename and no document_id/file_path metadata.
+        applicant_id = (
+            group.get("applicant_id")
+            or metadata.get("applicant_id")
+        )
+        filename = (
+            group.get("filename")
+            or group.get("file_name")
+            or metadata.get("filename")
+            or metadata.get("file_name")
+        )
+
+        if applicant_id and filename:
+            applicant_root = (
+                self.synthetic_data_path
+                / "applicants"
+                / str(applicant_id)
+            )
+
+            if applicant_root.exists():
+                matches = list(
+                    applicant_root.rglob(str(filename))
+                )
+                if matches:
+                    return matches[0]
+
+        return None
+
+    def _load_human_readable_text(self, group: dict[str, Any]) -> str:
+        """Load the complete original source for reviewer-facing evidence."""
+        path = self._resolve_source_path(group)
+
+        if path is None:
+            return ""
+
+        try:
+            return document_loader.load_full_text(path)
+        except Exception:
+            return ""
 
     def retrieve_document_views(
         self,

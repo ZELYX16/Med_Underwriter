@@ -32,6 +32,9 @@ class UnderwritingState(TypedDict, total=False):
     underwriting_evidence: list[dict[str, Any]]
     medical_knowledge: list[dict[str, Any]]
     coverage_gaps: list[dict[str, Any]]
+    confirmed_coverage_gaps: list[dict[str, Any]]
+    evidence_gaps: list[dict[str, Any]]
+    evidence_completeness: float
 
     agent1_enrichment: dict[str, Any]
     agent1_completed: bool
@@ -93,6 +96,8 @@ class UnderwritingState(TypedDict, total=False):
     # ------------------------------------------------------------------
     require_human_escalation: bool
     require_human_review: bool
+    human_review_reasons: list[str]
+    business_gate_reasons: list[str]
 
     human_review_reason: str
     human_review_status: str
@@ -117,6 +122,8 @@ class UnderwritingState(TypedDict, total=False):
 
     timing: dict[str, float]
     token_usage: dict[str, int]
+    agent_metrics: dict[str, dict[str, Any]]
+    workflow_metrics: dict[str, Any]
 
 
 class UnderwriteInput(BaseModel):
@@ -145,6 +152,9 @@ class UnderwriteResult(BaseModel):
     medical_risk_score: float = 0.0
     claims_risk_score: float = 0.0
     coverage_gap_score: float = 0.0
+    confirmed_coverage_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_completeness: float = 0.0
 
     base_premium: float = 0.0
     loading_percentage: float = 0.0
@@ -159,6 +169,7 @@ class UnderwriteResult(BaseModel):
     require_human_review: bool = False
 
     human_review_status: str = ""
+    human_review_reasons: list[str] = Field(default_factory=list)
 
     agent1_completed: bool = False
     agent2_completed: bool = False

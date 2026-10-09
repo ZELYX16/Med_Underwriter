@@ -31,6 +31,8 @@ class OllamaProvider(LLMProvider):
                 else temperature
             ),
             num_predict=settings.max_tokens,
+            timeout=settings.llm_timeout_sec,
+            max_retries=settings.llm_max_retries,
         )
 
 
@@ -57,6 +59,7 @@ class GroqProvider(LLMProvider):
                 else temperature
             ),
             max_tokens=settings.max_tokens,
+            max_retries=settings.llm_max_retries,
         )
 
 
@@ -85,6 +88,7 @@ class GeminiProvider(LLMProvider):
                 else temperature
             ),
             max_output_tokens=settings.max_tokens,
+            max_retries=settings.llm_max_retries,
         )
 
 

@@ -27,6 +27,7 @@ class RiskAssessmentAgent:
         routing_result: dict[str, Any],
     ) -> dict[str, Any]:
         agent_started = time.perf_counter()
+        self._last_llm_metrics = {}
 
         features = self._extract_features(
             applicant_profile,
@@ -176,8 +177,16 @@ class RiskAssessmentAgent:
         )
 
         coverage_gaps = self._as_list(
-            enrichment_results.get("coverage_gaps")
+            enrichment_results.get("confirmed_coverage_gaps")
+            or enrichment_results.get("coverage_gaps")
         )
+        evidence_gaps = self._as_list(
+            enrichment_results.get("evidence_gaps")
+        )
+        coverage_gaps, derived_evidence_gaps = self._split_gap_types(
+            coverage_gaps
+        )
+        evidence_gaps.extend(derived_evidence_gaps)
 
         age = self._number(
             applicant_profile.get("age")
@@ -210,6 +219,7 @@ class RiskAssessmentAgent:
             "regulatory_evidence": regulatory_evidence,
             "underwriting_evidence": underwriting_evidence,
             "coverage_gaps": coverage_gaps,
+            "evidence_gaps": self._unique_gap_dicts(evidence_gaps),
             "sum_insured": sum_insured,
             "term_years": max(term_years, 1),
             "condition_count": len(conditions),
@@ -345,6 +355,44 @@ class RiskAssessmentAgent:
 
         return claims
 
+    @staticmethod
+    def _split_gap_types(
+        gaps: list[Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        confirmed: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+        evidence_types = {
+            "evidence_unavailable",
+            "missing_policy_evidence",
+            "missing_underwriting_evidence",
+            "claims_evidence_incomplete",
+            "medical_evidence_incomplete",
+        }
+        for item in gaps:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).strip().lower()
+            status = str(item.get("status", "")).strip().lower()
+            if item_type in evidence_types or status == "needs_more_information":
+                evidence.append(item)
+            else:
+                confirmed.append(item)
+        return confirmed, evidence
+
+    @staticmethod
+    def _unique_gap_dicts(
+        gaps: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for item in gaps:
+            key = str((item.get("type"), item.get("source"), item.get("description")))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
     def _calculate_risk(
         self,
         features: dict[str, Any],
@@ -362,6 +410,7 @@ class RiskAssessmentAgent:
         hospitalizations = features["hospitalizations"]
         claims = features["claims"]
         coverage_gaps = features["coverage_gaps"]
+        evidence_gaps = features.get("evidence_gaps", [])
 
         if age >= 60:
             medical_score += 20
@@ -480,7 +529,7 @@ class RiskAssessmentAgent:
 
         if coverage_gaps:
             risk_factors.append(
-                "Potential coverage gaps identified"
+                "Confirmed coverage gaps identified"
             )
 
         medical_score = min(
@@ -516,6 +565,12 @@ class RiskAssessmentAgent:
             2,
         )
 
+        missing_domains = [
+            domain
+            for domain, available in evidence_domains.items()
+            if not available
+        ]
+
         return {
             "medical_risk_score": medical_score,
             "claims_risk_score": claims_score,
@@ -529,11 +584,8 @@ class RiskAssessmentAgent:
             ),
             "evidence_completeness": evidence_completeness,
             "evidence_domains": evidence_domains,
-            "evidence_gaps": [
-                domain
-                for domain, available in evidence_domains.items()
-                if not available
-            ],
+            "evidence_gaps": self._unique_gap_dicts(evidence_gaps)
+            + [{"domain": domain} for domain in missing_domains],
             "coverage_gaps": coverage_gaps,
         }
 
@@ -606,7 +658,9 @@ class RiskAssessmentAgent:
         if risk_score >= 70:
             return "human_review"
 
-        if risk_score >= 45:
+        # Keep recommendation aligned with the deterministic pricing
+        # bands: risk 30-44 receives the 10% loading band.
+        if risk_score >= 30:
             return "accept_with_loading"
 
         if features["condition_count"] >= 3:
@@ -709,6 +763,23 @@ class RiskAssessmentAgent:
         }
 
     @staticmethod
+    def _estimate_tokens(llm: Any, text: str) -> int:
+        if not text:
+            return 0
+
+        get_num_tokens = getattr(llm, "get_num_tokens", None)
+        if callable(get_num_tokens):
+            try:
+                return int(get_num_tokens(text))
+            except Exception:
+                pass
+
+        # Conservative fallback when the configured local/provider model
+        # does not expose tokenizer usage metadata. This is an estimate,
+        # not provider-billed token usage.
+        return max(1, len(text) // 4)
+
+    @staticmethod
     def _build_metrics(
         started: float,
         llm_metrics: dict[str, Any],
@@ -728,6 +799,8 @@ class RiskAssessmentAgent:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
+            "token_source": llm_metrics.get("token_source", "none"),
+            "llm_used": bool(llm_metrics.get("llm_used", False)),
         }
 
     @staticmethod
@@ -1019,10 +1092,9 @@ Return only the underwriting rationale.
             llm_started = time.perf_counter()
             response = self.llm.invoke(prompt)
             llm_latency = round(time.perf_counter() - llm_started, 4)
-            self._last_llm_metrics = {
-                **self._extract_token_usage(response),
-                "llm_latency_sec": llm_latency,
-            }
+
+            usage = self._extract_token_usage(response)
+            token_source = "provider" if usage["total_tokens"] > 0 else "estimated"
 
             content = getattr(
                 response,
@@ -1039,6 +1111,23 @@ Return only the underwriting rationale.
                 )
 
             reasoning = str(content).strip()
+
+            if usage["total_tokens"] <= 0:
+                usage = {
+                    "input_tokens": self._estimate_tokens(self.llm, prompt),
+                    "output_tokens": self._estimate_tokens(self.llm, reasoning),
+                    "total_tokens": 0,
+                }
+                usage["total_tokens"] = (
+                    usage["input_tokens"] + usage["output_tokens"]
+                )
+
+            self._last_llm_metrics = {
+                **usage,
+                "llm_latency_sec": llm_latency,
+                "token_source": token_source,
+                "llm_used": True,
+            }
 
             if not self._reasoning_is_consistent(
                 reasoning=reasoning,
@@ -1059,18 +1148,29 @@ Return only the underwriting rationale.
             return reasoning
 
         except Exception as exc:
-            self._last_llm_metrics = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "llm_latency_sec": 0.0,
-            }
-            return self._fallback_reasoning(
+            fallback = self._fallback_reasoning(
                 risk=risk,
                 pricing=pricing,
                 recommendation=recommendation,
                 error=str(exc),
             )
+            input_tokens = self._estimate_tokens(
+                self.llm,
+                locals().get("prompt", ""),
+            )
+            output_tokens = self._estimate_tokens(
+                self.llm,
+                fallback,
+            )
+            self._last_llm_metrics = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "llm_latency_sec": 0.0,
+                "token_source": "estimated",
+                "llm_used": True,
+            }
+            return fallback
 
     @staticmethod
     def _reasoning_is_consistent(

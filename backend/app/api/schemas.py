@@ -80,6 +80,9 @@ class AgentMetrics(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
+    token_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
+    model: str = ""
+    provider: str = ""
 
 
 class WorkflowMetrics(BaseModel):
@@ -88,6 +91,7 @@ class WorkflowMetrics(BaseModel):
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
     agents: dict[str, AgentMetrics] = Field(default_factory=dict)
+    token_source: Literal["provider", "estimated", "mixed", "unavailable"] = "unavailable"
 
 
 class DecisionBasis(BaseModel):
@@ -149,6 +153,10 @@ class UnderwritingDecision(BaseModel):
         le=100.0,
     )
 
+    confirmed_coverage_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
+
     base_premium: float = Field(
         default=0.0,
         ge=0.0,
@@ -169,6 +177,8 @@ class UnderwritingDecision(BaseModel):
     require_human_review: bool = False
 
     human_review_status: str = ""
+
+    human_review_reasons: list[str] = Field(default_factory=list)
 
     agent1_completed: bool = False
 

@@ -36,6 +36,14 @@ class Settings(BaseSettings):
 
     temperature: float = 0.1
     max_tokens: int = 4096
+    llm_timeout_sec: float = 90.0
+    llm_max_retries: int = 1
+
+    # Underwriting safety / human-review gates
+    medical_risk_human_review_threshold: float = 80.0
+    overall_risk_human_review_threshold: float = 70.0
+    confidence_human_review_threshold: float = 0.70
+    max_reflection_rounds: int = 3
 
     # Storage
     sqlite_path: str = "data/medunderwrite.db"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from app.agents.reflection.constitutional import (
@@ -21,6 +22,7 @@ class ReflectionAgent:
         risk_result: dict[str, Any],
         previous_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         confidence = float(
             risk_result.get(
                 "agent2_confidence",
@@ -67,20 +69,9 @@ class ReflectionAgent:
             risk_assessment=risk_assessment,
         )
 
-        if reflection_type == "none":
-            return self._no_reflection_result(
-                recommendation=recommendation,
-                confidence=confidence,
-                constitutional=constitutional,
-            )
-
-        if reflection_type == "lightweight":
-            return self._lightweight_result(
-                recommendation=recommendation,
-                confidence=confidence,
-                constitutional=constitutional,
-            )
-
+        # Agent 3 always performs an actual critique.
+        # "lightweight" means a smaller critique, not no critique.
+        # This keeps Agent 3 as the mandatory quality gate for every case.
         personas = self._select_personas(
             reflection_type=reflection_type,
             constitutional=constitutional,
@@ -90,7 +81,13 @@ class ReflectionAgent:
         reflection_round = 1
         final_mar: dict[str, Any] = {}
 
-        while reflection_round <= self.MAX_REFLECTION_ROUNDS:
+        max_rounds = (
+            1
+            if reflection_type == "lightweight"
+            else self.MAX_REFLECTION_ROUNDS
+        )
+
+        while reflection_round <= max_rounds:
             mar_result = mar_personas.review(
                 applicant_profile=applicant_profile,
                 risk_assessment=risk_assessment,
@@ -115,8 +112,8 @@ class ReflectionAgent:
 
             reflection_round += 1
 
-        if reflection_round > self.MAX_REFLECTION_ROUNDS:
-            reflection_round = self.MAX_REFLECTION_ROUNDS
+        if reflection_round > max_rounds:
+            reflection_round = max_rounds
 
         verdict = self._determine_verdict(
             mar_result=final_mar,
@@ -124,10 +121,20 @@ class ReflectionAgent:
             flag_count=flag_count,
         )
 
+        constitutional_flag = flag_count > 0
+        mar_failed = str(
+            final_mar.get("verdict", "")
+        ).strip().lower() in {"fail", "failed"}
+
         require_human_review = (
-            reflection_round >= self.MAX_REFLECTION_ROUNDS
-            and not final_mar.get("consensus", False)
-        ) or verdict == "escalate"
+            constitutional_flag
+            or mar_failed
+            or (
+                reflection_round >= self.MAX_REFLECTION_ROUNDS
+                and not final_mar.get("consensus", False)
+            )
+            or verdict in {"escalate", "fail"}
+        )
 
         requires_rescore = (
             bool(final_mar.get("requires_rescore"))
@@ -145,8 +152,33 @@ class ReflectionAgent:
             findings=findings,
         )
 
+        input_payload = {
+            "applicant_profile": applicant_profile,
+            "submission": submission,
+            "risk_result": risk_result,
+            "previous_findings": previous_findings,
+        }
+        output_payload = {
+            "verdict": verdict,
+            "findings": findings,
+            "constitutional": constitutional,
+        }
+        input_tokens = max(1, len(str(input_payload)) // 4)
+        output_tokens = max(1, len(str(output_payload)) // 4)
+        metrics = {
+            "latency_sec": round(time.perf_counter() - started, 4),
+            "llm_latency_sec": 0.0,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "token_source": "estimated",
+            "llm_used": False,
+        }
+
         return {
             "reflection_required": True,
+            "metrics": metrics,
+            "agent3_metrics": metrics,
             "reflection_type": reflection_type,
             "reflection_personas": personas,
             "reflection_round": reflection_round,
@@ -392,7 +424,14 @@ class ReflectionAgent:
         if not mar_result:
             return "review"
 
-        if mar_result.get("verdict") == "escalate":
+        mar_verdict = str(
+            mar_result.get("verdict", "")
+        ).strip().lower()
+
+        if mar_verdict in {"fail", "failed"}:
+            return "fail"
+
+        if mar_verdict == "escalate":
             return "escalate"
 
         if mar_result.get("requires_rescore"):

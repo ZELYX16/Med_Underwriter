@@ -891,7 +891,7 @@ class StateStore:
     def add_workflow_event(
         self,
         case_id: str,
-        event_type: str,
+        event_type: str = "workflow",
         node: str | None = None,
         status: str | None = None,
         message: str | None = None,

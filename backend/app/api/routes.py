@@ -227,6 +227,53 @@ def _save_state(
     )
 
 
+async def _persist_workflow_update(
+    case_id: str,
+    update: dict[str, Any],
+) -> None:
+    current = dict(update)
+    current["updated_at"] = _now()
+
+    trace = current.get("workflow_trace")
+    latest = trace[-1] if isinstance(trace, list) and trace else {}
+    if not isinstance(latest, dict):
+        latest = {}
+
+    node = str(
+        latest.get("node")
+        or latest.get("event_type")
+        or "workflow"
+    )
+    node_status = str(latest.get("status") or "completed")
+    message = latest.get("message") or ""
+
+    final_status = str(
+        current.get("final_status")
+        or current.get("status")
+        or "processing"
+    )
+    db_status = final_status.replace("_", "-")
+
+    state_store.save_case(
+        case_id=case_id,
+        state=current,
+        status=db_status,
+    )
+
+    state_store.add_workflow_event(
+        case_id=case_id,
+        event_type="workflow",
+        node=node,
+        status=node_status,
+        message=message or f"Workflow reached {node}.",
+        data={
+            "final_status": final_status,
+            "workflow_node": node,
+            "details": latest.get("details", {}),
+        },
+    )
+
+
 async def _run_case(
     case_id: str,
     state: UnderwritingState,
@@ -257,6 +304,10 @@ async def _run_case(
         result = await run_workflow(
             initial_state=current,
             thread_id=case_id,
+            on_update=lambda update: _persist_workflow_update(
+                case_id,
+                update,
+            ),
         )
 
         output_guardrail = guardrails.validate_output(
@@ -298,6 +349,22 @@ async def _run_case(
             "final_status",
             "completed",
         )
+
+        # Defensive HITL gate: never expose a completed/final decision when
+        # the workflow has explicitly requested human review.
+        human_review_required = bool(
+            result.get("require_human_review")
+            or result.get("require_human_escalation")
+            or result.get("human_review_reasons")
+            or result.get("business_gate_reasons")
+        )
+        if human_review_required:
+            final_status = "awaiting_human_review"
+            result["final_status"] = final_status
+            result["require_human_review"] = True
+            result["require_human_escalation"] = True
+            result["human_review_status"] = "awaiting_review"
+            result["final_decision"] = "pending_human_review"
 
         _save_state(
             case_id,
@@ -1000,6 +1067,7 @@ async def approve_case(
 
     state_store.add_workflow_event(
         case_id=case_id,
+        event_type="human_review",
         node="human_review",
         status="approved",
         data={
@@ -1106,6 +1174,7 @@ async def override_case(
 
     state_store.add_workflow_event(
         case_id=case_id,
+        event_type="human_review",
         node="human_review",
         status="overridden",
         data={
@@ -1209,6 +1278,7 @@ async def sendback_case(
 
     state_store.add_workflow_event(
         case_id=case_id,
+        event_type="human_review",
         node="human_review",
         status="sent_back",
         data={
@@ -1304,6 +1374,7 @@ async def escalate_case(
 
     state_store.add_workflow_event(
         case_id=case_id,
+        event_type="human_review",
         node="human_review",
         status="escalated",
         data={

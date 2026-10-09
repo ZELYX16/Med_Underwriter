@@ -135,8 +135,12 @@ class DocumentIndexer:
                     "source": (
                         "synthetic_applicant_document"
                     ),
+                    # Keep both names for compatibility with existing
+                    # retriever/document-service metadata.
+                    "filename": file_path.name,
                     "file_name": file_path.name,
                     "file_path": str(file_path),
+                    "storage_path": str(file_path),
                     "chunk_index": index,
                 }
 

@@ -13,7 +13,7 @@ class Settings:
     )
 
     request_timeout: int = int(
-        os.getenv("MEDUNDERWRITE_REQUEST_TIMEOUT", "60")
+        os.getenv("MEDUNDERWRITE_REQUEST_TIMEOUT", "30")
     )
 
 

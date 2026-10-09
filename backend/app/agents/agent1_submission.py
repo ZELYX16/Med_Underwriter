@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -152,6 +153,37 @@ class SubmissionIntelligenceAgent:
             )
         except Exception:
             return []
+
+    def _build_reviewer_evidence(
+        self,
+        results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert RAG chunks into document-level reviewer evidence."""
+        if not isinstance(results, list) or not results:
+            return []
+
+        try:
+            grouped = retriever.group_by_document(results)
+        except Exception:
+            return []
+
+        return grouped if isinstance(grouped, list) else []
+
+    @staticmethod
+    def _reviewer_evidence_summary(
+        medical_review_evidence: list[dict[str, Any]],
+        claims_review_evidence: list[dict[str, Any]],
+        policy_review_evidence: list[dict[str, Any]],
+        underwriting_review_evidence: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        return {
+            "medical_review_documents": len(medical_review_evidence),
+            "claims_review_documents": len(claims_review_evidence),
+            "policy_review_documents": len(policy_review_evidence),
+            "underwriting_review_documents": len(
+                underwriting_review_evidence
+            ),
+        }
 
     def _retrieve_regulatory(
         self,
@@ -333,6 +365,36 @@ class SubmissionIntelligenceAgent:
         return len(
             cls._unique_documents(results)
         )
+
+    @staticmethod
+    def _split_gap_types(
+        gaps: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Separate confirmed coverage findings from evidence limitations."""
+        confirmed: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+
+        evidence_types = {
+            "evidence_unavailable",
+            "missing_policy_evidence",
+            "missing_underwriting_evidence",
+            "claims_evidence_incomplete",
+            "medical_evidence_incomplete",
+        }
+
+        for item in gaps:
+            if not isinstance(item, dict):
+                continue
+
+            item_type = str(item.get("type", "")).strip().lower()
+            status = str(item.get("status", "")).strip().lower()
+
+            if item_type in evidence_types or status == "needs_more_information":
+                evidence.append(item)
+            else:
+                confirmed.append(item)
+
+        return confirmed, evidence
 
     @staticmethod
     def _risk_flags(
@@ -579,6 +641,7 @@ class SubmissionIntelligenceAgent:
         applicant_profile: dict[str, Any],
         submission: dict[str, Any],
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         applicant_id = self._applicant_id(
             applicant_profile
         )
@@ -634,6 +697,28 @@ class SubmissionIntelligenceAgent:
             "underwriting_submission"
         ]
 
+        # Keep RAG chunks for AI reasoning, but create a separate
+        # document-level representation for the reviewer UI.
+        medical_review_evidence = self._build_reviewer_evidence(
+            medical_evidence
+        )
+        claims_review_evidence = self._build_reviewer_evidence(
+            claims_evidence
+        )
+        policy_review_evidence = self._build_reviewer_evidence(
+            policy_evidence
+        )
+        underwriting_review_evidence = self._build_reviewer_evidence(
+            underwriting_submission
+        )
+
+        reviewer_evidence_summary = self._reviewer_evidence_summary(
+            medical_review_evidence=medical_review_evidence,
+            claims_review_evidence=claims_review_evidence,
+            policy_review_evidence=policy_review_evidence,
+            underwriting_review_evidence=underwriting_review_evidence,
+        )
+
         regulatory_evidence = enrichment[
             "regulatory_evidence"
         ]
@@ -651,18 +736,32 @@ class SubmissionIntelligenceAgent:
         ]
 
         if isinstance(coverage_result, dict):
-            coverage_gaps = coverage_result.get(
-                "coverage_gaps",
+            raw_gaps = coverage_result.get(
+                "confirmed_coverage_gaps",
+                coverage_result.get("coverage_gaps", []),
+            )
+            raw_evidence_gaps = coverage_result.get(
+                "evidence_gaps",
                 [],
             )
-            coverage_evidence_status = (
-                coverage_result.get(
-                    "evidence_status",
-                    {},
-                )
+            raw_gaps = raw_gaps if isinstance(raw_gaps, list) else []
+            raw_evidence_gaps = (
+                raw_evidence_gaps
+                if isinstance(raw_evidence_gaps, list)
+                else []
             )
+            split_confirmed, split_evidence = self._split_gap_types(raw_gaps)
+            coverage_gaps = split_confirmed
+            evidence_gaps = raw_evidence_gaps + split_evidence
+            coverage_evidence_status = coverage_result.get(
+                "evidence_status",
+                {},
+            )
+            if not isinstance(coverage_evidence_status, dict):
+                coverage_evidence_status = {}
         else:
             coverage_gaps = []
+            evidence_gaps = []
             coverage_evidence_status = {}
 
         evidence_summary = self._build_evidence_summary(
@@ -699,8 +798,20 @@ class SubmissionIntelligenceAgent:
                     "Agent 1 working-memory scratchpad."
                 ),
                 "evidence_summary": evidence_summary,
+                "reviewer_evidence_summary": reviewer_evidence_summary,
             }
         )
+
+        metrics = {
+            "latency_sec": round(time.perf_counter() - started, 4),
+            "llm_latency_sec": 0.0,
+            "input_tokens": max(1, len(str({"applicant_profile": applicant_profile, "submission": submission})) // 4),
+            "output_tokens": max(1, len(str(enrichment)) // 4),
+            "total_tokens": max(1, len(str({"applicant_profile": applicant_profile, "submission": submission})) // 4)
+            + max(1, len(str(enrichment)) // 4),
+            "token_source": "estimated",
+            "llm_used": False,
+        }
 
         return {
             "agent1_enrichment": {
@@ -709,11 +820,18 @@ class SubmissionIntelligenceAgent:
                 "claims_evidence": claims_evidence,
                 "policy_evidence": policy_evidence,
                 "underwriting_submission": underwriting_submission,
+                "medical_review_evidence": medical_review_evidence,
+                "claims_review_evidence": claims_review_evidence,
+                "policy_review_evidence": policy_review_evidence,
+                "underwriting_review_evidence": underwriting_review_evidence,
+                "reviewer_evidence_summary": reviewer_evidence_summary,
                 "regulatory_evidence": regulatory_evidence,
                 "actuarial_guidance": actuarial_guidance,
                 "underwriting_knowledge_evidence": actuarial_guidance,
                 "medical_knowledge": medical_knowledge,
                 "coverage_gaps": coverage_gaps,
+                "confirmed_coverage_gaps": coverage_gaps,
+                "evidence_gaps": evidence_gaps,
                 "coverage_evidence_status": coverage_evidence_status,
                 "evidence_summary": evidence_summary,
                 "scratchpad": scratchpad,
@@ -724,15 +842,24 @@ class SubmissionIntelligenceAgent:
             "claims_evidence": claims_evidence,
             "policy_evidence": policy_evidence,
             "underwriting_evidence": actuarial_guidance,
+            "medical_review_evidence": medical_review_evidence,
+            "claims_review_evidence": claims_review_evidence,
+            "policy_review_evidence": policy_review_evidence,
+            "underwriting_review_evidence": underwriting_review_evidence,
+            "reviewer_evidence_summary": reviewer_evidence_summary,
             "underwriting_submission": underwriting_submission,
             "regulatory_evidence": regulatory_evidence,
             "actuarial_guidance": actuarial_guidance,
             "medical_knowledge": medical_knowledge,
             "coverage_gaps": coverage_gaps,
+            "confirmed_coverage_gaps": coverage_gaps,
+            "evidence_gaps": evidence_gaps,
             "coverage_evidence_status": coverage_evidence_status,
             "evidence_summary": evidence_summary,
             "scratchpad": scratchpad,
             "workflow_trace": workflow_trace,
+            "metrics": metrics,
+            "agent1_metrics": metrics,
             "agent1_completed": True,
             "retrieved_at": utc_now(),
         }

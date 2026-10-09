@@ -15,6 +15,9 @@ from app.models.state import UnderwritingState
 
 
 MAX_REFLECTION_ROUNDS = 3
+HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD = 80.0
+HUMAN_REVIEW_OVERALL_RISK_THRESHOLD = 70.0
+HUMAN_REVIEW_CONFIDENCE_THRESHOLD = 0.70
 
 
 def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
@@ -51,6 +54,35 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _estimate_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        text = str(value)
+    except Exception:
+        return 0
+    return max(1, len(text) // 4) if text else 0
+
+
+def _ensure_metrics(
+    metrics: dict[str, Any],
+    input_payload: Any,
+    output_payload: Any,
+) -> dict[str, Any]:
+    normalized = dict(metrics or {})
+    total = int(normalized.get("total_tokens", 0) or 0)
+    if total > 0:
+        return normalized
+
+    input_tokens = _estimate_tokens(input_payload)
+    output_tokens = _estimate_tokens(output_payload)
+    normalized["input_tokens"] = input_tokens
+    normalized["output_tokens"] = output_tokens
+    normalized["total_tokens"] = input_tokens + output_tokens
+    normalized["token_source"] = "estimated"
+    return normalized
 
 
 def _workflow_metrics(
@@ -181,6 +213,7 @@ def intake_node(
 async def agent1_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     try:
         result = await submission_agent.run(
             applicant_profile=state.get(
@@ -200,6 +233,19 @@ async def agent1_node(
         agent1_metrics = _agent_metrics(
             result,
             "agent1",
+        )
+        if agent1_metrics["latency_sec"] <= 0:
+            agent1_metrics["latency_sec"] = round(
+                time.perf_counter() - started,
+                4,
+            )
+        agent1_metrics = _ensure_metrics(
+            agent1_metrics,
+            {
+                "applicant_profile": state.get("applicant_profile", {}),
+                "submission": state.get("submission", {}),
+            },
+            result,
         )
 
         underwriting_submission = result.get(
@@ -466,6 +512,15 @@ def agent2_node(
             result,
             "agent2",
         )
+        agent2_metrics = _ensure_metrics(
+            agent2_metrics,
+            {
+                "applicant_profile": state.get("applicant_profile", {}),
+                "submission": state.get("submission", {}),
+                "enrichment": state.get("agent1_enrichment", {}),
+            },
+            result,
+        )
 
         pricing = result.get(
             "pricing_result",
@@ -610,14 +665,16 @@ def confidence_gate_node(
         "standard",
     )
 
+    # Agent 3 is the mandatory critique/reflection layer.
+    # The confidence gate controls the depth of critique, not
+    # whether critique happens. Every underwriting decision must
+    # be checked before finalization.
     if (
         confidence >= 0.85
-        and risk_score < 70
+        and risk_score < 60
         and complexity_level == "standard"
     ):
         confidence_gate = "high"
-        reflection_required = False
-
     elif (
         complexity_level == "complex"
         or risk_score >= 70
@@ -628,19 +685,14 @@ def confidence_gate_node(
             if confidence >= 0.70
             else "low"
         )
-        reflection_required = True
-
     else:
         confidence_gate = "medium"
-        reflection_required = True
+
+    reflection_required = True
 
     return {
         "updated_at": _now(),
-        "final_status": (
-            "finalize"
-            if not reflection_required
-            else "agent3"
-        ),
+        "final_status": "agent3",
         "confidence_gate": confidence_gate,
         "reflection_required": reflection_required,
 
@@ -662,11 +714,7 @@ def confidence_gate_node(
                 "complexity_level": complexity_level,
                 "confidence_gate": confidence_gate,
                 "reflection_required": reflection_required,
-                "reflection_mode": (
-                    "pending_agent3"
-                    if reflection_required
-                    else "none"
-                ),
+                "reflection_mode": "mandatory_agent3",
             },
         ),
 
@@ -702,6 +750,8 @@ def reflection_node(
                 [],
             )
         )
+
+        started = time.perf_counter()
 
         result = reflection_agent.run(
             applicant_profile=state.get(
@@ -740,6 +790,22 @@ def reflection_node(
         agent3_metrics = _agent_metrics(
             result,
             "agent3",
+        )
+        if agent3_metrics["latency_sec"] <= 0:
+            agent3_metrics["latency_sec"] = round(
+                time.perf_counter() - started,
+                4,
+            )
+        agent3_metrics = _ensure_metrics(
+            agent3_metrics,
+            {
+                "applicant_profile": state.get("applicant_profile", {}),
+                "submission": state.get("submission", {}),
+                "risk_assessment": state.get("risk_assessment", {}),
+                "pricing_result": state.get("pricing_result", {}),
+                "previous_findings": previous_findings,
+            },
+            result,
         )
 
         agent3_round = int(
@@ -873,6 +939,10 @@ def reflection_node(
 
             "require_human_escalation": require_human,
 
+            "reflection_consensus": bool(
+                result.get("advisory", {}).get("consensus", False)
+            ),
+
             "human_review_reason": result.get(
                 "human_review_reason",
                 "",
@@ -964,18 +1034,62 @@ def reflection_router(
     return "finalize"
 
 
+def _business_review_reasons(
+    state: UnderwritingState,
+) -> list[str]:
+    reasons: list[str] = []
+
+    medical_risk = float(state.get("medical_risk_score", 0.0) or 0.0)
+    overall_risk = float(state.get("overall_risk_score", 0.0) or 0.0)
+    confidence = float(state.get("agent2_confidence", 0.0) or 0.0)
+
+    if medical_risk >= HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD:
+        reasons.append(
+            f"Medical risk score {medical_risk:.2f} is at or above {HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD:.0f}."
+        )
+
+    if overall_risk >= HUMAN_REVIEW_OVERALL_RISK_THRESHOLD:
+        reasons.append(
+            f"Overall risk score {overall_risk:.2f} is at or above {HUMAN_REVIEW_OVERALL_RISK_THRESHOLD:.0f}."
+        )
+
+    if confidence < HUMAN_REVIEW_CONFIDENCE_THRESHOLD:
+        reasons.append(
+            f"Agent 2 confidence {confidence:.2f} is below {HUMAN_REVIEW_CONFIDENCE_THRESHOLD:.2f}."
+        )
+
+    constitutional_flag = False
+    for key, value in state.items():
+        if key.startswith("constitutional_") and isinstance(value, dict):
+            if str(value.get("status", "")).lower() == "flag":
+                constitutional_flag = True
+                break
+
+    if constitutional_flag:
+        reasons.append("A constitutional/fairness/compliance check was flagged.")
+
+    verdict = str(state.get("reflection_verdict", "")).strip().lower()
+    if verdict in {"fail", "failed"}:
+        reasons.append("Agent 3 reflection failed.")
+
+    if state.get("reflection_round", 0) >= MAX_REFLECTION_ROUNDS and not state.get("reflection_consensus", False):
+        reasons.append("Agent 3 did not reach consensus within the maximum reflection rounds.")
+
+    return reasons
+
+
 def post_reflection_router(
     state: UnderwritingState,
 ) -> str:
+    business_reasons = _business_review_reasons(state)
+
+    if business_reasons:
+        return "human_review"
+
     if state.get(
         "require_human_escalation",
         False,
     ):
-        return "human_review"
-
-    # Progressive-autonomy policy: complex underwriting cases
-    # require human review even when Agent 3 reflection passes.
-    if state.get("complexity_level") == "complex":
         return "human_review"
 
     reflection_round = int(
@@ -1017,12 +1131,12 @@ def human_review_node(
         "human_review_reason",
         "",
     )
+    business_reasons = _business_review_reasons(state)
 
-    if not reason and state.get("complexity_level") == "complex":
-        reason = (
-            "Complex underwriting case requires human review "
-            "under the progressive-autonomy policy."
-        )
+    if business_reasons:
+        reason_parts = [reason] if reason else []
+        reason_parts.extend(business_reasons)
+        reason = " ".join(dict.fromkeys(reason_parts))
 
     if not reason:
         reason = "Manual underwriting review required."
@@ -1074,7 +1188,14 @@ def finalize_node(
         or 0.0
     )
 
-    if state.get(
+    business_reasons = _business_review_reasons(state)
+
+    if business_reasons:
+        decision = "human_review_required"
+        status = "awaiting_human_review"
+        recommendation = "human_review"
+
+    elif state.get(
         "require_human_escalation",
         False,
     ):
@@ -1252,9 +1373,6 @@ memory_saver = MemorySaver()
 
 workflow = build_graph().compile(
     checkpointer=memory_saver,
-    interrupt_before=[
-        "human_review",
-    ],
 )
 
 
@@ -1265,6 +1383,7 @@ def create_async_graph():
 async def run_workflow(
     initial_state: UnderwritingState,
     thread_id: str | None = None,
+    on_update=None,
 ) -> dict[str, Any]:
     case_id = initial_state.get(
         "case_id",
@@ -1281,11 +1400,20 @@ async def run_workflow(
     }
 
     started = time.perf_counter()
+    result = dict(initial_state)
 
-    result = await workflow.ainvoke(
+    # Stream completed node states so the API can persist progress while
+    # the asynchronous workflow is still running.
+    async for update in workflow.astream(
         initial_state,
         config=config,
-    )
+        stream_mode="values",
+    ):
+        result = dict(update)
+        if on_update is not None:
+            callback_result = on_update(result)
+            if hasattr(callback_result, "__await__"):
+                await callback_result
 
     agent_metrics = result.get(
         "agent_metrics",
@@ -1308,3 +1436,4 @@ async def run_workflow(
     }
 
     return result
+

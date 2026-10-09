@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import streamlit as st
@@ -399,13 +400,22 @@ def applicant_card(
 
                 # Remove obvious PDF extraction artifacts
                 # that are actually medical conditions.
-                if name.lower() in {
-                    "gerd",
-                    "hypertension",
-                    "hypothyroidism",
-                    "dyslipidaemia",
-                    "intermittent",
-                }:
+                normalized_name = re.sub(r"\s+", " ", name.lower()).strip()
+
+                if (
+                    normalized_name in {
+                        "gerd",
+                        "hypertension",
+                        "essential hypertension",
+                        "hypothyroidism",
+                        "dyslipidaemia",
+                        "type 2 diabetes mellitus",
+                        "intermittent",
+                    }
+                    or normalized_name.startswith("since ")
+                    or "year diagnosed" in normalized_name
+                    or "status (as declared)" in normalized_name
+                ):
                     continue
 
                 medication_items.append(
@@ -1403,16 +1413,81 @@ def _document_label(item: dict[str, Any]) -> str:
     )
 
 
+def _clean_evidence_text(value: Any) -> str:
+    text = safe_text(value, "").strip()
+    if not text:
+        return ""
+
+    # Normalize escaped newlines and common PDF extraction artifacts.
+    text = text.replace("\\n", "\n")
+    text = re.sub(r"\[Page\s+\d+\]", "", text, flags=re.I)
+    text = re.sub(r"\bPage\s+\d+\s+of\s+\d+\b", "", text, flags=re.I)
+
+    # Remove repeated synthetic document headers while keeping their actual
+    # clinical content.
+    text = re.sub(
+        r"\bAPP-\d+\s+SYNTHETIC\s*/?\s*DEMONSTRATION DATA\s*[—-]\s*MEDUNDERWRITE AI\b",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\b(?:Medical|Endocrinology|Claim|Policy|Underwriting)\s+Report\s+[^|\n]+\|\s*APP-\d+[^\n]*",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    # Turn numbered report sections into readable blocks.
+    text = re.sub(r"\s+(?=\d+\.\s+[A-Z])", "\n\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    return text.strip(" \n")
+
+
 def _document_content(item: dict[str, Any]) -> str:
     value = get_value(
         item,
+        "human_readable_content",
+        "original_text",
+        "full_text",
+        "clean_text",
         "content",
         "text",
         "page_content",
         "excerpt",
         default="",
     )
-    return safe_text(value, "").strip()
+    return _clean_evidence_text(value)
+
+
+def _dedupe_evidence_fragments(contents: list[str]) -> list[str]:
+    """Remove exact and containment duplicates caused by overlapping retrieval chunks."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for value in contents:
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+
+    # Prefer the longest version when one retrieved fragment is wholly
+    # contained in another fragment from the same source document.
+    normalized.sort(key=len, reverse=True)
+    kept: list[str] = []
+    for candidate in normalized:
+        candidate_key = candidate.casefold()
+        if any(candidate_key in existing.casefold() for existing in kept):
+            continue
+        kept.append(candidate)
+
+    return list(reversed(kept))
 
 
 def _render_document_reader(
@@ -1457,7 +1532,8 @@ def _render_document_reader(
             seen.add(content)
             contents.append(content)
 
-    full_text = "\\n\\n".join(contents).strip()
+    contents = _dedupe_evidence_fragments(contents)
+    full_text = "\n\n".join(contents).strip()
 
     st.markdown(
         f"**{title}**"
@@ -1487,16 +1563,20 @@ def _render_document_reader(
         st.markdown(
             "**Relevant evidence**"
         )
-        preview = full_text[:1400].strip()
-        if len(full_text) > 1400:
+        preview = full_text[:1800].strip()
+        if len(full_text) > 1800:
             preview += "…"
         st.write(preview)
 
         with st.expander(
-            "View full evidence",
+            "View full source text",
             expanded=False,
         ):
             st.text(full_text)
+            st.caption(
+                "Readable source-document text is shown here for reviewer verification. "
+                "Retrieval chunks remain an AI representation; they are not presented as the original PDF."
+            )
     else:
         st.caption(
             "The source was retrieved, but readable text is not available."
@@ -1757,6 +1837,9 @@ def agent_metrics(
         data.get("total_tokens")
     )
 
+    if not data or not any((latency, llm_latency, input_tokens, output_tokens, total_tokens)):
+        return
+
     st.markdown(
         f"#### {agent_name} Metrics"
     )
@@ -1783,54 +1866,63 @@ def workflow_metrics(
     if not isinstance(agents, dict):
         agents = {}
 
-    st.markdown("#### Workflow Metrics")
+    workflow_has_data = any((
+        _metric_number(data.get("workflow_latency_sec")),
+        _metric_int(data.get("input_tokens")),
+        _metric_int(data.get("output_tokens")),
+        _metric_int(data.get("total_tokens")),
+    ))
+    agent_has_data = any(
+        isinstance(values, dict) and any((
+            _metric_number(values.get("latency_sec")),
+            _metric_number(values.get("llm_latency_sec")),
+            _metric_int(values.get("input_tokens")),
+            _metric_int(values.get("output_tokens")),
+            _metric_int(values.get("total_tokens")),
+        ))
+        for values in agents.values()
+    )
 
-    columns = st.columns(4)
-    values = [
-        (
-            "Workflow Latency",
-            f"{_metric_number(data.get('workflow_latency_sec')):.2f}s",
-        ),
-        (
-            "Input Tokens",
-            f"{_metric_int(data.get('input_tokens')):,}",
-        ),
-        (
-            "Output Tokens",
-            f"{_metric_int(data.get('output_tokens')):,}",
-        ),
-        (
-            "Total Tokens",
-            f"{_metric_int(data.get('total_tokens')):,}",
-        ),
-    ]
+    if not workflow_has_data and not agent_has_data:
+        return
 
-    for column, (label, value) in zip(columns, values):
-        with column:
-            metric_card(label, value)
+    if workflow_has_data:
+        st.markdown("#### Workflow Metrics")
+        columns = st.columns(4)
+        values = [
+            ("Workflow Latency", f"{_metric_number(data.get('workflow_latency_sec')):.2f}s"),
+            ("Input Tokens", f"{_metric_int(data.get('input_tokens')):,}"),
+            ("Output Tokens", f"{_metric_int(data.get('output_tokens')):,}"),
+            ("Total Tokens", f"{_metric_int(data.get('total_tokens')):,}"),
+        ]
+        for column, (label, value) in zip(columns, values):
+            with column:
+                metric_card(label, value)
 
-    if agents:
+    if agent_has_data:
         st.markdown("##### Agent Usage")
         rows = []
         for name, values in agents.items():
             if not isinstance(values, dict):
                 continue
-            rows.append(
-                {
-                    "Agent": humanize(name),
-                    "Latency": f"{_metric_number(values.get('latency_sec')):.2f}s",
-                    "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.2f}s",
-                    "Input Tokens": _metric_int(values.get("input_tokens")),
-                    "Output Tokens": _metric_int(values.get("output_tokens")),
-                    "Total Tokens": _metric_int(values.get("total_tokens")),
-                }
-            )
+            if not any((
+                _metric_number(values.get("latency_sec")),
+                _metric_number(values.get("llm_latency_sec")),
+                _metric_int(values.get("input_tokens")),
+                _metric_int(values.get("output_tokens")),
+                _metric_int(values.get("total_tokens")),
+            )):
+                continue
+            rows.append({
+                "Agent": humanize(name),
+                "Latency": f"{_metric_number(values.get('latency_sec')):.2f}s",
+                "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.2f}s",
+                "Input Tokens": _metric_int(values.get("input_tokens")),
+                "Output Tokens": _metric_int(values.get("output_tokens")),
+                "Total Tokens": _metric_int(values.get("total_tokens")),
+            })
         if rows:
-            st.dataframe(
-                rows,
-                hide_index=True,
-                use_container_width=True,
-            )
+            st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
 # ============================================================
@@ -1998,68 +2090,55 @@ def review_actions(
 
     comments = st.text_area(
         "Review comments",
-        placeholder=(
-            "Document the basis for the review decision..."
-        ),
+        placeholder="Document the basis for the review decision...",
         key=f"review_comments_{case_id}",
+    )
+
+    decision = st.selectbox(
+        "Override decision",
+        options=[
+            "approved",
+            "approved_with_loading",
+            "approved_with_exclusion",
+            "postpone",
+            "declined",
+        ],
+        format_func=humanize,
+        key=f"override_decision_{case_id}",
     )
 
     columns = st.columns(4)
 
     with columns[0]:
-        approve = st.button(
-            "Approve",
-            key=f"approve_{case_id}",
-            use_container_width=True,
-        )
-
+        approve = st.button("Approve", key=f"approve_{case_id}", use_container_width=True)
     with columns[1]:
-        override = st.button(
-            "Override",
-            key=f"override_{case_id}",
-            use_container_width=True,
-        )
-
+        override = st.button("Override", key=f"override_{case_id}", use_container_width=True)
     with columns[2]:
-        sendback = st.button(
-            "Send Back",
-            key=f"sendback_{case_id}",
-            use_container_width=True,
-        )
-
+        sendback = st.button("Send Back", key=f"sendback_{case_id}", use_container_width=True)
     with columns[3]:
-        escalate = st.button(
-            "Escalate",
-            key=f"escalate_{case_id}",
-            use_container_width=True,
-        )
+        escalate = st.button("Escalate", key=f"escalate_{case_id}", use_container_width=True)
+
+    reviewer = reviewer.strip()
+    comments = comments.strip()
 
     if approve:
-        return {
-            "action": "approve",
-            "reviewer": reviewer,
-            "comments": comments,
-        }
-
+        return {"action": "approve", "reviewer": reviewer, "comments": comments}
     if override:
         return {
             "action": "override",
             "reviewer": reviewer,
             "comments": comments,
+            "decision": decision,
         }
-
     if sendback:
-        return {
-            "action": "sendback",
-            "reviewer": reviewer,
-            "comments": comments,
-        }
-
+        if not comments:
+            st.warning("Add review comments before sending the case back.")
+            return None
+        return {"action": "sendback", "reviewer": reviewer, "comments": comments}
     if escalate:
-        return {
-            "action": "escalate",
-            "reviewer": reviewer,
-            "comments": comments,
-        }
+        if not comments:
+            st.warning("Add review comments before escalating the case.")
+            return None
+        return {"action": "escalate", "reviewer": reviewer, "comments": comments}
 
     return None

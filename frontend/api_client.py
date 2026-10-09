@@ -266,6 +266,7 @@ class APIClient:
         action: str,
         payload: dict[str, Any],
     ) -> Any:
+        """Record an explicit human-review lifecycle action."""
         paths = {
             "approve": f"/api/case/{case_id}/approve",
             "override": f"/api/case/{case_id}/override",
@@ -279,6 +280,59 @@ class APIClient:
             "POST",
             path,
             json=payload,
+        )
+
+    def approve(
+        self,
+        case_id: str,
+        reviewer: str,
+        comments: str = "",
+    ) -> Any:
+        return self._review(
+            case_id,
+            "approve",
+            {"reviewer": reviewer, "comments": comments},
+        )
+
+    def override(
+        self,
+        case_id: str,
+        reviewer: str,
+        decision: str,
+        comments: str = "",
+    ) -> Any:
+        return self._review(
+            case_id,
+            "override",
+            {
+                "reviewer": reviewer,
+                "decision": decision,
+                "comments": comments,
+            },
+        )
+
+    def sendback(
+        self,
+        case_id: str,
+        reviewer: str,
+        comments: str,
+    ) -> Any:
+        return self._review(
+            case_id,
+            "sendback",
+            {"reviewer": reviewer, "comments": comments},
+        )
+
+    def escalate(
+        self,
+        case_id: str,
+        reviewer: str,
+        comments: str = "",
+    ) -> Any:
+        return self._review(
+            case_id,
+            "escalate",
+            {"reviewer": reviewer, "comments": comments},
         )
 
 

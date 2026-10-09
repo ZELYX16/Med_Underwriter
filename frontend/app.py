@@ -893,13 +893,7 @@ def run_underwriting(
                 progress = get_progress(current)
                 progress_bar.progress(progress)
 
-                current_agent = (
-                    current.get("current_agent")
-                    or current.get("current_node")
-                    or current.get("current_step")
-                    or current_status
-                )
-                stage_label = humanize(current_agent)
+                stage_label = workflow_stage(current)
 
                 if stage_label != last_stage:
                     stage_placeholder.markdown(
@@ -1914,14 +1908,8 @@ def render_treatment_history(
 def render_claim_history(
     profile: dict[str, Any],
 ) -> None:
-    claims = profile.get(
-        "claims"
-    )
-
-    if not isinstance(
-        claims,
-        list,
-    ):
+    claims = profile.get("claims")
+    if not isinstance(claims, list):
         claims = []
 
     section_title(
@@ -1930,97 +1918,33 @@ def render_claim_history(
     )
 
     if not claims:
-        st.caption(
-            "No historical claims declared."
-        )
+        st.caption("No historical claims declared.")
         return
 
-    st.caption(
-        f"{len(claims)} historical claim(s) declared"
-    )
+    st.caption(f"{len(claims)} historical claim(s) declared")
 
     for claim in claims:
+        if not isinstance(claim, dict):
+            st.write(str(claim))
+            st.divider()
+            continue
 
-        if isinstance(
-            claim,
-            dict,
-        ):
-            claim_id = (
-                claim.get(
-                    "claim_id"
-                )
-                or claim.get(
-                    "id"
-                )
-                or "Historical claim"
-            )
+        claim_id = claim.get("claim_id") or claim.get("id") or "Historical claim"
+        status = humanize(claim.get("status") or "Historical")
+        date = claim.get("date") or claim.get("claim_date")
+        amount = claim.get("amount") or claim.get("paid_amount")
 
-            status = humanize(
-                claim.get(
-                    "status"
-                )
-                or "Historical"
-            )
+        fields = [("CLAIM", claim_id), ("STATUS", status)]
+        if date not in (None, "", "—"):
+            fields.append(("DATE", date))
+        if amount not in (None, "", "—"):
+            fields.append(("AMOUNT", format_currency(amount)))
 
-            date = (
-                claim.get(
-                    "date"
-                )
-                or claim.get(
-                    "claim_date"
-                )
-            )
-
-            amount = (
-                claim.get(
-                    "amount"
-                )
-                or claim.get(
-                    "paid_amount"
-                )
-            )
-
-            columns = st.columns(
-                [
-                    1.5,
-                    1.5,
-                    1.5,
-                    1.5,
-                ]
-            )
-
-            with columns[0]:
-                st.caption("CLAIM")
-                st.write(
-                    claim_id
-                )
-
-            with columns[1]:
-                st.caption("STATUS")
-                st.write(
-                    status
-                )
-
-            with columns[2]:
-                st.caption("DATE")
-                st.write(
-                    date or "—"
-                )
-
-            with columns[3]:
-                st.caption("AMOUNT")
-                st.write(
-                    format_currency(
-                        amount
-                    )
-                    if amount
-                    else "—"
-                )
-
-        else:
-            st.write(
-                str(claim)
-            )
+        columns = st.columns(len(fields))
+        for column, (label, value) in zip(columns, fields):
+            with column:
+                st.caption(label)
+                st.write(value)
 
         st.divider()
 
@@ -2032,76 +1956,41 @@ def render_claim_history(
 def render_existing_policy(
     profile: dict[str, Any],
 ) -> None:
-    policy = profile.get(
-        "existing_policy"
-    )
+    policy = profile.get("existing_policy")
 
     section_title(
         "Existing Policy",
         "Current insurance policy information.",
     )
 
-    if not isinstance(
-        policy,
-        dict,
-    ) or not policy:
-        st.caption(
-            "No existing policy declared."
-        )
+    if not isinstance(policy, dict) or not policy:
+        st.caption("No existing policy declared.")
         return
 
-    columns = st.columns(
-        [
-            1.5,
-            1.5,
-            2,
-            2,
-        ]
-    )
+    fields = []
+    policy_id = policy.get("policy_id")
+    status = policy.get("status")
+    policy_type = policy.get("type") or policy.get("policy_type")
+    coverage_limit = policy.get("coverage_limit") or policy.get("sum_insured")
 
-    fields = [
-        (
-            "POLICY ID",
-            policy.get(
-                "policy_id"
-            ),
-        ),
-        (
-            "STATUS",
-            humanize(
-                policy.get(
-                    "status"
-                )
-            ),
-        ),
-        (
-            "TYPE",
-            policy.get(
-                "type"
-            ),
-        ),
-        (
-            "COVERAGE LIMIT",
-            format_currency(
-                policy.get(
-                    "coverage_limit"
-                )
-            ),
-        ),
-    ]
+    if policy_id not in (None, ""):
+        fields.append(("POLICY ID", policy_id))
+    if status not in (None, ""):
+        fields.append(("STATUS", humanize(status)))
+    if policy_type not in (None, ""):
+        fields.append(("TYPE", policy_type))
+    if coverage_limit not in (None, ""):
+        fields.append(("COVERAGE LIMIT", format_currency(coverage_limit)))
 
-    for column, (
-        label,
-        value,
-    ) in zip(
-        columns,
-        fields,
-    ):
+    if not fields:
+        st.caption("No policy details available.")
+        return
+
+    columns = st.columns(len(fields))
+    for column, (label, value) in zip(columns, fields):
         with column:
             st.caption(label)
-            st.write(
-                text(value)
-            )
+            st.write(value)
 
 
 # ============================================================
@@ -2545,56 +2434,114 @@ def render_case_action_bar(
         )
 
 
+def workflow_stage(case: dict[str, Any]) -> str:
+    """Return the backend workflow node for human-readable progress."""
+    for key in ("current_node", "current_agent", "current_step"):
+        value = case.get(key)
+        if value:
+            return humanize(value)
+
+    status = status_key(case.get("status") or case.get("processing_status"))
+    mapping = {
+        "draft": "Intake",
+        "pending": "Intake",
+        "in-progress": "Workflow",
+        "running": "Workflow",
+        "processing": "Workflow",
+        "agent1": "Agent 1 · Submission Intelligence",
+        "agent2": "Agent 2 · Risk Assessment",
+        "agent3": "Agent 3 · Reflection",
+        "awaiting-human-review": "Human Review",
+        "human-review": "Human Review",
+        "review": "Human Review",
+        "escalated": "Human Review · Escalated",
+        "sent-back": "Returned for Reassessment",
+        "completed": "Finalization",
+        "failed": "Workflow Failed",
+    }
+    return mapping.get(status, humanize(status))
+
+
+def review_reasons(case: dict[str, Any]) -> list[str]:
+    """Collect business-gate reasons without duplicating backend messages."""
+    values = []
+    for key in (
+        "human_review_reasons",
+        "business_gate_reasons",
+        "human_review_reason",
+    ):
+        value = case.get(key)
+        if isinstance(value, list):
+            values.extend(str(v) for v in value if v not in (None, ""))
+        elif value not in (None, ""):
+            values.append(str(value))
+    result = []
+    seen = set()
+    for value in values:
+        key = value.strip().casefold()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(value.strip())
+    return result
+
+
+def evidence_gaps(case: dict[str, Any]) -> list[Any]:
+    value = case.get("evidence_gaps")
+    if isinstance(value, list):
+        return value
+    evidence = case.get("evidence")
+    if isinstance(evidence, dict) and isinstance(evidence.get("evidence_gaps"), list):
+        return evidence["evidence_gaps"]
+    return []
+
+
+def confirmed_coverage_gaps(case: dict[str, Any]) -> list[Any]:
+    value = case.get("confirmed_coverage_gaps")
+    if isinstance(value, list):
+        return value
+    value = case.get("coverage_gaps")
+    return value if isinstance(value, list) else []
+
+
 def get_progress(
     case: dict[str, Any],
 ) -> float:
-    explicit = case.get(
-        "progress_pct"
-    )
-
+    explicit = case.get("progress_pct")
     if explicit is not None:
         try:
-            return max(
-                0.0,
-                min(
-                    float(explicit) / 100,
-                    1.0,
-                ),
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
+            return max(0.0, min(float(explicit) / 100, 1.0))
+        except (TypeError, ValueError):
             pass
 
-    status = status_key(
-        case.get(
-            "status"
-        )
-        or case.get(
-            "processing_status"
-        )
-    )
+    status = status_key(case.get("status") or case.get("processing_status"))
+    node = str(case.get("current_node") or case.get("current_step") or "").strip().lower().replace("-", "_")
+    stage_values = {
+        "intake": 0.08,
+        "validate": 0.12,
+        "agent1": 0.30,
+        "agent1_submission": 0.30,
+        "complexity_router": 0.40,
+        "agent2": 0.58,
+        "agent2_risk": 0.58,
+        "confidence_gate": 0.68,
+        "agent3": 0.82,
+        "agent3_reflection": 0.82,
+        "human_review": 0.90,
+        "human_review_gate": 0.90,
+        "finalization": 1.0,
+    }
+    if node in stage_values:
+        return stage_values[node]
 
     values = {
-        "draft": 0.0,
-        "pending": 0.05,
-        "agent1": 0.30,
-        "in-progress": 0.45,
-        "running": 0.50,
-        "agent2": 0.60,
-        "agent3": 0.80,
-        "human-review": 0.90,
-        "review": 0.90,
-        "awaiting-human-review": 0.90,
-        "escalated": 0.95,
-        "completed": 1.0,
+        "draft": 0.0, "pending": 0.05, "in-progress": 0.45,
+        "running": 0.50, "processing": 0.50, "agent1": 0.30,
+        "agent2": 0.58, "agent3": 0.82,
+        "human-review": 0.90, "review": 0.90,
+        "awaiting-human-review": 0.90, "escalated": 0.95,
+        "sent-back": 0.30, "completed": 1.0, "failed": 1.0,
     }
-
-    return values.get(
-        status,
-        0.0,
-    )
+    return values.get(status, 0.0)
 
 
 # ============================================================
@@ -3208,18 +3155,23 @@ def render_case_evidence(
         evidence = {}
 
     backend_evidence = {
-        "medical_evidence": case.get("medical_evidence", []),
-        "claims_evidence": case.get("claims_evidence", []),
-        "policy_evidence": case.get("policy_evidence", []),
+        "medical_evidence": case.get("medical_review_evidence")
+            or case.get("medical_evidence", []),
+        "claims_evidence": case.get("claims_review_evidence")
+            or case.get("claims_evidence", []),
+        "policy_evidence": case.get("policy_review_evidence")
+            or case.get("policy_evidence", []),
+        "underwriting_evidence": case.get("underwriting_review_evidence")
+            or case.get("underwriting_evidence", []),
         "regulatory_evidence": case.get("regulatory_evidence", []),
-        "underwriting_evidence": case.get("underwriting_evidence", []),
         "medical_knowledge": case.get("medical_knowledge", []),
-        "coverage_gaps": case.get("coverage_gaps", []),
+        "confirmed_coverage_gaps": confirmed_coverage_gaps(case),
+        "evidence_gaps": evidence_gaps(case),
     }
 
     for key, value in backend_evidence.items():
         if isinstance(value, list) and value:
-            evidence.setdefault(key, value)
+            evidence[key] = value
 
     if evidence:
         evidence_availability(evidence)
@@ -3269,7 +3221,7 @@ def render_case_evidence(
         for key, value in evidence.items():
             if not isinstance(value, list) or not value:
                 continue
-            if key == "coverage_gaps":
+            if key in {"confirmed_coverage_gaps", "evidence_gaps"}:
                 continue
 
             evidence_section(
@@ -3606,269 +3558,146 @@ def render_agent3_section(
 ) -> None:
     section_title(
         "Agent 3 · Reflection & Quality",
-        "Constitutional checks and multi-persona reflection for complex or high-risk cases.",
+        "Mandatory quality gate applied to every underwriting case; reflection depth varies by risk and confidence.",
     )
 
-    result = get_agent_result(
-        case,
-        3,
+    result = get_agent_result(case, 3)
+    complexity = humanize(case.get("complexity_level") or "standard")
+    risk_score = overall_risk(case)
+    confidence = extract_confidence(case)
+    confidence_numeric = None
+    if confidence not in (None, ""):
+        try:
+            confidence_numeric = float(str(confidence).replace("%", "")) / (100 if "%" in str(confidence) else 1)
+        except (TypeError, ValueError):
+            confidence_numeric = None
+    mode = case.get("reflection_type") or result.get("reflection_type")
+    verdict = case.get("reflection_verdict") or result.get("reflection_verdict") or ""
+    human_required = bool(
+        case.get("require_human_review")
+        or case.get("require_human_escalation")
+        or status_key(case.get("final_status") or case.get("status")) in {
+            "human-review", "awaiting-human-review", "escalated"
+        }
     )
 
-    constitutional = (
-        case.get("constitutional_results")
-        or result.get("constitutional_results")
-        or result.get("constitutional")
-        or {}
-    )
-
-    if not constitutional:
-        constitutional = {}
-        for key in (
-            "constitutional_medical_accuracy",
-            "constitutional_actuarial_soundness",
-            "constitutional_regulatory_compliance",
-            "constitutional_fairness",
-            "constitutional_explainability",
-        ):
-            value = case.get(key)
-            if value:
-                constitutional[key.replace("constitutional_", "")] = value
-
-    reflection = (
-        case.get("reflection_personas")
-        or case.get("mar_persona_outputs")
-        or result.get("reflection_personas")
-        or result.get("mar_persona_outputs")
-        or result.get("persona_outputs")
-        or result.get("personas")
-        or []
-    )
-
-    if not result and not constitutional and not reflection:
-        st.info(
-            "Agent 3 has not produced a reflection result for this case."
-        )
+    if not result and not case.get("agent3_completed") and not case.get("reflection_findings"):
+        st.info("Agent 3 has not produced a reflection result yet.")
         return
 
-    mode = (
-        case.get(
-            "reflection_mode"
-        )
-        or result.get(
-            "reflection_mode"
-        )
-    )
-
-    round_number = (
-        case.get(
-            "reflection_round"
-        )
-        or result.get(
-            "reflection_round"
-        )
-    )
-
-    columns = st.columns(3)
-
+    columns = st.columns(4)
     with columns[0]:
         st.caption("REFLECTION MODE")
-        st.write(
-            humanize(mode)
-            if mode
-            else "Not specified"
-        )
-
+        st.write(humanize(mode) if mode else "Pending")
     with columns[1]:
-        st.caption("REFLECTION ROUND")
-        st.write(
-            text(round_number)
-        )
-
+        st.caption("ROUND")
+        st.write(text(case.get("reflection_round") or result.get("reflection_round") or "—"))
     with columns[2]:
-        st.caption("QUALITY VERDICT")
-        verdict = (
-            case.get("reflection_verdict")
-            or result.get("verdict")
-            or result.get("final_verdict")
-            or "Completed"
-        )
-        st.write(
-            humanize(verdict)
-        )
+        st.caption("VERDICT")
+        st.write(humanize(verdict) if verdict else "Pending")
+    with columns[3]:
+        st.caption("HUMAN REVIEW")
+        if human_required:
+            st.warning("Required")
+        else:
+            st.success("Not required")
 
-    if constitutional:
-
-        st.divider()
-
-        st.markdown(
-            "#### Constitutional Checks"
-        )
-
-        if isinstance(
-            constitutional,
-            dict,
-        ):
-
-            for key, value in constitutional.items():
-
-                passed = None
-                message = value
-
-                if isinstance(
-                    value,
-                    dict,
-                ):
-                    passed = value.get(
-                        "passed"
-                    )
-                    message = (
-                        value.get(
-                            "message"
-                        )
-                        or value.get(
-                            "reason"
-                        )
-                        or value.get(
-                            "result"
-                        )
-                        or ""
-                    )
-
-                columns = st.columns(
-                    [
-                        2,
-                        1,
-                        4,
-                    ]
-                )
-
-                with columns[0]:
-                    st.write(
-                        humanize(key)
-                    )
-
-                with columns[1]:
-                    if passed is True:
-                        st.success(
-                            "PASS"
-                        )
-                    elif passed is False:
-                        st.error(
-                            "FLAG"
-                        )
-                    else:
-                        st.write(
-                            "—"
-                        )
-
-                with columns[2]:
-                    st.write(
-                        str(message)
-                    )
+    st.divider()
+    st.markdown("#### Why Agent 3 was invoked")
+    reasons = [
+        "Agent 3 is a mandatory quality-control step for every completed underwriting case.",
+        f"Reflection depth selected: {humanize(mode) if mode else 'Pending'}.",
+    ]
+    if complexity.lower() == "complex":
+        reasons.append("The case was classified as complex, so a deeper reflection profile may be used.")
+    if risk_score is not None and risk_score >= 70:
+        reasons.append(f"Overall risk is {risk_score:.2f}, which is in the high-risk range.")
+    if confidence_numeric is not None and confidence_numeric < 0.70:
+        reasons.append(f"Agent 2 confidence is {confidence_numeric:.0%}, below the high-confidence threshold.")
+    for reason in reasons:
+        st.write(f"• {reason}")
 
     findings = case.get("reflection_findings") or result.get("reflection_findings") or []
     if findings:
-        st.divider()
         st.markdown("#### Reflection Findings")
         for finding in findings:
             if isinstance(finding, dict):
-                st.write(f"• {finding.get('finding') or finding.get('message') or finding.get('reason') or finding}")
-            else:
+                message = finding.get("finding") or finding.get("message") or finding.get("reason")
+                if message:
+                    st.write(f"• {message}")
+            elif finding:
                 st.write(f"• {finding}")
 
-    if isinstance(
-        reflection,
-        dict,
+    constitutional = {}
+    for key in (
+        "constitutional_medical_accuracy",
+        "constitutional_actuarial_soundness",
+        "constitutional_regulatory_compliance",
+        "constitutional_fairness",
+        "constitutional_explainability",
     ):
-        reflection = [
-            {
-                "persona": key,
-                "output": value,
-            }
-            for key, value in reflection.items()
-        ]
+        value = case.get(key)
+        if value:
+            constitutional[key.replace("constitutional_", "")] = value
 
-    if reflection:
-
+    if constitutional:
         st.divider()
+        st.markdown("#### Constitutional Checks")
+        for key, value in constitutional.items():
+            passed = value.get("passed") if isinstance(value, dict) else None
+            message = (
+                value.get("message") or value.get("reason") or value.get("result") or ""
+                if isinstance(value, dict) else str(value)
+            )
+            columns = st.columns([2, 1, 4])
+            with columns[0]:
+                st.write(humanize(key))
+            with columns[1]:
+                if passed is True:
+                    st.success("PASS")
+                elif passed is False:
+                    st.error("FLAG")
+                else:
+                    st.write("—")
+            with columns[2]:
+                st.write(message)
 
-        st.markdown(
-            "#### Multi-Agent Reflection"
+    reflection = (
+        case.get("reflection_personas")
+        or result.get("reflection_personas")
+        or result.get("mar_persona_outputs")
+        or []
+    )
+    if reflection:
+        st.divider()
+        st.markdown("#### Multi-Agent Reflection")
+        for persona in reflection:
+            if isinstance(persona, dict):
+                name = persona.get("persona") or persona.get("role") or "Reviewer"
+                argument = persona.get("argument") or persona.get("reasoning") or persona.get("output")
+                verdict_value = persona.get("verdict") or persona.get("decision")
+                with st.expander(humanize(name), expanded=True):
+                    if verdict_value:
+                        st.caption("VERDICT")
+                        st.write(humanize(verdict_value))
+                    if argument:
+                        st.write(argument)
+            else:
+                st.write(persona)
+
+    reason = case.get("human_review_reason") or result.get("human_review_reason")
+    if human_required:
+        st.divider()
+        st.warning(
+            reason
+            or "This case requires human underwriting review before a final decision can be issued."
         )
 
-        for persona in reflection:
-
-            if isinstance(
-                persona,
-                dict,
-            ):
-
-                name = (
-                    persona.get(
-                        "persona"
-                    )
-                    or persona.get(
-                        "role"
-                    )
-                    or "Reviewer"
-                )
-
-                verdict = (
-                    persona.get(
-                        "verdict"
-                    )
-                    or persona.get(
-                        "decision"
-                    )
-                )
-
-                argument = (
-                    persona.get(
-                        "argument"
-                    )
-                    or persona.get(
-                        "key_argument"
-                    )
-                    or persona.get(
-                        "reasoning"
-                    )
-                    or persona.get(
-                        "output"
-                    )
-                )
-
-                with st.expander(
-                    humanize(name),
-                    expanded=True,
-                ):
-
-                    if verdict:
-                        st.caption(
-                            "VERDICT"
-                        )
-                        st.write(
-                            humanize(verdict)
-                        )
-
-                    if argument:
-                        st.write(
-                            argument
-                        )
-
-            else:
-                st.write(
-                    persona
-                )
-
-
-    metrics = (
-        result.get("metrics")
-        or result.get("agent_metrics")
-        or {}
-    )
+    metrics = result.get("metrics") or result.get("agent_metrics") or case.get("agent3_metrics") or {}
     if metrics:
         st.divider()
         agent_metrics(metrics, "Agent 3 / Reflection")
+
 # ============================================================
 # DECISION SECTION
 # ============================================================
@@ -3919,8 +3748,22 @@ def render_decision_section(
         st.caption(
             "FINAL DECISION"
         )
+        decision_status = status_key(
+            case.get("final_status")
+            or case.get("status")
+            or case.get("processing_status")
+        )
+        display_decision = (
+            "Human Review Required"
+            if decision_status in {
+                "human-review",
+                "awaiting-human-review",
+                "escalated",
+            }
+            else decision(case)
+        )
         st.markdown(
-            f"## {esc(decision(case))}"
+            f"## {esc(display_decision)}"
         )
 
     with columns[3]:
@@ -4311,6 +4154,42 @@ def render_key_value_grid(
 # WORKFLOW
 # ============================================================
 
+def _merge_workflow_metrics(case: dict[str, Any]) -> dict[str, Any]:
+    """Normalize metric locations returned by different backend state versions."""
+    candidates = [
+        case.get("workflow_metrics"),
+        case.get("metrics"),
+        case.get("token_usage"),
+    ]
+    merged: dict[str, Any] = {}
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            merged.update(candidate)
+
+    agents = {}
+    for source in (
+        merged.get("agents"),
+        case.get("agent_metrics"),
+    ):
+        if isinstance(source, dict):
+            agents.update(source)
+
+    # Some states store agent metrics directly on the case.
+    for name in ("agent1", "agent2", "agent3"):
+        direct = case.get(f"{name}_metrics")
+        if isinstance(direct, dict):
+            agents[name] = direct
+
+    merged["agents"] = agents
+
+    if not any(merged.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")) and agents:
+        merged["input_tokens"] = sum(int(v.get("input_tokens", 0) or 0) for v in agents.values() if isinstance(v, dict))
+        merged["output_tokens"] = sum(int(v.get("output_tokens", 0) or 0) for v in agents.values() if isinstance(v, dict))
+        merged["total_tokens"] = merged["input_tokens"] + merged["output_tokens"]
+
+    return merged
+
+
 def render_workflow_section(
     case: dict[str, Any],
 ) -> None:
@@ -4318,17 +4197,8 @@ def render_workflow_section(
         "Workflow",
         "Execution trace and persisted underwriting events.",
     )
-    workflow_metrics(
-        case.get("workflow_metrics")
-        or case.get("metrics")
-        or {}
-    )
-
-    agent_usage = case.get("agent_metrics")
-    if isinstance(agent_usage, dict) and agent_usage:
-        st.divider()
-        st.markdown("#### Agent Latency & Token Usage")
-        workflow_metrics({"agents": agent_usage})
+    metrics = _merge_workflow_metrics(case)
+    workflow_metrics(metrics)
     trace = case.get(
         "workflow_trace"
     )
@@ -4429,234 +4299,116 @@ def render_human_review(
         "Evidence-backed reviewer workspace for cases requiring human intervention.",
     )
 
-    status = status_key(
-        case.get("status")
-        or case.get("processing_status")
-    )
+    status = status_key(case.get("status") or case.get("processing_status"))
+    review_statuses = {"human-review", "review", "awaiting-human-review", "escalated"}
+    reasons = review_reasons(case)
 
-    if status not in {
-        "human-review",
-        "review",
-        "awaiting-human-review",
-        "escalated",
-    }:
+    if status in review_statuses:
+        st.warning("HUMAN REVIEW REQUIRED — finalization is blocked until a reviewer records an action.")
+        if reasons:
+            st.markdown("**Review reasons**")
+            for reason in reasons:
+                st.markdown(f"- {esc(reason)}")
+    else:
+        st.info("This case is not currently waiting for human review.")
 
-        st.info(
-            "This case is not currently waiting for human review."
-        )
-
-    score = overall_risk(
-        case
-    )
-
+    score = overall_risk(case)
     if score is not None:
-
         columns = st.columns(4)
-
         values = [
-            (
-                "Overall Risk",
-                risk_value(
-                    case,
-                    "overall_risk_score",
-                ),
-            ),
-            (
-                "Medical Risk",
-                risk_value(
-                    case,
-                    "medical_risk_score",
-                ),
-            ),
-            (
-                "Claims Risk",
-                risk_value(
-                    case,
-                    "claims_risk_score",
-                ),
-            ),
-            (
-                "Coverage Gap",
-                risk_value(
-                    case,
-                    "coverage_gap_score",
-                ),
-            ),
+            ("Overall Risk", risk_value(case, "overall_risk_score")),
+            ("Medical Risk", risk_value(case, "medical_risk_score")),
+            ("Claims Risk", risk_value(case, "claims_risk_score")),
+            ("Coverage Gap", risk_value(case, "coverage_gap_score")),
         ]
-
-        for column, (
-            label,
-            value,
-        ) in zip(
-            columns,
-            values,
-        ):
+        for column, (label, value) in zip(columns, values):
             with column:
-                st.caption(
-                    label.upper()
-                )
-                st.markdown(
-                    f"### {text(value)}"
-                )
+                st.caption(label.upper())
+                st.markdown(f"### {text(value)}")
 
-    risk = risk_assessment(
-        case
-    )
+    confirmed = confirmed_coverage_gaps(case)
+    missing_evidence = evidence_gaps(case)
+    st.divider()
+    gap_columns = st.columns(2)
+    with gap_columns[0]:
+        st.markdown("#### Coverage Assessment")
+        if confirmed:
+            for gap in confirmed:
+                st.markdown(f"- {esc(gap)}")
+        else:
+            st.success("No confirmed coverage gaps identified.")
+    with gap_columns[1]:
+        st.markdown("#### Evidence Completeness")
+        if missing_evidence:
+            for gap in missing_evidence:
+                st.markdown(f"- {esc(gap)}")
+        else:
+            st.success("Required evidence is available for the current assessment.")
 
-    factors = get_list(
-        risk,
-        "risk_factors",
-    )
+    st.caption("A missing document or incomplete evidence is not itself a confirmed coverage gap.")
 
+    risk = risk_assessment(case)
+    factors = get_list(risk, "risk_factors")
     if factors:
-
         st.divider()
+        st.markdown("#### Key Risk Factors")
+        risk_factors(factors)
 
-        st.markdown(
-            "#### Key Risk Factors"
-        )
-
-        risk_factors(
-            factors
-        )
-
-    evidence = case.get(
-        "evidence"
-    )
-
-    if isinstance(
-        evidence,
-        dict,
-    ) and evidence:
-
+    evidence = case.get("evidence")
+    if isinstance(evidence, dict) and evidence:
         st.divider()
+        st.markdown("#### Evidence Supporting Review")
+        evidence_availability(evidence)
 
-        st.markdown(
-            "#### Evidence Supporting Review"
-        )
+    pricing = risk.get("pricing") if isinstance(risk.get("pricing"), dict) else {}
+    if pricing or risk.get("premium") is not None or risk.get("final_premium") is not None:
+        st.divider()
+        st.markdown("#### Demonstration Pricing")
+        st.caption("Pricing shown here is a deterministic demonstration model for this project, not real actuarial pricing.")
+        base = pricing.get("base_premium", risk.get("base_premium"))
+        final = pricing.get("final_premium", risk.get("final_premium", risk.get("premium")))
+        loading = pricing.get("loading_percent", risk.get("loading_percent"))
+        cols = st.columns(3)
+        for col, label, value in zip(cols, ("Base Premium", "Loading", "Final Premium"), (base, loading, final)):
+            with col:
+                st.caption(label.upper())
+                st.markdown(f"**{format_currency(value) if label != 'Loading' else text(value) + '%'}**")
 
-        evidence_availability(
-            evidence
-        )
-
-    reviews = load_reviews(
-        str(
-            case.get(
-                "case_id",
-                "",
-            )
-        )
-    )
-
+    reviews = load_reviews(str(case.get("case_id", "")))
     if reviews:
-
         st.divider()
+        st.markdown("#### Review History")
+        review_summary(reviews)
 
-        st.markdown(
-            "#### Review History"
-        )
-
-        review_summary(
-            reviews
-        )
-
-    if status not in {
-        "human-review",
-        "review",
-        "awaiting-human-review",
-        "escalated",
-    }:
+    if status not in review_statuses:
         return
 
     st.divider()
-
-    st.markdown(
-        "#### Reviewer Decision"
-    )
-
+    st.markdown("#### Reviewer Decision")
+    case_id = str(case.get("case_id") or "")
     action = review_actions(case_id)
-
     if not action:
         return
 
-    reviewer = action.get(
-        "reviewer",
-        "Underwriter",
-    )
-
-    comments = action.get(
-        "comments",
-        "",
-    )
-
-    case_id = str(
-        case.get(
-            "case_id"
-        )
-        or ""
-    )
-
+    reviewer = action.get("reviewer", "Underwriter")
+    comments = action.get("comments", "")
     try:
-
         if action["action"] == "approve":
-
-            api.approve(
-                case_id,
-                reviewer=reviewer,
-                comments=comments,
-            )
-
+            api.approve(case_id, reviewer=reviewer, comments=comments)
         elif action["action"] == "override":
-
-            api.override(
-                case_id,
-                reviewer=reviewer,
-                decision=action.get(
-                    "decision",
-                    "",
-                ),
-                comments=comments,
-            )
-
+            api.override(case_id, reviewer=reviewer, decision=action.get("decision", ""), comments=comments)
         elif action["action"] == "sendback":
-
-            api.sendback(
-                case_id,
-                reviewer=reviewer,
-                comments=comments,
-            )
-
+            api.sendback(case_id, reviewer=reviewer, comments=comments)
         elif action["action"] == "escalate":
+            api.escalate(case_id, reviewer=reviewer, comments=comments)
 
-            api.escalate(
-                case_id,
-                reviewer=reviewer,
-                comments=comments,
-            )
-
-        st.session_state.case_cache.pop(
-            case_id,
-            None,
-        )
-
-        st.success(
-            "Human review action recorded."
-        )
-
-        time.sleep(
-            0.4
-        )
-
-        st.session_state.workspace_section = (
-            "Overview"
-        )
-
+        st.session_state.case_cache.pop(case_id, None)
+        st.success("Human review action recorded. The case state will be reloaded from the backend.")
+        time.sleep(0.4)
+        st.session_state.workspace_section = "Overview"
         st.rerun()
-
     except APIError as exc:
-        st.error(
-            f"Unable to record review decision: {exc}"
-        )
+        st.error(f"Unable to record review decision: {exc}")
 
 
 # ============================================================

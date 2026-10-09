@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,47 @@ class DocumentLoader:
 
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+
+    def load_full_text(
+        self,
+        file_path: str | Path,
+    ) -> str:
+        """Return the complete source text for reviewer-facing evidence."""
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Document not found: {path}"
+            )
+
+        extension = path.suffix.lower()
+
+        if extension not in SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file type: {extension}"
+            )
+
+        if extension == ".pdf":
+            text = self._load_pdf(path)
+        elif extension == ".txt":
+            text = self._load_text(path)
+        elif extension == ".json":
+            text = self._load_json(path)
+        elif extension == ".csv":
+            text = self._load_csv(path)
+        else:
+            text = ""
+
+        return self._clean_source_text(text)
+
+    @staticmethod
+    def _clean_source_text(text: str) -> str:
+        """Normalize extracted source text without changing its meaning."""
+        text = str(text or "")
+        text = text.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+        text = re.sub(r"[ \\t]+", " ", text)
+        text = re.sub(r"\\n{3,}", "\\n\\n", text)
+        return text.strip()
 
     def load_file(
         self,
@@ -83,6 +125,57 @@ class DocumentLoader:
             }
             for index, chunk in enumerate(chunks)
         ]
+
+    def load_full_text(self, file_path: str | Path) -> str:
+        """
+        Load the complete source document without chunking.
+        Used when displaying human-readable evidence.
+        """
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+
+        extension = path.suffix.lower()
+
+        if extension == ".pdf":
+            text = self._load_pdf(path)
+        elif extension == ".txt":
+            text = self._load_text(path)
+        elif extension == ".json":
+            text = self._load_json(path)
+        elif extension == ".csv":
+            text = self._load_csv(path)
+        else:
+            raise ValueError(f"Unsupported file type: {extension}")
+
+        return self._clean_source_text(text)
+
+    @staticmethod
+    def _clean_source_text(text: str) -> str:
+        """Normalize extracted source text while preserving document structure."""
+        text = text or ""
+
+        text = text.replace("\r\n", "\n")
+        text = text.replace("\r", "\n")
+        text = text.replace("\x0c", "\n")
+
+        cleaned_lines = []
+        previous_blank = False
+
+        for raw_line in text.split("\n"):
+            line = " ".join(raw_line.split())
+
+            if not line:
+                if not previous_blank:
+                    cleaned_lines.append("")
+                previous_blank = True
+                continue
+
+            cleaned_lines.append(line)
+            previous_blank = False
+
+        return "\n".join(cleaned_lines).strip()
 
     def load_directory(
         self,
