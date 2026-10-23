@@ -5,7 +5,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from app.cache.pattern_cache import pattern_cache
+from app.config import settings
 from app.rag.agentic_rag import agentic_rag
+from app.rag.budget import retrieval_budget
 from app.rag.hybrid_rag import hybrid_rag
 from app.rag.medgraph_rag import medgraph_rag
 from app.rag.retriever import retriever
@@ -13,6 +16,36 @@ from app.rag.retriever import retriever
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_KNOWLEDGE_CACHE: dict[tuple, tuple[float, list[dict[str, Any]]]] = {}
+_KNOWLEDGE_TTL_SEC = 3600.0
+
+
+def _knowledge_cache(key: tuple, fetch) -> list[dict[str, Any]]:
+    """Cache non-applicant knowledge lookups; failures return [] uncached."""
+    now = time.monotonic()
+    hit = _KNOWLEDGE_CACHE.get(key)
+    pattern_key = "|".join(str(part) for part in key)
+    if hit and now - hit[0] < _KNOWLEDGE_TTL_SEC:
+        pattern_cache.record_hit("knowledge", pattern_key)
+        return hit[1]
+
+    stored = pattern_cache.get("knowledge", pattern_key)
+    if isinstance(stored, list) and stored:
+        _KNOWLEDGE_CACHE[key] = (now, stored)
+        return stored
+
+    try:
+        results = fetch()
+    except Exception:
+        return []
+    if isinstance(results, list) and results:
+        if len(_KNOWLEDGE_CACHE) > 128:
+            _KNOWLEDGE_CACHE.clear()
+        _KNOWLEDGE_CACHE[key] = (now, results)
+        pattern_cache.put("knowledge", pattern_key, results)
+    return results if isinstance(results, list) else []
 
 
 class SubmissionIntelligenceAgent:
@@ -42,52 +75,68 @@ class SubmissionIntelligenceAgent:
             or ""
         )
 
+    @staticmethod
+    def _join(values: Any, limit: int = 6) -> str:
+        """Readable 'a, b, c' text instead of a raw Python list repr."""
+        if not isinstance(values, (list, tuple)):
+            values = [values] if values else []
+        parts = []
+        for v in values[:limit]:
+            if isinstance(v, dict):
+                v = v.get("name") or v.get("condition") or v.get("title") or ""
+            v = str(v).strip()
+            if v:
+                parts.append(v)
+        return ", ".join(parts)
+
     def _build_queries(
         self,
         applicant_profile: dict[str, Any],
         submission: dict[str, Any],
     ) -> dict[str, str]:
-        conditions = applicant_profile.get(
-            "medical_conditions",
-            [],
+        conditions = self._join(
+            applicant_profile.get("medical_conditions", [])
         )
-
-        medications = applicant_profile.get(
-            "medications",
-            [],
+        medications = self._join(
+            applicant_profile.get("medications", [])
         )
+        product = str(submission.get("product", "") or "")
 
-        product = submission.get(
-            "product",
-            "",
+        medical = " ".join(
+            part
+            for part in (
+                f"diagnosis and treatment of {conditions}"
+                if conditions
+                else "medical history diagnosis treatment",
+                f"medications {medications}" if medications else "",
+            )
+            if part
         )
 
         return {
-            "medical": (
-                "medical conditions diagnosis treatment "
-                "medications examination history "
-                f"{conditions} {medications}"
-            ),
+            "medical": medical,
             "claims": (
-                "insurance claims hospitalization "
-                "admission treatment utilization "
-                "claim history"
+                f"claims hospitalization {conditions}"
+                if conditions
+                else "claims hospitalization admission history"
             ),
+            "policy": (
+                f"existing {product} policy coverage sum insured "
+                "exclusions status"
+            ).replace("  ", " "),
+            "underwriting": (
+                f"{product} underwriting submission sum insured "
+                "medical declarations"
+            ).strip(),
             "regulatory": (
-                "health insurance underwriting requirements "
-                "applicant assessment disclosure requirements "
-                "India IRDAI"
+                "IRDAI health insurance underwriting disclosure "
+                "requirements"
+                + (f" for {conditions}" if conditions else "")
             ),
             "actuarial": (
-                "health insurance underwriting risk classification "
-                "risk loading pricing premium actuarial "
-                f"guidance for {product}"
-            ),
-            "coverage": (
-                "coverage gaps missing evidence policy "
-                "limitations exclusions underwriting "
-                "information gaps"
-            ),
+                f"{product} risk loading premium guidance"
+                + (f" for {conditions}" if conditions else "")
+            ).strip(),
         }
 
     def _retrieve_medical_evidence(
@@ -189,22 +238,16 @@ class SubmissionIntelligenceAgent:
         self,
         query: str,
     ) -> list[dict[str, Any]]:
-        try:
-            return hybrid_rag.search_regulatory(
+        # Regulatory text is the same for every applicant asking the same
+        # thing, so serve it from a short-lived cache.
+        return _knowledge_cache(
+            ("regulatory", query),
+            lambda: hybrid_rag.search_regulatory(
                 query=query,
                 jurisdiction="India",
-                top_k=5,
-            )
-        except TypeError:
-            try:
-                return hybrid_rag.search_regulatory(
-                    query=query,
-                    jurisdiction="India",
-                )
-            except Exception:
-                return []
-        except Exception:
-            return []
+                top_k=settings.retrieval_per_source_k,
+            ),
+        )
 
     def _retrieve_actuarial_guidance(
         self,
@@ -218,28 +261,21 @@ class SubmissionIntelligenceAgent:
         knowledge collection, so no separate actuarial collection
         is required.
         """
-        try:
-            return hybrid_rag.search_underwriting(
+        return _knowledge_cache(
+            ("actuarial", query, product),
+            lambda: hybrid_rag.search_underwriting(
                 query=query,
                 product=product,
-                top_k=5,
-            )
-        except TypeError:
-            try:
-                return hybrid_rag.search_underwriting(
-                    query=query,
-                    product=product,
-                )
-            except Exception:
-                return []
-        except Exception:
-            return []
+                top_k=settings.retrieval_per_source_k,
+            ),
+        )
 
     async def _retrieve_coverage_gaps(
         self,
         applicant_id: str,
         applicant_profile: dict[str, Any],
         submission: dict[str, Any],
+        prefetched: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         if not applicant_id:
             return {
@@ -258,6 +294,7 @@ class SubmissionIntelligenceAgent:
                     "applicant_id": applicant_id,
                     "applicant_profile": applicant_profile,
                     "submission": submission,
+                    "prefetched_evidence": prefetched,
                 },
             )
         except Exception:
@@ -581,28 +618,28 @@ class SubmissionIntelligenceAgent:
             submission.get("product"),
         )
 
-        coverage_task = self._retrieve_coverage_gaps(
-            applicant_id=applicant_id,
-            applicant_profile=applicant_profile,
-            submission=submission,
-        )
+        # Nothing to look up in the medical knowledge graph when the
+        # applicant declares no conditions.
+        if applicant_profile.get("medical_conditions"):
+            medical_knowledge_task = self._retrieve_medical_knowledge(
+                queries["medical"]
+            )
+        else:
+            async def _no_knowledge() -> list[dict[str, Any]]:
+                return []
 
-        medical_knowledge_task = self._retrieve_medical_knowledge(
-            queries["medical"]
-        )
+            medical_knowledge_task = _no_knowledge()
 
         policy_task = asyncio.to_thread(
             self._retrieve_policy_evidence,
             applicant_id,
-            "existing insurance policy coverage "
-            "sum insured deductible exclusions status",
+            queries["policy"],
         )
 
         underwriting_task = asyncio.to_thread(
             self._retrieve_underwriting_submission,
             applicant_id,
-            "underwriting submission requested product "
-            "sum insured declarations medical disclosures",
+            queries["underwriting"],
         )
 
         (
@@ -610,7 +647,6 @@ class SubmissionIntelligenceAgent:
             claims_evidence,
             regulatory_evidence,
             actuarial_guidance,
-            coverage_gaps,
             medical_knowledge,
             policy_evidence,
             underwriting_submission,
@@ -619,10 +655,23 @@ class SubmissionIntelligenceAgent:
             claims_task,
             regulatory_task,
             actuarial_task,
-            coverage_task,
             medical_knowledge_task,
             policy_task,
             underwriting_task,
+        )
+
+        # Coverage analysis reuses the applicant evidence fetched above
+        # (it used to re-run those four queries).
+        coverage_gaps = await self._retrieve_coverage_gaps(
+            applicant_id=applicant_id,
+            applicant_profile=applicant_profile,
+            submission=submission,
+            prefetched={
+                "medical": medical_evidence,
+                "claims": claims_evidence,
+                "policy": policy_evidence,
+                "underwriting": underwriting_submission,
+            },
         )
 
         return {
@@ -663,12 +712,16 @@ class SubmissionIntelligenceAgent:
             }
         ]
 
-        enrichment = await self._execute_delegations(
-            applicant_id=applicant_id,
-            applicant_profile=applicant_profile,
-            submission=submission,
-            queries=queries,
-        )
+        # One shared budget bounds every vector query this case makes,
+        # including CRAG / agentic sub-searches.
+        with retrieval_budget() as budget:
+            enrichment = await self._execute_delegations(
+                applicant_id=applicant_id,
+                applicant_profile=applicant_profile,
+                submission=submission,
+                queries=queries,
+            )
+        retrieval_stats = budget.summary()
 
         workflow_trace.append(
             {
@@ -805,11 +858,12 @@ class SubmissionIntelligenceAgent:
         metrics = {
             "latency_sec": round(time.perf_counter() - started, 4),
             "llm_latency_sec": 0.0,
-            "input_tokens": max(1, len(str({"applicant_profile": applicant_profile, "submission": submission})) // 4),
-            "output_tokens": max(1, len(str(enrichment)) // 4),
-            "total_tokens": max(1, len(str({"applicant_profile": applicant_profile, "submission": submission})) // 4)
-            + max(1, len(str(enrichment)) // 4),
-            "token_source": "estimated",
+            # Agent 1 makes no LLM call: retrieval is not token usage.
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "token_source": "none",
+            "retrieval": retrieval_stats,
             "llm_used": False,
         }
 

@@ -6,6 +6,8 @@ from typing import Any
 from app.agents.reflection.constitutional import (
     constitutional_checker,
 )
+from app.agents.reflection.llm_critic import llm_critic
+from app.config import settings
 from app.agents.reflection.mar_personas import (
     mar_personas,
 )
@@ -21,6 +23,7 @@ class ReflectionAgent:
         enrichment_results: dict[str, Any],
         risk_result: dict[str, Any],
         previous_findings: list[dict[str, Any]] | None = None,
+        complexity_level: str = "",
     ) -> dict[str, Any]:
         started = time.perf_counter()
         confidence = float(
@@ -115,11 +118,51 @@ class ReflectionAgent:
         if reflection_round > max_rounds:
             reflection_round = max_rounds
 
+        # LLM critique: only where it earns its cost (complex or high-risk).
+        critique: dict[str, Any] | None = None
+        if settings.reflection_llm_enabled and (
+            reflection_type == "full_mar" or complexity_level == "complex"
+        ):
+            critique = llm_critic.critique(
+                applicant_profile=applicant_profile,
+                risk_assessment=risk_assessment,
+                pricing_result=pricing_result,
+                recommendation=recommendation,
+                reasoning=str(risk_result.get("agent2_reasoning", "")),
+                rule_concerns=[
+                    str(f.get("finding", ""))
+                    for f in findings
+                    if f.get("verdict") != "pass"
+                ],
+            )
+            if critique.get("ok"):
+                for concern in critique["concerns"]:
+                    findings.append(
+                        {
+                            "round": reflection_round,
+                            "persona": concern["persona"],
+                            "verdict": "concern",
+                            "finding": concern["issue"],
+                            "evidence": [
+                                "LLM critique of the decision and rationale"
+                            ],
+                            "action": concern["action"],
+                            "source": "llm",
+                        }
+                    )
+        llm_disagrees = bool(
+            critique
+            and critique.get("ok")
+            and critique["verdict"] == "disagree"
+        )
+
         verdict = self._determine_verdict(
             mar_result=final_mar,
             constitutional=constitutional,
             flag_count=flag_count,
         )
+        if llm_disagrees and verdict == "pass":
+            verdict = "review"
 
         constitutional_flag = flag_count > 0
         mar_failed = str(
@@ -128,6 +171,7 @@ class ReflectionAgent:
 
         require_human_review = (
             constitutional_flag
+            or llm_disagrees
             or mar_failed
             or (
                 reflection_round >= self.MAX_REFLECTION_ROUNDS
@@ -146,34 +190,33 @@ class ReflectionAgent:
             findings=findings,
             consensus=final_mar.get("consensus", False),
         )
+        if llm_disagrees:
+            human_reason = (
+                "LLM critique disagrees with the recommendation: "
+                + "; ".join(c["issue"] for c in critique["concerns"][:2])
+                if critique["concerns"]
+                else "LLM critique disagrees with the recommendation."
+            )
 
         checks = self._build_checks(
             constitutional=constitutional,
             findings=findings,
         )
 
-        input_payload = {
-            "applicant_profile": applicant_profile,
-            "submission": submission,
-            "risk_result": risk_result,
-            "previous_findings": previous_findings,
-        }
-        output_payload = {
-            "verdict": verdict,
-            "findings": findings,
-            "constitutional": constitutional,
-        }
-        input_tokens = max(1, len(str(input_payload)) // 4)
-        output_tokens = max(1, len(str(output_payload)) // 4)
+        # Rules/personas use no tokens; the LLM critique (complex or
+        # high-risk cases only) reports its own usage.
+        critique_metrics = critique["metrics"] if critique else {}
         metrics = {
             "latency_sec": round(time.perf_counter() - started, 4),
-            "llm_latency_sec": 0.0,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "token_source": "estimated",
-            "llm_used": False,
+            "llm_latency_sec": critique_metrics.get("llm_latency_sec", 0.0),
+            "input_tokens": critique_metrics.get("input_tokens", 0),
+            "output_tokens": critique_metrics.get("output_tokens", 0),
+            "total_tokens": critique_metrics.get("total_tokens", 0),
+            "token_source": critique_metrics.get("token_source", "none"),
+            "llm_used": bool(critique_metrics.get("llm_used", False)),
         }
+        if critique and not critique.get("ok"):
+            metrics["error"] = critique.get("error", "critique_failed")
 
         return {
             "reflection_required": True,

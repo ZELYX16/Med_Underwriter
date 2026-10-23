@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.config import settings
+from app.rag.budget import current_budget
 from app.rag.hybrid_rag import hybrid_rag
 from app.rag.medgraph_rag import medgraph_rag
 
@@ -60,7 +62,18 @@ class CRAG:
         corrective_results: list[dict[str, Any]] = []
         retrieval_mode = "initial"
 
-        if initial_quality["score"] < 0.3:
+        # Correction is optional: only when it is enabled and the case's
+        # retrieval budget still has room.
+        budget = current_budget()
+        may_correct = (
+            settings.crag_max_correction_rounds > 0
+            and (budget is None or not budget.exhausted())
+        )
+
+        if not may_correct:
+            pass
+
+        elif initial_quality["score"] < 0.3:
             corrective_results = self._corrective_retrieval(
                 query=query,
                 intent=intent,
@@ -85,6 +98,9 @@ class CRAG:
         )
 
         final_results = final_results[:limit]
+        corrective_results = [
+            r for r in corrective_results if r in final_results
+        ]
 
         final_quality = self._evaluate_quality(
             query=query,

@@ -38,12 +38,30 @@ class Settings(BaseSettings):
     max_tokens: int = 4096
     llm_timeout_sec: float = 90.0
     llm_max_retries: int = 1
+    ollama_keep_alive: str = "30m"
+
+    # Token / latency controls
+    reasoning_max_tokens: int = 500
+    reasoning_cache_size: int = 256
+    prompt_version: str = "v2"
+    batch_max_group_size: int = 8
+    batch_concurrency: int = 2  # parallel workflows; keep low for Ollama
+    pattern_cache_enabled: bool = True
+    pattern_cache_ttl_sec: float = 7 * 24 * 3600
+    pattern_cache_max_entries: int = 2000
+    skip_llm_for_simple_cases: bool = True
+    skip_llm_risk_ceiling: float = 40.0
+    reflection_llm_enabled: bool = True  # LLM critique for complex/high-risk cases
+    reflection_max_tokens: int = 400
+    warm_llm_on_startup: bool = True  # Ollama only: preload models
 
     # Underwriting safety / human-review gates
     medical_risk_human_review_threshold: float = 80.0
     overall_risk_human_review_threshold: float = 70.0
     confidence_human_review_threshold: float = 0.70
     max_reflection_rounds: int = 3
+    fraud_review_threshold: float = 60.0
+    fraud_high_sum_insured: float = 5_000_000.0
 
     # Storage
     sqlite_path: str = "data/medunderwrite.db"
@@ -57,6 +75,16 @@ class Settings(BaseSettings):
     # RAG
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     top_k_results: int = 5
+    # Relevance / budget limits (cosine distance: lower is closer)
+    retrieval_max_distance: float = 0.65
+    retrieval_relative_margin: float = 0.15  # keep hits within best+margin
+    retrieval_per_source_k: int = 3
+    retrieval_chunk_chars: int = 600
+    rag_max_calls_per_case: int = 12
+    rag_max_chunks_per_case: int = 25
+    rag_max_seconds_per_case: float = 20.0
+    crag_max_correction_rounds: int = 1
+    agentic_max_subsearches: int = 3
 
     # LangSmith
     langsmith_tracing: bool = False

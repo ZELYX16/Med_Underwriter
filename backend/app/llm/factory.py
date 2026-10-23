@@ -16,6 +16,7 @@ LLMRole = Literal[
 def get_llm(
     role: LLMRole = "reasoning",
     temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> Any:
     model = settings.get_model(role)
 
@@ -24,4 +25,5 @@ def get_llm(
     return provider.create(
         model=model,
         temperature=temperature,
+        max_tokens=max_tokens,
     )

@@ -100,6 +100,10 @@ class UnderwritingState(TypedDict, total=False):
     business_gate_reasons: list[str]
 
     human_review_reason: str
+    reasoning_cache_key: str | None
+    fraud_risk_score: float
+    fraud_risk_level: str
+    fraud_flags: list[dict[str, Any]]
     human_review_status: str
     human_reviewed_by: str
     human_review_comments: str

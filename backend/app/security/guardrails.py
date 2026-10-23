@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from pathlib import Path
 from typing import Any
 
 from app.config import settings
@@ -81,6 +83,25 @@ class Guardrails:
 
     def __init__(self) -> None:
         self.enabled = True
+        self.max_length = 30000
+        self._load_config()
+
+    def _load_config(self) -> None:
+        """Read `enabled` and `max_length` from config/guardrails.yml."""
+        path = Path(__file__).parent / "config" / "guardrails.yml"
+        try:
+            import yaml
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return  # keep the safe defaults
+
+        self.enabled = bool(config.get("enabled", True))
+        self.max_length = int(
+            (config.get("prompt_validation") or {}).get(
+                "max_length", self.max_length
+            )
+        )
 
     def validate_prompt(
         self,
@@ -171,11 +192,11 @@ class Guardrails:
                 "Potential personal identifiers detected and masked."
             )
 
-        if len(prompt) > 30000:
+        if len(prompt) > self.max_length:
             reasons.append("Prompt exceeds the maximum permitted length.")
 
         checks["length"] = {
-            "passed": len(prompt) <= 30000,
+            "passed": len(prompt) <= self.max_length,
             "characters": len(prompt),
         }
 
@@ -185,7 +206,7 @@ class Guardrails:
             injection_matches
             or secret_matches
             or medical_decision_matches
-            or len(prompt) > 30000
+            or len(prompt) > self.max_length
         )
 
         risk_level = self._risk_level(
@@ -307,6 +328,14 @@ class Guardrails:
 
     @staticmethod
     def _normalize(text: str) -> str:
+        # NFKC folds look-alike / full-width characters; zero-width and
+        # control characters are removed so they cannot split a keyword.
+        text = unicodedata.normalize("NFKC", text)
+        text = "".join(
+            ch for ch in text
+            if unicodedata.category(ch) not in {"Cf", "Cc"}
+            or ch in ("\n", "\t", " ")
+        )
         return re.sub(
             r"\s+",
             " ",

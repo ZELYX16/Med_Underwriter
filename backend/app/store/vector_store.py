@@ -1,3 +1,5 @@
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -6,6 +8,7 @@ from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 
 from app.config import settings
+from app.rag.budget import RetrievalBudget, current_budget
 
 
 class VectorStore:
@@ -31,6 +34,11 @@ class VectorStore:
                 anonymized_telemetry=False,
             ),
         )
+
+        # Repeated queries (same text across agents / rescore rounds)
+        # skip re-encoding.
+        self._query_embeddings: OrderedDict[str, list[float]] = OrderedDict()
+        self._embed_lock = threading.Lock()
 
     def get_collection(self, collection_name: str):
         return self.client.get_or_create_collection(
@@ -67,14 +75,50 @@ class VectorStore:
         self,
         query_text: str,
     ) -> list[float]:
+        key = query_text.strip()
+
+        with self._embed_lock:
+            cached = self._query_embeddings.get(key)
+            if cached is not None:
+                self._query_embeddings.move_to_end(key)
+                return cached
+
         embedding = self.embedding_model.encode(
             [query_text],
             normalize_embeddings=True,
             show_progress_bar=False,
             convert_to_numpy=True,
-        )
+        )[0].tolist()
 
-        return embedding[0].tolist()
+        with self._embed_lock:
+            self._query_embeddings[key] = embedding
+            while len(self._query_embeddings) > 512:
+                self._query_embeddings.popitem(last=False)
+
+        return embedding
+
+    def warm_query_embeddings(self, queries: list[str]) -> None:
+        """Encode several queries in one call and prime the query cache."""
+        with self._embed_lock:
+            pending = [
+                q.strip()
+                for q in dict.fromkeys(queries)
+                if q and q.strip() and q.strip() not in self._query_embeddings
+            ]
+        if not pending:
+            return
+
+        vectors = self.embedding_model.encode(
+            pending,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        with self._embed_lock:
+            for text, vector in zip(pending, vectors):
+                self._query_embeddings[text] = vector.tolist()
+            while len(self._query_embeddings) > 512:
+                self._query_embeddings.popitem(last=False)
 
     def add_documents(
         self,
@@ -125,14 +169,22 @@ class VectorStore:
         query_text: str,
         n_results: int = 5,
         where: dict[str, Any] | None = None,
+        filter_relevant: bool = True,
     ) -> dict[str, Any]:
+        empty = {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+
         if not query_text or not query_text.strip():
-            return {
-                "ids": [[]],
-                "documents": [[]],
-                "metadatas": [[]],
-                "distances": [[]],
-            }
+            return empty
+
+        # Case-level retrieval budget (see app/rag/budget.py)
+        budget = current_budget()
+        if budget is not None and not budget.try_acquire():
+            return empty
 
         collection = self.get_collection(
             collection_name
@@ -163,7 +215,61 @@ class VectorStore:
         if where:
             kwargs["where"] = where
 
-        return collection.query(**kwargs)
+        raw = collection.query(**kwargs)
+
+        if not filter_relevant:
+            return raw
+
+        return self._filter_relevant(raw, budget)
+
+    @staticmethod
+    def _filter_relevant(
+        raw: dict[str, Any],
+        budget: RetrievalBudget | None,
+    ) -> dict[str, Any]:
+        """
+        Drop weak matches: beyond the absolute distance ceiling, or far
+        behind the best hit. Trim chunk text and respect the case's
+        remaining chunk budget.
+        """
+        try:
+            distances = (raw.get("distances") or [[]])[0]
+            if not distances:
+                return raw
+
+            best = min(distances)
+            ceiling = min(
+                settings.retrieval_max_distance,
+                best + settings.retrieval_relative_margin,
+            )
+            keep = [
+                i for i, d in enumerate(distances) if d <= ceiling
+            ][: settings.retrieval_per_source_k]
+
+            if budget is not None:
+                keep = keep[: budget.remaining_chunks()]
+                budget.record_chunks(len(keep))
+
+            limit = settings.retrieval_chunk_chars
+            result: dict[str, Any] = {}
+            for key, value in raw.items():
+                if (
+                    isinstance(value, list)
+                    and value
+                    and isinstance(value[0], list)
+                ):
+                    rows = [value[0][i] for i in keep]
+                    if key == "documents":
+                        rows = [
+                            r[:limit] if isinstance(r, str) else r
+                            for r in rows
+                        ]
+                    result[key] = [rows]
+                else:
+                    result[key] = value
+            return result
+        except Exception:
+            return raw
 
     def get_documents(
         self,

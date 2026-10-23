@@ -29,10 +29,13 @@ from app.models.state import (
 
 from app.api.schemas import (
     ApplicantCreate,
+    BatchStartInput,
     CaseCreate,
     DocumentUploadResponse,
 )
+from app.cache.pattern_cache import pattern_cache
 from app.orchestrator.graph import run_workflow
+from app.services.batch import plan_groups, run_batch
 from app.services.document_service import document_service
 from app.store.state_store import state_store
 from app.security.guardrails import guardrails
@@ -224,6 +227,7 @@ def _save_state(
         case_id=case_id,
         state=dict(state),
         status=status,
+        return_case=False,
     )
 
 
@@ -254,24 +258,30 @@ async def _persist_workflow_update(
     )
     db_status = final_status.replace("_", "-")
 
-    state_store.save_case(
-        case_id=case_id,
-        state=current,
-        status=db_status,
-    )
+    # SQLite is synchronous: keep it off the event loop so status polling
+    # and /health stay responsive while a case runs.
+    def _write() -> None:
+        state_store.save_case(
+            case_id=case_id,
+            state=current,
+            status=db_status,
+            return_case=False,
+        )
 
-    state_store.add_workflow_event(
-        case_id=case_id,
-        event_type="workflow",
-        node=node,
-        status=node_status,
-        message=message or f"Workflow reached {node}.",
-        data={
-            "final_status": final_status,
-            "workflow_node": node,
-            "details": latest.get("details", {}),
-        },
-    )
+        state_store.add_workflow_event(
+            case_id=case_id,
+            event_type="workflow",
+            node=node,
+            status=node_status,
+            message=message or f"Workflow reached {node}.",
+            data={
+                "final_status": final_status,
+                "workflow_node": node,
+                "details": latest.get("details", {}),
+            },
+        )
+
+    await asyncio.to_thread(_write)
 
 
 async def _run_case(
@@ -310,8 +320,10 @@ async def _run_case(
             ),
         )
 
+        # Validate the decision and the generated narrative together.
         output_guardrail = guardrails.validate_output(
-            result.get("final_decision", result),
+            f"{result.get('final_decision', '')} "
+            f"{result.get('agent2_reasoning', '')}"
         )
         output_guardrail_data = output_guardrail.to_dict()
         result.setdefault("audit_trail", []).append({
@@ -352,6 +364,16 @@ async def _run_case(
 
         # Defensive HITL gate: never expose a completed/final decision when
         # the workflow has explicitly requested human review.
+        if final_status == "failed":
+            # A node failed internally: hand over to an underwriter with a
+            # plain-language reason instead of a dead-end failed state.
+            if not result.get("human_review_reason"):
+                result["human_review_reason"] = (
+                    "Automated processing could not be completed for "
+                    "this case. Manual underwriting review is required."
+                )
+            result["require_human_review"] = True
+
         human_review_required = bool(
             result.get("require_human_review")
             or result.get("require_human_escalation")
@@ -413,20 +435,32 @@ async def _run_case(
         )
 
         current["errors"] = errors
-        current["final_status"] = "failed"
+
+        # Never leave the user on a dead-end "failed" page: hand the case
+        # to an underwriter with a plain-language reason. The technical
+        # error stays in `errors` / the event log for support.
+        current["final_status"] = "awaiting_human_review"
+        current["human_review_status"] = "awaiting_review"
+        current["require_human_review"] = True
+        current["require_human_escalation"] = True
+        current["human_review_reason"] = (
+            "Automated processing could not be completed for this case. "
+            "Manual underwriting review is required."
+        )
+        current["final_decision"] = "pending_human_review"
         current["updated_at"] = _now()
 
         _save_state(
             case_id,
             current,
-            status="failed",
+            status="awaiting-human-review",
         )
 
         state_store.add_workflow_event(
             case_id=case_id,
             event_type="workflow",
             node="workflow",
-            status="failed",
+            status="routed_to_human_review",
             data={
                 "error": str(exc),
             },
@@ -588,14 +622,8 @@ async def create_case(
         "error": None,
     }
 
-@router.post(
-    "/case/{case_id}/start",
-    status_code=202,
-)
-async def start_existing_case(
-    case_id: str,
-    background_tasks: BackgroundTasks,
-):
+def _prepare_case_for_run(case_id: str) -> dict[str, Any]:
+    """Validate a case and mark it processing; shared by start and batch."""
     state = state_store.get_case(case_id)
 
     if state is None:
@@ -663,6 +691,19 @@ async def start_existing_case(
         status="processing",
     )
 
+    return state
+
+
+@router.post(
+    "/case/{case_id}/start",
+    status_code=202,
+)
+async def start_existing_case(
+    case_id: str,
+    background_tasks: BackgroundTasks,
+):
+    state = _prepare_case_for_run(case_id)
+
     background_tasks.add_task(
         _run_case,
         case_id,
@@ -684,6 +725,40 @@ async def start_existing_case(
         },
         "error": None,
     }
+
+@router.post(
+    "/cases/batch",
+    status_code=202,
+)
+async def start_batch(
+    body: BatchStartInput,
+    background_tasks: BackgroundTasks,
+):
+    """Start several drafted cases; similar ones share retrieval work."""
+    prepared: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+
+    for case_id in dict.fromkeys(body.case_ids):
+        try:
+            prepared[case_id] = _prepare_case_for_run(case_id)
+        except HTTPException as exc:
+            skipped[case_id] = (
+                exc.detail if isinstance(exc.detail, str) else "Not eligible."
+            )
+
+    if prepared:
+        background_tasks.add_task(run_batch, prepared, _run_case)
+
+    return {
+        "success": True,
+        "data": {
+            "accepted": list(prepared),
+            "skipped": skipped,
+            "groups": [len(g) for g in plan_groups(prepared)],
+        },
+        "error": None,
+    }
+
 
 @router.get(
     "/case/{case_id}/documents",
@@ -983,6 +1058,92 @@ async def get_case_reviews(
     }
 
 
+@router.get(
+    "/case/{case_id}/status",
+)
+async def get_case_status(
+    case_id: str,
+):
+    """Lightweight status for polling; avoids loading the full case."""
+    data = await asyncio.to_thread(
+        state_store.get_case_status,
+        case_id,
+    )
+
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Case not found.",
+        )
+
+    return {
+        "success": True,
+        "data": data,
+        "error": None,
+    }
+
+
+def _case_label(case_id: str) -> dict[str, Any]:
+    """Short description of a cache source case for the UI."""
+    case = state_store.get_case(case_id)
+    if not case:
+        return {"case_id": case_id, "exists": False}
+    profile = case.get("applicant_profile") or {}
+    submission = case.get("submission") or {}
+    return {
+        "case_id": case_id,
+        "exists": True,
+        "applicant": profile.get("name") or profile.get("applicant_id"),
+        "product": submission.get("product"),
+        "status": case.get("status") or case.get("final_status"),
+    }
+
+
+@router.get(
+    "/case/{case_id}/cache",
+)
+async def get_case_cache(
+    case_id: str,
+):
+    """Which cached patterns this case reused, and which case stored them."""
+    case = await asyncio.to_thread(state_store.get_case, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+
+    agent_metrics = case.get("agent_metrics") or {}
+    entries: list[dict[str, Any]] = []
+    sources: dict[str, dict[str, Any]] = {}
+    for agent in ("agent1", "agent2"):
+        metrics = agent_metrics.get(agent) or {}
+        for event in metrics.get("cache_events") or []:
+            entry = {**event, "agent": agent}
+            source = event.get("source_case_id")
+            if source and source != case_id:
+                if source not in sources:
+                    sources[source] = await asyncio.to_thread(
+                        _case_label, source
+                    )
+                entry["source"] = sources[source]
+            entries.append(entry)
+
+    hits = sum(1 for e in entries if e.get("outcome") == "hit")
+    return {
+        "success": True,
+        "data": {
+            "case_id": case_id,
+            "entries": entries,
+            "summary": {
+                "hits": hits,
+                "misses": sum(1 for e in entries if e.get("outcome") == "miss"),
+                "stored": sum(1 for e in entries if e.get("outcome") == "stored"),
+                "skipped": sum(1 for e in entries if e.get("outcome") == "skipped"),
+            },
+            "cache_totals": pattern_cache.stats(),
+        },
+        "error": None,
+    }
+
+
 @router.post(
     "/case/{case_id}/approve",
 )
@@ -1125,6 +1286,10 @@ async def override_case(
     state["require_human_escalation"] = False
     state["require_human_review"] = False
 
+    # A human disagreed with the automated outcome: don't reuse its
+    # narrative for future similar cases.
+    pattern_cache.invalidate("rationale", state.get("reasoning_cache_key"))
+
     state["human_review_status"] = (
         "overridden"
     )
@@ -1228,6 +1393,8 @@ async def sendback_case(
                 "for human review."
             ),
         )
+
+    pattern_cache.invalidate("rationale", state.get("reasoning_cache_key"))
 
     state["human_review_status"] = (
         "sent_back"

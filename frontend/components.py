@@ -1563,20 +1563,20 @@ def _render_document_reader(
         st.markdown(
             "**Relevant evidence**"
         )
-        preview = full_text[:1800].strip()
-        if len(full_text) > 1800:
-            preview += "…"
-        st.write(preview)
-
-        with st.expander(
-            "View full source text",
-            expanded=False,
-        ):
-            st.text(full_text)
-            st.caption(
-                "Readable source-document text is shown here for reviewer verification. "
-                "Retrieval chunks remain an AI representation; they are not presented as the original PDF."
-            )
+        if len(full_text) <= 1800:
+            # Short enough to show whole; a second "full text" copy is noise.
+            st.write(full_text)
+        else:
+            st.write(full_text[:1800].strip() + "…")
+            with st.expander(
+                "View full source text",
+                expanded=False,
+            ):
+                st.text(full_text)
+                st.caption(
+                    "Readable source-document text is shown here for reviewer verification. "
+                    "Retrieval chunks remain an AI representation; they are not presented as the original PDF."
+                )
     else:
         st.caption(
             "The source was retrieved, but readable text is not available."
@@ -1846,8 +1846,8 @@ def agent_metrics(
 
     columns = st.columns(5)
     values = [
-        ("Latency", f"{latency:.2f}s"),
-        ("LLM Latency", f"{llm_latency:.2f}s"),
+        ("Latency", f"{latency:.4f}s"),
+        ("LLM Latency", f"{llm_latency:.4f}s"),
         ("Input Tokens", f"{input_tokens:,}"),
         ("Output Tokens", f"{output_tokens:,}"),
         ("Total Tokens", f"{total_tokens:,}"),
@@ -1858,6 +1858,25 @@ def agent_metrics(
             metric_card(label, value)
 
 
+def _cache_label(values: dict[str, Any]) -> str:
+    events = values.get("cache_events")
+    if isinstance(events, list) and events:
+        hits = sum(1 for e in events if e.get("outcome") == "hit")
+        misses = sum(1 for e in events if e.get("outcome") == "miss")
+        skipped = sum(1 for e in events if e.get("outcome") == "skipped")
+        parts = []
+        if hits:
+            parts.append(f"{hits} hit")
+        if misses:
+            parts.append(f"{misses} miss")
+        if skipped:
+            parts.append("skipped")
+        return ", ".join(parts) or "-"
+    if values.get("cache_hit"):
+        return "1 hit"
+    return "-"
+
+
 def workflow_metrics(
     metrics: dict[str, Any] | None,
 ) -> None:
@@ -1866,63 +1885,89 @@ def workflow_metrics(
     if not isinstance(agents, dict):
         agents = {}
 
-    workflow_has_data = any((
-        _metric_number(data.get("workflow_latency_sec")),
-        _metric_int(data.get("input_tokens")),
-        _metric_int(data.get("output_tokens")),
-        _metric_int(data.get("total_tokens")),
-    ))
-    agent_has_data = any(
-        isinstance(values, dict) and any((
-            _metric_number(values.get("latency_sec")),
-            _metric_number(values.get("llm_latency_sec")),
-            _metric_int(values.get("input_tokens")),
-            _metric_int(values.get("output_tokens")),
-            _metric_int(values.get("total_tokens")),
-        ))
-        for values in agents.values()
-    )
+    def has_data(values: dict[str, Any]) -> bool:
+        return any(
+            _metric_number(values.get(k))
+            for k in (
+                "workflow_latency_sec",
+                "latency_sec",
+                "llm_latency_sec",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "data_input_tokens",
+                "data_output_tokens",
+                "data_total_tokens",
+            )
+        )
 
-    if not workflow_has_data and not agent_has_data:
+    agent_rows = {
+        name: values
+        for name, values in agents.items()
+        if isinstance(values, dict) and has_data(values)
+    }
+    if not has_data(data) and not agent_rows:
         return
 
-    if workflow_has_data:
+    # Older runs have no data_* fields; fall back to summing the agents.
+    def data_total(key: str) -> int:
+        value = _metric_int(data.get(key))
+        if value:
+            return value
+        return sum(_metric_int(v.get(key)) for v in agent_rows.values())
+
+    if has_data(data):
         st.markdown("#### Workflow Metrics")
-        columns = st.columns(4)
-        values = [
-            ("Workflow Latency", f"{_metric_number(data.get('workflow_latency_sec')):.2f}s"),
-            ("Input Tokens", f"{_metric_int(data.get('input_tokens')):,}"),
-            ("Output Tokens", f"{_metric_int(data.get('output_tokens')):,}"),
-            ("Total Tokens", f"{_metric_int(data.get('total_tokens')):,}"),
-        ]
-        for column, (label, value) in zip(columns, values):
+        st.caption(
+            "All = everything the agents read and produced (estimated, ~4 characters per token). "
+            "LLM = what the model actually used; 0 for steps that make no LLM call."
+        )
+        row1 = st.columns(4)
+        llm_latency = _metric_number(data.get("llm_latency_sec")) or sum(
+            _metric_number(v.get("llm_latency_sec")) for v in agent_rows.values()
+        )
+        for column, (label, value) in zip(
+            row1,
+            (
+                ("Total Latency", f"{_metric_number(data.get('workflow_latency_sec')):.4f}s"),
+                ("LLM Latency", f"{llm_latency:.4f}s"),
+                ("All Tokens (in / out)", f"{data_total('data_input_tokens'):,} / {data_total('data_output_tokens'):,}"),
+                ("All Tokens (total)", f"{data_total('data_total_tokens'):,}"),
+            ),
+        ):
             with column:
                 metric_card(label, value)
 
-    if agent_has_data:
+        row2 = st.columns(3)
+        for column, (label, value) in zip(
+            row2,
+            (
+                ("LLM Input Tokens", f"{_metric_int(data.get('input_tokens')):,}"),
+                ("LLM Output Tokens", f"{_metric_int(data.get('output_tokens')):,}"),
+                ("LLM Total Tokens", f"{_metric_int(data.get('total_tokens')):,}"),
+            ),
+        ):
+            with column:
+                metric_card(label, value)
+
+    if agent_rows:
         st.markdown("##### Agent Usage")
         rows = []
-        for name, values in agents.items():
-            if not isinstance(values, dict):
-                continue
-            if not any((
-                _metric_number(values.get("latency_sec")),
-                _metric_number(values.get("llm_latency_sec")),
-                _metric_int(values.get("input_tokens")),
-                _metric_int(values.get("output_tokens")),
-                _metric_int(values.get("total_tokens")),
-            )):
-                continue
+        for name, values in agent_rows.items():
             rows.append({
                 "Agent": humanize(name),
-                "Latency": f"{_metric_number(values.get('latency_sec')):.2f}s",
-                "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.2f}s",
-                "Input Tokens": _metric_int(values.get("input_tokens")),
-                "Output Tokens": _metric_int(values.get("output_tokens")),
-                "Total Tokens": _metric_int(values.get("total_tokens")),
+                "Latency": f"{_metric_number(values.get('latency_sec')):.4f}s",
+                "Data In": _metric_int(values.get("data_input_tokens")),
+                "Data Out": _metric_int(values.get("data_output_tokens")),
+                "Data Total": _metric_int(values.get("data_total_tokens")),
+                "LLM Used": "Yes" if values.get("llm_used") else "No",
+                "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.4f}s",
+                "LLM In": _metric_int(values.get("input_tokens")),
+                "LLM Out": _metric_int(values.get("output_tokens")),
+                "LLM Total": _metric_int(values.get("total_tokens")),
+                "Cache": _cache_label(values),
             })
-        if rows:
-            st.dataframe(rows, hide_index=True, use_container_width=True)
+        st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
 # ============================================================

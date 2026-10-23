@@ -561,3 +561,7 @@ class HealthResponse(BaseModel):
     environment: str
 
     chromadb: str
+
+
+class BatchStartInput(BaseModel):
+    case_ids: list[str] = Field(min_length=1, max_length=100)

@@ -78,6 +78,11 @@ class ComplexityRouter:
                 "additional analysis."
             )
 
+        # No conditions and no red flags / conflicts: nothing to reason
+        # about, so Agent 2 can use its deterministic rationale.
+        if condition_count == 0 and complexity_level == "standard":
+            complexity_level = "simple"
+
         return {
             "complexity_level": complexity_level,
             "complexity_reasons": reasons,

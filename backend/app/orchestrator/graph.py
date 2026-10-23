@@ -11,6 +11,8 @@ from app.agents.agent1_submission import submission_agent
 from app.agents.agent2_risk import risk_agent
 from app.agents.agent3_reflection import reflection_agent
 from app.agents.routing.complexity_router import complexity_router
+from app.cache.pattern_cache import cache_scope
+from app.config import settings
 from app.models.state import UnderwritingState
 
 
@@ -40,7 +42,17 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
         or input_tokens + output_tokens
     )
 
+    # Keep the agent's own honesty markers: without token_source,
+    # _ensure_metrics would "estimate" tokens from the whole output payload
+    # (tens of thousands for Agent 1, which makes no LLM call).
+    passthrough = {
+        key: metrics[key]
+        for key in ("token_source", "llm_used", "cache_hit", "retrieval", "error", "skipped_reason")
+        if key in metrics
+    }
+
     return {
+        **passthrough,
         "agent": agent,
         "latency_sec": round(
             float(metrics.get("latency_sec", metrics.get("duration_sec", 0.0)) or 0.0),
@@ -54,6 +66,41 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _merge_agent_metrics(
+    existing: dict[str, Any] | None,
+    new: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Accumulate an agent's metrics across reflection/rescore rounds instead
+    of letting the latest round overwrite earlier ones.
+    """
+    if not existing:
+        return {**new, "runs": 1}
+
+    merged = dict(new)
+    for key in (
+        "latency_sec",
+        "llm_latency_sec",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "data_input_tokens",
+        "data_output_tokens",
+        "data_total_tokens",
+    ):
+        merged[key] = round(
+            float(existing.get(key, 0) or 0) + float(new.get(key, 0) or 0),
+            4,
+        )
+        if key.endswith("tokens"):
+            merged[key] = int(merged[key])
+    merged["runs"] = int(existing.get("runs", 1) or 1) + 1
+    merged["llm_used"] = bool(
+        existing.get("llm_used") or new.get("llm_used")
+    )
+    return merged
 
 
 def _estimate_tokens(value: Any) -> int:
@@ -71,16 +118,32 @@ def _ensure_metrics(
     input_payload: Any,
     output_payload: Any,
 ) -> dict[str, Any]:
+    """
+    Fill in the per-agent numbers the UI shows.
+
+    Two separate families:
+      data_*  estimated size of what the agent read and produced (every
+              agent, LLM or not; ~4 chars/token), and
+      input_tokens / output_tokens / total_tokens / llm_latency_sec
+              what the model actually used (0 when no LLM call was made).
+    """
     normalized = dict(metrics or {})
+
+    data_in = _estimate_tokens(input_payload)
+    data_out = _estimate_tokens(output_payload)
+    normalized["data_input_tokens"] = data_in
+    normalized["data_output_tokens"] = data_out
+    normalized["data_total_tokens"] = data_in + data_out
+
     total = int(normalized.get("total_tokens", 0) or 0)
-    if total > 0:
+    # An agent that states its token_source (provider / cache / none) has
+    # already reported honestly; only estimate when it said nothing.
+    if total > 0 or normalized.get("token_source"):
         return normalized
 
-    input_tokens = _estimate_tokens(input_payload)
-    output_tokens = _estimate_tokens(output_payload)
-    normalized["input_tokens"] = input_tokens
-    normalized["output_tokens"] = output_tokens
-    normalized["total_tokens"] = input_tokens + output_tokens
+    normalized["input_tokens"] = data_in
+    normalized["output_tokens"] = data_out
+    normalized["total_tokens"] = data_in + data_out
     normalized["token_source"] = "estimated"
     return normalized
 
@@ -99,11 +162,30 @@ def _workflow_metrics(
         for item in normalized.values()
     )
 
+    def _sum(key: str) -> int:
+        return sum(
+            int(item.get(key, 0) or 0) for item in normalized.values()
+        )
+
+    llm_latency = round(
+        sum(
+            float(item.get("llm_latency_sec", 0) or 0)
+            for item in normalized.values()
+        ),
+        4,
+    )
+
     return {
         "workflow_latency_sec": round(time.perf_counter() - started, 4),
+        "llm_latency_sec": llm_latency,
+        # LLM-only (measured by the model/provider).
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
+        # Everything the agents read and produced (estimated).
+        "data_input_tokens": _sum("data_input_tokens"),
+        "data_output_tokens": _sum("data_output_tokens"),
+        "data_total_tokens": _sum("data_total_tokens"),
         "agents": normalized,
     }
 
@@ -215,16 +297,17 @@ async def agent1_node(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        result = await submission_agent.run(
-            applicant_profile=state.get(
-                "applicant_profile",
-                {},
-            ),
-            submission=state.get(
-                "submission",
-                {},
-            ),
-        )
+        with cache_scope(state.get("case_id")) as cache_trace:
+            result = await submission_agent.run(
+                applicant_profile=state.get(
+                    "applicant_profile",
+                    {},
+                ),
+                submission=state.get(
+                    "submission",
+                    {},
+                ),
+            )
 
         enrichment = result.get(
             "agent1_enrichment",
@@ -247,6 +330,7 @@ async def agent1_node(
             },
             result,
         )
+        agent1_metrics["cache_events"] = cache_trace.events
 
         underwriting_submission = result.get(
             "underwriting_submission",
@@ -488,21 +572,22 @@ def agent2_node(
             ),
         }
 
-        result = risk_agent.run(
-            applicant_profile=state.get(
-                "applicant_profile",
-                {},
-            ),
-            submission=state.get(
-                "submission",
-                {},
-            ),
-            enrichment_results=state.get(
-                "agent1_enrichment",
-                {},
-            ),
-            routing_result=routing_result,
-        )
+        with cache_scope(state.get("case_id")) as cache_trace:
+            result = risk_agent.run(
+                applicant_profile=state.get(
+                    "applicant_profile",
+                    {},
+                ),
+                submission=state.get(
+                    "submission",
+                    {},
+                ),
+                enrichment_results=state.get(
+                    "agent1_enrichment",
+                    {},
+                ),
+                routing_result=routing_result,
+            )
 
         risk_assessment = result.get(
             "risk_assessment",
@@ -521,6 +606,7 @@ def agent2_node(
             },
             result,
         )
+        agent2_metrics["cache_events"] = cache_trace.events
 
         pricing = result.get(
             "pricing_result",
@@ -573,6 +659,10 @@ def agent2_node(
                 "final_premium",
                 0.0,
             ),
+            "reasoning_cache_key": result.get("reasoning_cache_key"),
+            "fraud_risk_score": result.get("fraud_risk_score", 0.0),
+            "fraud_risk_level": result.get("fraud_risk_level", "low"),
+            "fraud_flags": result.get("fraud_flags", []),
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": result.get(
@@ -586,7 +676,10 @@ def agent2_node(
             "agent2_metrics": agent2_metrics,
             "agent_metrics": {
                 **state.get("agent_metrics", {}),
-                "agent2": agent2_metrics,
+                "agent2": _merge_agent_metrics(
+                    state.get("agent_metrics", {}).get("agent2"),
+                    agent2_metrics,
+                ),
             },
             "agent2_completed": True,
             "reflection_requires_rescore": False,
@@ -783,8 +876,13 @@ def reflection_node(
                     "agent2_confidence",
                     0.0,
                 ),
+                "agent2_reasoning": state.get(
+                    "agent2_reasoning",
+                    "",
+                ),
             },
             previous_findings=previous_findings,
+            complexity_level=str(state.get("complexity_level", "")),
         )
 
         agent3_metrics = _agent_metrics(
@@ -951,7 +1049,10 @@ def reflection_node(
             "agent3_metrics": agent3_metrics,
             "agent_metrics": {
                 **state.get("agent_metrics", {}),
-                "agent3": agent3_metrics,
+                "agent3": _merge_agent_metrics(
+                    state.get("agent_metrics", {}).get("agent3"),
+                    agent3_metrics,
+                ),
             },
             "agent3_completed": True,
 
@@ -1056,6 +1157,13 @@ def _business_review_reasons(
     if confidence < HUMAN_REVIEW_CONFIDENCE_THRESHOLD:
         reasons.append(
             f"Agent 2 confidence {confidence:.2f} is below {HUMAN_REVIEW_CONFIDENCE_THRESHOLD:.2f}."
+        )
+
+    fraud_score = float(state.get("fraud_risk_score", 0.0) or 0.0)
+    if fraud_score >= settings.fraud_review_threshold:
+        reasons.append(
+            f"Fraud indicators score {fraud_score:.0f} is at or above "
+            f"{settings.fraud_review_threshold:.0f}; verify the flagged items."
         )
 
     constitutional_flag = False
@@ -1436,4 +1544,3 @@ async def run_workflow(
     }
 
     return result
-

@@ -10,6 +10,7 @@ class LLMProvider:
         self,
         model: str,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -19,6 +20,7 @@ class OllamaProvider(LLMProvider):
         self,
         model: str,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
         from langchain_ollama import ChatOllama
 
@@ -30,7 +32,8 @@ class OllamaProvider(LLMProvider):
                 if temperature is None
                 else temperature
             ),
-            num_predict=settings.max_tokens,
+            num_predict=max_tokens or settings.max_tokens,
+            keep_alive=settings.ollama_keep_alive,
             timeout=settings.llm_timeout_sec,
             max_retries=settings.llm_max_retries,
         )
@@ -41,6 +44,7 @@ class GroqProvider(LLMProvider):
         self,
         model: str,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
         from langchain_groq import ChatGroq
 
@@ -58,7 +62,7 @@ class GroqProvider(LLMProvider):
                 if temperature is None
                 else temperature
             ),
-            max_tokens=settings.max_tokens,
+            max_tokens=max_tokens or settings.max_tokens,
             max_retries=settings.llm_max_retries,
         )
 
@@ -68,6 +72,7 @@ class GeminiProvider(LLMProvider):
         self,
         model: str,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
         from langchain_google_genai import (
             ChatGoogleGenerativeAI,
@@ -87,7 +92,7 @@ class GeminiProvider(LLMProvider):
                 if temperature is None
                 else temperature
             ),
-            max_output_tokens=settings.max_tokens,
+            max_output_tokens=max_tokens or settings.max_tokens,
             max_retries=settings.llm_max_retries,
         )
 
