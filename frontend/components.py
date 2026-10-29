@@ -313,16 +313,146 @@ def applicant_summary(
     )
 
 
+_NOT_MEDICATIONS = {
+    "gerd",
+    "hypertension",
+    "essential hypertension",
+    "hypothyroidism",
+    "dyslipidaemia",
+    "type 2 diabetes mellitus",
+    "intermittent",
+}
+
+_PERIOD = re.compile(
+    r"^(\d{2}-[A-Za-z]{3}-\d{4}"
+    r"(?:\s+to\s+\d{2}-[A-Za-z]{3}-\d{4})?"
+    r"(?:\s+\(day-care\))?)\s*(.*)$",
+    re.DOTALL,
+)
+
+
+def _clean_condition_name(name: Any) -> str:
+    # PDF table headers sometimes get merged into the first cell.
+    return (
+        safe_text(name)
+        .replace("Year diagnosed Status (as declared) ", "")
+        .replace("injections ", "", 1)
+        .strip()
+    )
+
+
+def _condition_rows(conditions: list[Any]) -> list[dict[str, Any]]:
+    rows = []
+    for condition in conditions:
+        if isinstance(condition, dict):
+            rows.append(
+                {
+                    "Condition": _clean_condition_name(
+                        get_value(condition, "condition", "name", default="Condition")
+                    ),
+                    "Since": safe_text(
+                        get_value(condition, "year_diagnosed", "year", default=""), ""
+                    ),
+                    "Status": safe_text(
+                        get_value(condition, "status", default=""), ""
+                    ),
+                }
+            )
+        else:
+            rows.append(
+                {"Condition": _clean_condition_name(condition), "Since": "", "Status": ""}
+            )
+    return rows
+
+
+def _medication_rows(medications: list[Any]) -> list[dict[str, Any]]:
+    rows = []
+    for medication in medications:
+        if not isinstance(medication, dict):
+            rows.append({"Medication": safe_text(medication), "Dose / frequency": ""})
+            continue
+        name = safe_text(
+            get_value(medication, "name", "medication", default=""), ""
+        ).strip()
+        normalized = re.sub(r"\s+", " ", name.lower()).strip()
+        if (
+            not name
+            or normalized in _NOT_MEDICATIONS
+            or normalized.startswith("since ")
+            or "year diagnosed" in normalized
+            or "status (as declared)" in normalized
+        ):
+            continue
+        rows.append(
+            {
+                "Medication": name,
+                "Dose / frequency": safe_text(
+                    get_value(medication, "details", "dose", default=""), ""
+                ),
+            }
+        )
+    return rows
+
+
+def _hospitalization_rows(items: list[Any]) -> list[dict[str, Any]]:
+    rows = []
+    for item in items:
+        details = safe_text(
+            get_value(item, "details", default="")
+            if isinstance(item, dict)
+            else item,
+            "",
+        ).strip()
+        match = _PERIOD.match(details)
+        rows.append(
+            {
+                "Period": match.group(1) if match else "",
+                "Details": (match.group(2) if match else details).strip(),
+            }
+        )
+    return rows
+
+
+def _table(rows: list[dict[str, Any]], empty: str) -> None:
+    if rows:
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    else:
+        st.caption(empty)
+
+
 def applicant_card(
     applicant: dict[str, Any],
 ) -> None:
-    profile = applicant_profile_from(
-        applicant
-    )
+    profile = applicant_profile_from(applicant)
 
-    applicant_summary(
-        applicant
-    )
+    applicant_summary(applicant)
+
+    # --------------------------------------------------------
+    # AT A GLANCE
+    # --------------------------------------------------------
+
+    smoker = profile.get("smoker")
+    glance = [
+        ("Age", safe_text(profile.get("age"), "-")),
+        ("Date of birth", safe_text(profile.get("date_of_birth"), "-")),
+        ("BMI", safe_text(profile.get("bmi"), "-")),
+        (
+            "Smoking",
+            "Smoker" if smoker is True else "Non-smoker" if smoker is False else "-",
+        ),
+    ]
+    for column, (label, value) in zip(st.columns(len(glance)), glance):
+        with column:
+            st.caption(label.upper())
+            st.markdown(f"**{value}**")
+
+    conditions = get_list(profile, "medical_conditions", "conditions")
+    medications = get_list(profile, "medications")
+    hospitalizations = get_list(profile, "hospitalizations")
+    claims = get_list(profile, "claims")
+
+    condition_rows = _condition_rows(conditions)
+    medication_rows = _medication_rows(medications)
 
     # --------------------------------------------------------
     # MEDICAL PROFILE
@@ -330,138 +460,17 @@ def applicant_card(
 
     section_title(
         "Medical Profile",
-        "Declared medical conditions and current medications.",
+        f"{len(condition_rows)} declared condition(s), "
+        f"{len(medication_rows)} current medication(s).",
     )
 
-    conditions = get_list(
-        profile,
-        "medical_conditions",
-        "conditions",
-    )
-
-    medications = get_list(
-        profile,
-        "medications",
-    )
-
-    left, right = st.columns(
-        [1.35, 1],
-        gap="large",
-    )
-
+    left, right = st.columns([1.35, 1], gap="large")
     with left:
-        st.markdown(
-            "**Medical Conditions**"
-        )
-
-        if conditions:
-            for condition in conditions:
-                render_condition(
-                    condition
-                )
-        else:
-            st.caption(
-                "No medical conditions declared."
-            )
-
+        st.markdown("**Medical conditions**")
+        _table(condition_rows, "No medical conditions declared.")
     with right:
-        st.markdown(
-            "**Current Medication**"
-        )
-
-        if medications:
-            medication_items = []
-
-            for medication in medications:
-                if not isinstance(
-                    medication,
-                    dict,
-                ):
-                    continue
-
-                name = get_value(
-                    medication,
-                    "name",
-                    "medication",
-                    default="",
-                )
-
-                details = get_value(
-                    medication,
-                    "details",
-                    "dose",
-                    default="",
-                )
-
-                if not name:
-                    continue
-
-                name = str(name).strip()
-
-                # Remove obvious PDF extraction artifacts
-                # that are actually medical conditions.
-                normalized_name = re.sub(r"\s+", " ", name.lower()).strip()
-
-                if (
-                    normalized_name in {
-                        "gerd",
-                        "hypertension",
-                        "essential hypertension",
-                        "hypothyroidism",
-                        "dyslipidaemia",
-                        "type 2 diabetes mellitus",
-                        "intermittent",
-                    }
-                    or normalized_name.startswith("since ")
-                    or "year diagnosed" in normalized_name
-                    or "status (as declared)" in normalized_name
-                ):
-                    continue
-
-                medication_items.append(
-                    (
-                        name,
-                        safe_text(
-                            details,
-                            "",
-                        ),
-                    )
-                )
-
-            if medication_items:
-                medication_columns = st.columns(
-                    3,
-                    gap="medium",
-                )
-
-                for index, (
-                    name,
-                    details,
-                ) in enumerate(
-                    medication_items
-                ):
-                    with medication_columns[
-                        index % 3
-                    ]:
-                        st.markdown(
-                            f"**{name}**"
-                        )
-
-                        if details:
-                            st.caption(
-                                details
-                            )
-
-                        st.write("")
-            else:
-                st.caption(
-                    "No current medications declared."
-                )
-
-        else:
-            st.caption(
-                "No current medications declared."
-            )
+        st.markdown("**Current medication**")
+        _table(medication_rows, "No current medications declared.")
 
     # --------------------------------------------------------
     # TREATMENT HISTORY
@@ -471,25 +480,10 @@ def applicant_card(
         "Treatment History",
         "Hospitalization and day-care treatment history.",
     )
-
-    hospitalizations = get_list(
-        profile,
-        "hospitalizations",
+    _table(
+        _hospitalization_rows(hospitalizations),
+        "No hospitalization history declared.",
     )
-
-    if hospitalizations:
-        for index, hospitalization in enumerate(
-            hospitalizations,
-            start=1,
-        ):
-            render_hospitalization(
-                hospitalization,
-                index,
-            )
-    else:
-        st.caption(
-            "No hospitalization history declared."
-        )
 
     # --------------------------------------------------------
     # CLAIMS
@@ -499,24 +493,29 @@ def applicant_card(
         "Claims History",
         "Historical insurance claims declared in the submission.",
     )
-
-    claims = get_list(
-        profile,
-        "claims",
-    )
-
-    if claims:
-        st.caption(
-            f"{len(claims)} historical claim(s) declared"
-        )
-
-        render_claims(
-            claims
-        )
-    else:
-        st.caption(
-            "No historical claims declared."
-        )
+    claim_rows = []
+    for claim in claims:
+        if isinstance(claim, dict):
+            claim_rows.append(
+                {
+                    "Claim": safe_text(get_value(claim, "claim_id", "id", default=""), ""),
+                    "Date": safe_text(get_value(claim, "date", "claim_date", default=""), ""),
+                    "Amount": safe_text(
+                        get_value(claim, "amount", "claim_amount", default=""), ""
+                    ),
+                    "Status": safe_text(get_value(claim, "status", default=""), ""),
+                }
+            )
+        else:
+            claim_rows.append(
+                {"Claim": safe_text(claim, ""), "Date": "", "Amount": "", "Status": ""}
+            )
+    # Hide columns that are empty for every claim.
+    claim_rows = [
+        {k: v for k, v in row.items() if any(r.get(k) for r in claim_rows)}
+        for row in claim_rows
+    ]
+    _table(claim_rows, "No historical claims declared.")
 
     # --------------------------------------------------------
     # EXISTING POLICY
@@ -526,21 +525,19 @@ def applicant_card(
         "Existing Policy",
         "Current insurance policy information.",
     )
-
-    policy = get_value(
-        profile,
-        "existing_policy",
-        default={},
-    )
-
-    if isinstance(policy, dict) and policy:
-        render_policy(
-            policy
+    policy = get_value(profile, "existing_policy", default={})
+    if isinstance(policy, dict) and any(policy.values()):
+        _table(
+            [
+                {
+                    "Policy": safe_text(policy.get("policy_id"), "-"),
+                    "Status": safe_text(policy.get("status"), "-").title(),
+                }
+            ],
+            "No existing policy declared.",
         )
     else:
-        st.caption(
-            "No existing policy declared."
-        )
+        st.caption("No existing policy declared.")
 
 
 def render_condition(
@@ -1858,6 +1855,22 @@ def agent_metrics(
             metric_card(label, value)
 
 
+def text_of_status(values: dict[str, Any]) -> str:
+    status = values.get("llm_status")
+    if status:
+        error = values.get("llm_error")
+        return f"{status}: {error}" if error else str(status)
+    return "Used" if values.get("llm_used") else "Not used"
+
+
+def _timing(values: dict[str, Any], key: str, suffix: str = "s") -> str:
+    timing = values.get("timing")
+    value = timing.get(key) if isinstance(timing, dict) else None
+    if value is None:
+        return "-"
+    return f"{value}{suffix}"
+
+
 def _cache_label(values: dict[str, Any]) -> str:
     events = values.get("cache_events")
     if isinstance(events, list) and events:
@@ -1920,7 +1933,8 @@ def workflow_metrics(
         st.markdown("#### Workflow Metrics")
         st.caption(
             "All = everything the agents read and produced (estimated, ~4 characters per token). "
-            "LLM = what the model actually used; 0 for steps that make no LLM call."
+            "LLM = what the model actually used; 0 for steps that make no LLM call. "
+            "Agents that re-ran after a reflection rescore show the sum of all runs (see Runs)."
         )
         row1 = st.columns(4)
         llm_latency = _metric_number(data.get("llm_latency_sec")) or sum(
@@ -1956,18 +1970,32 @@ def workflow_metrics(
         for name, values in agent_rows.items():
             rows.append({
                 "Agent": humanize(name),
+                "Runs": _metric_int(values.get("runs")) or 1,
                 "Latency": f"{_metric_number(values.get('latency_sec')):.4f}s",
                 "Data In": _metric_int(values.get("data_input_tokens")),
                 "Data Out": _metric_int(values.get("data_output_tokens")),
                 "Data Total": _metric_int(values.get("data_total_tokens")),
-                "LLM Used": "Yes" if values.get("llm_used") else "No",
+                "LLM Status": text_of_status(values),
                 "LLM Latency": f"{_metric_number(values.get('llm_latency_sec')):.4f}s",
+                "Model Load": _timing(values, "load_sec"),
+                "Generation": _timing(values, "generation_sec"),
+                "Tokens/sec": _timing(values, "tokens_per_sec", suffix=""),
                 "LLM In": _metric_int(values.get("input_tokens")),
                 "LLM Out": _metric_int(values.get("output_tokens")),
                 "LLM Total": _metric_int(values.get("total_tokens")),
                 "Cache": _cache_label(values),
             })
         st.dataframe(rows, hide_index=True, use_container_width=True)
+
+        stats = (agent_rows.get("agent1") or {}).get("evidence_stats")
+        if isinstance(stats, dict) and stats.get("unique_chunks") is not None:
+            st.caption(
+                f"Agent 1 retrieved {stats.get('unique_chunks')} unique evidence "
+                f"chunk(s) (~{_metric_int(stats.get('unique_chars')):,} characters). "
+                f"The saved result carries {stats.get('stored_copies')} copies "
+                f"({stats.get('duplicate_copies')} duplicate), which is a storage "
+                "layout for the UI, not extra retrieval."
+            )
 
 
 # ============================================================

@@ -39,6 +39,10 @@ _NEGATION = re.compile(
     re.IGNORECASE,
 )
 
+# Flags meaning the documents contradict what the applicant declared. These
+# force human review (material non-disclosure) regardless of the total score.
+MATERIAL_FLAG_CODES = {"undeclared_condition", "undeclared_smoker"}
+
 _WEIGHTS = {
     "undeclared_condition": 20,  # per condition, capped below
     "undeclared_smoker": 25,
@@ -65,6 +69,31 @@ def _mentions(text: str, term: str) -> bool:
     return False
 
 
+_CLAIM_LINE = re.compile(
+    r"(CLM-\d{5})[^\n]*?(\d{4}-\d{2}-\d{2})[^\n]*?(?:INR|Rs\.?)\s*([\d,]+)",
+    re.IGNORECASE,
+)
+
+
+def _claims_from_text(text: str) -> list[dict[str, Any]]:
+    """Claim id / date / amount lines found in retrieved claims evidence."""
+    seen: set[str] = set()
+    claims: list[dict[str, Any]] = []
+    for claim_id, date, amount in _CLAIM_LINE.findall(text):
+        claim_id = claim_id.upper()
+        if claim_id in seen:
+            continue
+        seen.add(claim_id)
+        claims.append(
+            {
+                "claim_id": claim_id,
+                "date": date,
+                "amount": amount.replace(",", ""),
+            }
+        )
+    return claims
+
+
 def _num(value: Any) -> float:
     try:
         return float(str(value).replace(",", "").strip())
@@ -80,8 +109,10 @@ def assess_fraud(
 ) -> dict[str, Any]:
     flags: list[dict[str, Any]] = []
 
-    def flag(code: str, points: int, detail: str) -> None:
-        flags.append({"code": code, "points": points, "detail": detail})
+    def flag(code: str, points: int, detail: str, **extra: Any) -> None:
+        flags.append(
+            {"code": code, "points": points, "detail": detail, **extra}
+        )
 
     declared = " ".join(
         str(c).lower()
@@ -110,6 +141,7 @@ def assess_fraud(
             "undeclared_condition",
             _WEIGHTS["undeclared_condition"],
             f"Applicant documents mention {label}, which was not declared.",
+            condition=label,
         )
 
     # 2. Smoking status contradicted by documents.
@@ -135,6 +167,18 @@ def assess_fraud(
     # 3. Claim patterns.
     claims = [c for c in (features.get("claims") or []) if isinstance(c, dict)]
     claim_count = int(features.get("claim_count", len(claims)) or 0)
+
+    # Profile claims only carry ids; dates and amounts live in the claims
+    # documents, so read them from the retrieved evidence when needed.
+    if not any(c.get("amount") or c.get("claim_amount") for c in claims):
+        parsed = _claims_from_text(
+            " ".join(
+                _text_of(item) for item in (features.get("claims_evidence") or [])
+            )
+        )
+        if parsed:
+            claims = parsed
+            claim_count = max(claim_count, len(parsed))
 
     if claim_count >= 4:
         flag(

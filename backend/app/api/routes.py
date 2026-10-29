@@ -29,13 +29,14 @@ from app.models.state import (
 
 from app.api.schemas import (
     ApplicantCreate,
+    BatchPlanInput,
     BatchStartInput,
     CaseCreate,
     DocumentUploadResponse,
 )
 from app.cache.pattern_cache import pattern_cache
 from app.orchestrator.graph import run_workflow
-from app.services.batch import plan_groups, run_batch
+from app.services.batch import describe_plan, plan_groups, run_batch
 from app.services.document_service import document_service
 from app.store.state_store import state_store
 from app.security.guardrails import guardrails
@@ -657,23 +658,60 @@ def _prepare_case_for_run(case_id: str) -> dict[str, Any]:
     )
 
     if not guardrail_result.allowed:
+        quarantine = guardrails.quarantine_submission(
+            state.get("applicant_profile", {}),
+            state.get("submission", {}),
+        )
+
+        if not quarantine["recoverable"]:
+            state_store.add_workflow_event(
+                case_id=case_id,
+                event_type="security_guardrail",
+                node="guardrails",
+                status="blocked",
+                message="Underwriting request blocked by security guardrails.",
+                data=guardrail_result.to_dict(),
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Underwriting request blocked by security guardrails.",
+                    "risk_level": guardrail_result.risk_level,
+                    "reasons": guardrail_result.reasons,
+                    "checks": guardrail_result.checks,
+                },
+            )
+
+        # Keep the audit record of what was found, then continue on the
+        # clean remainder with mandatory human review.
+        _record_guardrail_result(state, guardrail_result.to_dict())
+        state["applicant_profile"] = quarantine["profile"]
+        state["submission"] = quarantine["submission"]
+        state["quarantined_inputs"] = list(
+            state.get("quarantined_inputs") or []
+        ) + quarantine["items"]
+        state["security_review_reasons"] = list(
+            dict.fromkeys(
+                list(state.get("security_review_reasons") or [])
+                + [
+                    f"'{item['field']}' was excluded from analysis "
+                    f"({'; '.join(item['reasons'])})"
+                    for item in quarantine["items"]
+                ]
+            )
+        )
         state_store.add_workflow_event(
             case_id=case_id,
             event_type="security_guardrail",
             node="guardrails",
-            status="blocked",
-            message="Underwriting request blocked by security guardrails.",
-            data=guardrail_result.to_dict(),
+            status="quarantined",
+            message=(
+                f"{len(quarantine['items'])} input field(s) excluded from "
+                "analysis by security guardrails; human review required."
+            ),
+            data={"items": quarantine["items"]},
         )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Underwriting request blocked by security guardrails.",
-                "risk_level": guardrail_result.risk_level,
-                "reasons": guardrail_result.reasons,
-                "checks": guardrail_result.checks,
-            },
-        )
+        guardrail_result = quarantine["recheck"]
 
     _record_guardrail_result(
         state,
@@ -726,6 +764,48 @@ async def start_existing_case(
         "error": None,
     }
 
+@router.post("/cases/batch/plan")
+async def plan_batch(body: BatchPlanInput):
+    """Propose groups of similar cases, with reasons, without running anything."""
+    if body.case_ids is None:
+        listed = await asyncio.to_thread(state_store.list_cases, limit=1000)
+        ids = [
+            c["case_id"]
+            for c in listed
+            if str(c.get("status", "")).strip().lower() in {"draft", "pending"}
+        ]
+    else:
+        ids = list(dict.fromkeys(body.case_ids))
+
+    cases: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+    for case_id in ids:
+        state = await asyncio.to_thread(state_store.get_case, case_id)
+        if state is None:
+            skipped[case_id] = "Case not found."
+            continue
+        status = str(state.get("final_status", "")).strip().lower()
+        if status in {
+            "processing",
+            "completed",
+            "awaiting_human_review",
+            "human_review",
+            "escalated",
+        }:
+            skipped[case_id] = f"Already {status}."
+            continue
+        cases[case_id] = state
+
+    return {
+        "success": True,
+        "data": {
+            "groups": describe_plan(cases),
+            "skipped": skipped,
+        },
+        "error": None,
+    }
+
+
 @router.post(
     "/cases/batch",
     status_code=202,
@@ -747,6 +827,26 @@ async def start_batch(
             )
 
     if prepared:
+        for group in describe_plan(prepared):
+            for case_id in group["case_ids"]:
+                size = len(group["case_ids"])
+                state_store.add_workflow_event(
+                    case_id=case_id,
+                    event_type="batch",
+                    node="batch",
+                    status="grouped" if group["grouped"] else "single",
+                    message=(
+                        f"Run in batch group {group['group_id']} with "
+                        f"{size - 1} other similar case(s): {group['reason']}"
+                        if group["grouped"]
+                        else "Run in a batch, on its own (no similar case in the selection)."
+                    ),
+                    data={
+                        "group_id": group["group_id"],
+                        "case_ids": group["case_ids"],
+                        "shares": group["shares"],
+                    },
+                )
         background_tasks.add_task(run_batch, prepared, _run_case)
 
     return {

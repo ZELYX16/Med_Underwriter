@@ -112,13 +112,28 @@ def extract_applicant_profile(
     if not name:
         name = applicant_id
 
-    return {
+    profile: dict[str, Any] = {
         "applicant_id": applicant_id,
         "name": name,
         "date_of_birth": dob,
         "age": age,
         "source": "synthetic_dataset",
     }
+
+    # Optional lifestyle fields; only set when the document states them.
+    smoking = extract_single_line(text, r"Smoking status\s*\n([^\n]+)")
+    if smoking:
+        profile["smoker"] = not re.search(
+            r"\b(non[- ]?smoker|never|no|former|quit)\b",
+            smoking,
+            flags=re.IGNORECASE,
+        )
+
+    bmi_match = re.search(r"\bBMI\b\s*\n?\s*(\d{2}(?:\.\d+)?)", text)
+    if bmi_match:
+        profile["bmi"] = float(bmi_match.group(1))
+
+    return profile
 
 
 # ============================================================
@@ -538,7 +553,7 @@ def extract_submission(
         else 1
     )
 
-    return {
+    submission: dict[str, Any] = {
         "product": product,
         "policy_type": policy_type,
         "sum_insured": sum_insured,
@@ -547,6 +562,17 @@ def extract_submission(
         "jurisdiction": "India",
         "insurer": "DEMO_INSURER",
     }
+
+    # Optional free-text note from the submitter (screened by guardrails).
+    notes = extract_between(
+        text,
+        r"Underwriting note",
+        r"(?:\n\d+\.\s|\Z)",
+    )
+    if notes:
+        submission["notes"] = clean_text(notes)[:1000]
+
+    return submission
 
 
 # ============================================================

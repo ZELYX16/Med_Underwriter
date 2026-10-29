@@ -1196,6 +1196,8 @@ def run_batch_underwriting(case_ids: list[str]) -> None:
     if st.session_state.underwriting_running:
         return
     st.session_state.underwriting_running = True
+    st.session_state.batch_summary = None
+    batch_started = _time.time()
 
     terminal = {
         "completed",
@@ -1267,6 +1269,13 @@ def run_batch_underwriting(case_ids: list[str]) -> None:
                     "backend; refresh the case list later."
                 )
 
+            st.session_state.batch_summary = {
+                "done": done,
+                "total": len(accepted),
+                "groups": groups,
+                "seconds": round(_time.time() - batch_started),
+                "case_ids": accepted,
+            }
             box.update(
                 label=f"Batch finished: {done}/{len(accepted)} case(s) done",
                 state="complete",
@@ -1277,6 +1286,10 @@ def run_batch_underwriting(case_ids: list[str]) -> None:
     finally:
         st.session_state.underwriting_running = False
         st.session_state.case_cache.clear()
+
+    # Reload the list so finished cases show their real status and action.
+    if st.session_state.get("batch_summary"):
+        st.rerun()
 
 
 def render_case_row(
@@ -1406,6 +1419,89 @@ def render_case_row(
 # ALL CASES
 # ============================================================
 
+def render_batch_panel(startable: list[dict[str, Any]]) -> None:
+    """Propose groups of similar draft cases; run only the approved ones."""
+    summary = st.session_state.get("batch_summary")
+    if summary:
+        minutes, seconds = divmod(int(summary.get("seconds", 0)), 60)
+        st.success(
+            f"Last batch: {summary.get('done')}/{summary.get('total')} case(s) "
+            f"finished in {minutes}m {seconds}s across "
+            f"{len(summary.get('groups') or [])} group(s) "
+            f"(sizes {summary.get('groups')}): "
+            + ", ".join(summary.get("case_ids") or [])
+        )
+        if st.button("Dismiss batch summary"):
+            st.session_state.batch_summary = None
+            st.rerun()
+
+    with st.expander(
+        f"Batch underwriting ({len(startable)} draft case(s))",
+        expanded=False,
+    ):
+        st.caption(
+            "Similar cases (same product, condition categories and age band) "
+            "are grouped so they share regulatory and guidance retrieval. "
+            "Each case still gets its own scoring, rationale and review."
+        )
+        if st.button("Suggest groups of similar cases"):
+            try:
+                st.session_state.batch_plan = normalize_data(
+                    api.plan_batch(
+                        [str(case.get("case_id")) for case in startable]
+                    )
+                )
+            except APIError as exc:
+                show_error("build the batch plan", exc)
+
+        plan = st.session_state.get("batch_plan")
+        groups = plan.get("groups", []) if isinstance(plan, dict) else []
+        if not groups:
+            return
+
+        chosen: list[str] = []
+        for group in groups:
+            members = group.get("cases", [])
+            grouped = bool(group.get("grouped"))
+            title = (
+                f"{group.get('group_id')} · {len(members)} similar cases"
+                if grouped
+                else f"{group.get('group_id')} · runs on its own"
+            )
+            with st.container(border=True):
+                if st.checkbox(
+                    title,
+                    value=grouped,
+                    key=f"batch_pick_{group.get('group_id')}",
+                ):
+                    chosen.extend(group.get("case_ids", []))
+                st.caption(f"Why: {group.get('reason', '')}")
+                if group.get("shares"):
+                    st.caption("Shares: " + ", ".join(group["shares"]))
+                st.dataframe(
+                    [
+                        {
+                            "Case": member.get("case_id"),
+                            "Applicant": member.get("applicant"),
+                            "Age": member.get("age"),
+                            "Product": member.get("product"),
+                            "Conditions": ", ".join(member.get("conditions") or []) or "-",
+                        }
+                        for member in members
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        if st.button(
+            f"Run selected groups ({len(chosen)} case(s))",
+            type="primary",
+            disabled=not chosen,
+        ):
+            st.session_state.batch_plan = None
+            run_batch_underwriting(chosen)
+
+
 def render_cases() -> None:
     page_header(
         "All Cases",
@@ -1520,26 +1616,7 @@ def render_cases() -> None:
         in {"draft", "pending"}
     ]
     if startable:
-        with st.expander(
-            f"Batch underwriting ({len(startable)} draft case(s))",
-            expanded=False,
-        ):
-            labels = {
-                str(case.get("case_id")): f"{case.get('case_id')} · {applicant_name(case)} · {product(case)}"
-                for case in startable
-            }
-            chosen = st.multiselect(
-                "Cases to run together",
-                options=list(labels),
-                format_func=lambda cid: labels[cid],
-                key="batch_selection",
-            )
-            if st.button(
-                "Run batch",
-                type="primary",
-                disabled=not chosen,
-            ):
-                run_batch_underwriting(chosen)
+        render_batch_panel(startable)
 
     st.caption(
         f"{len(filtered)} case(s)"
@@ -1740,20 +1817,13 @@ def render_applicant_detail() -> None:
 
     st.divider()
 
-    render_applicant_medical_profile(
-        profile
-    )
-
-    render_treatment_history(
-        profile
-    )
-
-    render_claim_history(
-        profile
-    )
-
-    render_existing_policy(
-        profile
+    applicant_card(
+        {
+            "applicant_profile": profile,
+            "applicant_id": app_id,
+            "source": applicant.get("source") or profile.get("source"),
+            "cases": [],
+        }
     )
 
     render_applicant_cases(
@@ -2824,6 +2894,7 @@ def render_case_overview(
     st.divider()
 
     render_fraud_panel(case, always=True)
+    render_security_panel(case)
 
     st.divider()
 
@@ -2842,22 +2913,95 @@ def render_case_overview(
 # DECISION SNAPSHOT
 # ============================================================
 
+def render_structured_reasoning(case: dict[str, Any], fallback: Any = "") -> None:
+    """
+    Short assessment first, then a fact-exact breakdown by topic.
+
+    The breakdown is built by the backend from the same values the scores
+    came from; the narrative only explains it. Older cases without the
+    breakdown show the plain text.
+    """
+    structured = case.get("reasoning_structured")
+    sections = structured.get("sections") if isinstance(structured, dict) else None
+    if not sections:
+        if fallback:
+            st.write(fallback)
+        return
+
+    summary = structured.get("summary")
+    if summary:
+        st.markdown("**Assessment**")
+        st.info(str(summary))
+
+    for start in range(0, len(sections), 2):
+        pair = sections[start:start + 2]
+        for column, section in zip(st.columns(len(pair)), pair):
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"**{esc(section.get('title', ''))}**")
+                    for point in section.get("points", []):
+                        st.markdown(f"- {esc(point)}")
+
+
+def render_security_panel(case: dict[str, Any]) -> None:
+    """Inputs the guardrails excluded from analysis (case goes to human review)."""
+    reasons = case.get("security_review_reasons")
+    items = case.get("quarantined_inputs")
+    if not reasons and not items:
+        return
+    with st.container(border=True):
+        st.markdown("**Security review**")
+        st.caption(
+            "These inputs were excluded from scoring and prompts. The case "
+            "continues on the remaining data and requires human review."
+        )
+        for reason in reasons or []:
+            st.markdown(f"- {esc(reason)}")
+        for item in items or []:
+            if isinstance(item, dict) and item.get("excerpt"):
+                st.caption(
+                    f"{item.get('field', 'input')}: {item.get('excerpt')}"
+                )
+
+
 def render_fraud_panel(case: dict[str, Any], always: bool = False) -> None:
-    """Fraud indicators for the reviewer; flags are leads to verify, never verdicts."""
+    """
+    Fraud-indicator card shown on every assessed case.
+
+    Flags are leads for the reviewer to verify, never verdicts; they do not
+    decline a case on their own.
+    """
+    if case.get("fraud_risk_level") is None and not case.get("fraud_flags"):
+        return  # not assessed yet
+
     flags = case.get("fraud_flags")
     flags = [f for f in flags if isinstance(f, dict)] if isinstance(flags, list) else []
     level = text(case.get("fraud_risk_level", "low")).title()
     score = case.get("fraud_risk_score", 0)
 
-    if not flags:
-        if always and case.get("fraud_risk_level") is not None:
-            st.caption(f"FRAUD INDICATORS · None raised ({text(score)}/100)")
-        return
-
-    st.markdown(f"#### Fraud Indicators · {level} ({text(score)}/100)")
-    st.caption("Indicators to verify, not findings. They never decline a case on their own.")
-    for item in flags:
-        st.markdown(f"- {esc(item.get('detail', ''))}")
+    with st.container(border=True):
+        head = st.columns([1.2, 1, 3])
+        with head[0]:
+            st.caption("FRAUD INDICATORS")
+            st.markdown(f"**{level}**")
+        with head[1]:
+            st.caption("SCORE")
+            st.markdown(f"**{text(score)} / 100**")
+        with head[2]:
+            st.caption(
+                "Checked: undeclared conditions or smoking against documents, "
+                "claim frequency, same-month clusters, duplicate claims, "
+                "claims vs sum insured, high cover with heavy history."
+            )
+        if flags:
+            for item in flags:
+                st.markdown(f"- {esc(item.get('detail', ''))}")
+            st.caption(
+                "Indicators to verify, not findings. A high score routes the "
+                "case to human review but never declines it on its own."
+            )
+        else:
+            st.caption("No indicators raised for this case.")
 
 
 def render_decision_snapshot(
@@ -3773,7 +3917,12 @@ def render_agent2_result(
             pricing
         )
 
+    if isinstance(case.get("reasoning_structured"), dict):
+        st.markdown("#### Reasoning")
+        render_structured_reasoning(case)
+
     render_fraud_panel(case, always=True)
+    render_security_panel(case)
 
 
 # ============================================================
@@ -4221,9 +4370,7 @@ def render_decision_details(
             "#### Underwriting Rationale"
         )
 
-        st.write(
-            reasoning
-        )
+        render_structured_reasoning(case, reasoning)
 
     st.divider()
 
@@ -4504,6 +4651,19 @@ def render_workflow_section(
         "Workflow",
         "Execution trace and persisted underwriting events.",
     )
+    events = load_events(
+        str(
+            case.get(
+                "case_id",
+                "",
+            )
+        )
+    )
+    for event in events or []:
+        if isinstance(event, dict) and event.get("event_type") == "batch":
+            st.info(f"Batch: {event.get('message', '')}")
+            break
+
     metrics = _merge_workflow_metrics(case)
     workflow_metrics(metrics)
     trace = case.get(
@@ -4521,15 +4681,6 @@ def render_workflow_section(
         workflow_timeline(
             trace
         )
-
-    events = load_events(
-        str(
-            case.get(
-                "case_id",
-                "",
-            )
-        )
-    )
 
     if events:
 

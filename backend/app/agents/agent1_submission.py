@@ -10,6 +10,7 @@ from app.config import settings
 from app.rag.agentic_rag import agentic_rag
 from app.rag.budget import retrieval_budget
 from app.rag.hybrid_rag import hybrid_rag
+from app.services.similarity import knowledge_key
 from app.rag.medgraph_rag import medgraph_rag
 from app.rag.retriever import retriever
 
@@ -26,7 +27,10 @@ def _knowledge_cache(key: tuple, fetch) -> list[dict[str, Any]]:
     """Cache non-applicant knowledge lookups; failures return [] uncached."""
     now = time.monotonic()
     hit = _KNOWLEDGE_CACHE.get(key)
-    pattern_key = "|".join(str(part) for part in key)
+    pattern_key = "|".join(
+        "+".join(part) if isinstance(part, tuple) else str(part)
+        for part in key
+    )
     if hit and now - hit[0] < _KNOWLEDGE_TTL_SEC:
         pattern_cache.record_hit("knowledge", pattern_key)
         return hit[1]
@@ -237,11 +241,14 @@ class SubmissionIntelligenceAgent:
     def _retrieve_regulatory(
         self,
         query: str,
+        conditions: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
         # Regulatory text is the same for every applicant asking the same
-        # thing, so serve it from a short-lived cache.
+        # thing, so serve it from a cache keyed on condition categories.
         return _knowledge_cache(
-            ("regulatory", query),
+            knowledge_key("regulatory", conditions, None)
+            if conditions is not None
+            else ("regulatory", query),
             lambda: hybrid_rag.search_regulatory(
                 query=query,
                 jurisdiction="India",
@@ -253,6 +260,7 @@ class SubmissionIntelligenceAgent:
         self,
         query: str,
         product: str | None,
+        conditions: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Retrieves underwriting, pricing and actuarial guidance.
@@ -262,7 +270,9 @@ class SubmissionIntelligenceAgent:
         is required.
         """
         return _knowledge_cache(
-            ("actuarial", query, product),
+            knowledge_key("actuarial", conditions, product)
+            if conditions is not None
+            else ("actuarial", query, product),
             lambda: hybrid_rag.search_underwriting(
                 query=query,
                 product=product,
@@ -352,6 +362,39 @@ class SubmissionIntelligenceAgent:
             return []
 
         return results if isinstance(results, list) else []
+
+    @staticmethod
+    def _quarantine_flagged(
+        enrichment: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Remove security-flagged applicant chunks; report what was removed."""
+        removed: dict[str, dict[str, Any]] = {}
+        for key in (
+            "medical_evidence",
+            "claims_evidence",
+            "policy_evidence",
+            "underwriting_submission",
+        ):
+            items = enrichment.get(key)
+            if not isinstance(items, list):
+                continue
+            kept = []
+            for item in items:
+                metadata = item.get("metadata") if isinstance(item, dict) else None
+                flag = (metadata or {}).get("security_flag")
+                if flag:
+                    name = (
+                        (metadata or {}).get("filename")
+                        or (metadata or {}).get("file_name")
+                        or "document"
+                    )
+                    removed.setdefault(
+                        name, {"file": name, "flag": flag, "chunks": 0}
+                    )["chunks"] += 1
+                else:
+                    kept.append(item)
+            enrichment[key] = kept
+        return list(removed.values())
 
     @staticmethod
     def _unique_documents(
@@ -607,15 +650,19 @@ class SubmissionIntelligenceAgent:
             queries["claims"],
         )
 
+        declared = applicant_profile.get("medical_conditions") or []
+
         regulatory_task = asyncio.to_thread(
             self._retrieve_regulatory,
             queries["regulatory"],
+            declared,
         )
 
         actuarial_task = asyncio.to_thread(
             self._retrieve_actuarial_guidance,
             queries["actuarial"],
             submission.get("product"),
+            declared,
         )
 
         # Nothing to look up in the medical knowledge graph when the
@@ -722,6 +769,10 @@ class SubmissionIntelligenceAgent:
                 queries=queries,
             )
         retrieval_stats = budget.summary()
+
+        # Chunks flagged at index time (embedded instructions, secrets) are
+        # excluded from analysis; the case is routed to human review.
+        security_quarantine = self._quarantine_flagged(enrichment)
 
         workflow_trace.append(
             {
@@ -915,6 +966,7 @@ class SubmissionIntelligenceAgent:
             "metrics": metrics,
             "agent1_metrics": metrics,
             "agent1_completed": True,
+            "security_quarantine": security_quarantine,
             "retrieved_at": utc_now(),
         }
 

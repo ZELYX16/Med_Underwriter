@@ -358,6 +358,97 @@ class Guardrails:
 
         return matches
 
+    def quarantine_submission(
+        self,
+        applicant_profile: dict[str, Any],
+        submission: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Isolate fields with injected instructions, secrets or forced-decision
+        language instead of rejecting the whole case.
+
+        Scores and the recommendation are computed in code, so such text can't
+        change the decision; it only must not reach prompts or mislead a
+        reviewer. Offending fields are removed from the working copy, kept
+        (redacted) for the audit trail, and the case is routed to human review.
+        recoverable is False when the remainder still fails validation.
+        """
+        profile = dict(applicant_profile)
+        clean_submission = dict(submission)
+        items: list[dict[str, Any]] = []
+        # Structured fields the decision depends on: removing them would
+        # silently understate risk, so tampering there is still a hard block.
+        protected = {
+            "applicant_id", "age", "date_of_birth", "medical_conditions",
+            "medications", "hospitalizations", "claims", "existing_policy",
+            "product", "sum_insured", "term_years",
+        }
+        unrecoverable = False
+
+        for label, source, target in (
+            ("submission", submission, clean_submission),
+            ("profile", applicant_profile, profile),
+        ):
+            for key, value in source.items():
+                if value in (None, "", [], {}):
+                    continue
+                result = self.validate_prompt(str(value))
+                checks = result.checks
+                flagged = [
+                    name
+                    for name in (
+                        "prompt_injection",
+                        "secrets",
+                        "medical_decision_safety",
+                    )
+                    if not (checks.get(name) or {}).get("passed", True)
+                ]
+                if not flagged:
+                    continue
+                if key in protected:
+                    unrecoverable = True
+                    continue
+                items.append(
+                    {
+                        "field": f"{label}.{key}",
+                        "reasons": [r for r in result.reasons],
+                        "checks": flagged,
+                        "excerpt": self._redact(str(value))[:160],
+                    }
+                )
+                target.pop(key, None)
+
+        recheck = self.validate_submission(profile, clean_submission)
+        return {
+            "recoverable": bool(items) and not unrecoverable and recheck.allowed,
+            "profile": profile,
+            "submission": clean_submission,
+            "items": items,
+            "recheck": recheck,
+        }
+
+    def _redact(self, text: str) -> str:
+        for pattern in self.SECRET_PATTERNS:
+            try:
+                text = re.sub(pattern, "[REDACTED]", text)
+            except re.error:
+                continue
+        return self._sanitize(text)
+
+    def scan_document_text(self, text: str) -> list[str]:
+        """
+        Index-time scan of document text (regex only, no runtime cost).
+
+        Returns the kinds of problems found, e.g. embedded instructions
+        aimed at an LLM or credentials, so the chunk can be flagged.
+        """
+        found: list[str] = []
+        if self._find_matches(text, self.INJECTION_PATTERNS):
+            found.append("possible_prompt_injection")
+        if self._find_matches(text, self.SECRET_PATTERNS):
+            found.append("possible_secret")
+        return found
+
     def _find_pii(self, text: str) -> list[str]:
         detected: list[str] = []
 

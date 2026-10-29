@@ -39,11 +39,12 @@ class Settings(BaseSettings):
     llm_timeout_sec: float = 90.0
     llm_max_retries: int = 1
     ollama_keep_alive: str = "30m"
+    ollama_num_ctx: int = 4096  # explicit, smaller context = less prefill/memory
 
     # Token / latency controls
-    reasoning_max_tokens: int = 500
+    reasoning_max_tokens: int = 250  # short assessment; structure comes from code
     reasoning_cache_size: int = 256
-    prompt_version: str = "v2"
+    prompt_version: str = "v3"
     batch_max_group_size: int = 8
     batch_concurrency: int = 2  # parallel workflows; keep low for Ollama
     pattern_cache_enabled: bool = True
@@ -52,7 +53,7 @@ class Settings(BaseSettings):
     skip_llm_for_simple_cases: bool = True
     skip_llm_risk_ceiling: float = 40.0
     reflection_llm_enabled: bool = True  # LLM critique for complex/high-risk cases
-    reflection_max_tokens: int = 400
+    reflection_max_tokens: int = 450  # room for complete JSON; short prompt keeps it small
     warm_llm_on_startup: bool = True  # Ollama only: preload models
 
     # Underwriting safety / human-review gates
@@ -61,6 +62,8 @@ class Settings(BaseSettings):
     confidence_human_review_threshold: float = 0.70
     max_reflection_rounds: int = 3
     fraud_review_threshold: float = 60.0
+    router_complex_threshold: int = 4  # weighted routing score >= this is complex
+    max_upload_mb: int = 20
     fraud_high_sum_insured: float = 5_000_000.0
 
     # Storage

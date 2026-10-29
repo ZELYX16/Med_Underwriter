@@ -118,11 +118,38 @@ class ReflectionAgent:
         if reflection_round > max_rounds:
             reflection_round = max_rounds
 
-        # LLM critique: only where it earns its cost (complex or high-risk).
-        critique: dict[str, Any] | None = None
-        if settings.reflection_llm_enabled and (
+        # LLM critique: only where it earns its cost. It can only add
+        # caution, so it is pointless when the rules already send the case
+        # to a human.
+        preliminary_verdict = self._determine_verdict(
+            mar_result=final_mar,
+            constitutional=constitutional,
+            flag_count=flag_count,
+        )
+        rules_force_review = (
+            flag_count > 0
+            or str(final_mar.get("verdict", "")).strip().lower()
+            in {"fail", "failed"}
+            or preliminary_verdict in {"escalate", "fail"}
+            or (
+                reflection_round >= self.MAX_REFLECTION_ROUNDS
+                and not final_mar.get("consensus", False)
+            )
+        )
+        needs_critique = (
             reflection_type == "full_mar" or complexity_level == "complex"
-        ):
+        )
+        if not settings.reflection_llm_enabled:
+            critique_status = "disabled"
+        elif not needs_critique:
+            critique_status = "not required (simple or standard case)"
+        elif rules_force_review:
+            critique_status = "not needed (rules already require human review)"
+        else:
+            critique_status = "used"
+
+        critique: dict[str, Any] | None = None
+        if critique_status == "used":
             critique = llm_critic.critique(
                 applicant_profile=applicant_profile,
                 risk_assessment=risk_assessment,
@@ -206,6 +233,8 @@ class ReflectionAgent:
         # Rules/personas use no tokens; the LLM critique (complex or
         # high-risk cases only) reports its own usage.
         critique_metrics = critique["metrics"] if critique else {}
+        if critique and not critique.get("ok"):
+            critique_status = "failed (rules only)"
         metrics = {
             "latency_sec": round(time.perf_counter() - started, 4),
             "llm_latency_sec": critique_metrics.get("llm_latency_sec", 0.0),
@@ -214,9 +243,13 @@ class ReflectionAgent:
             "total_tokens": critique_metrics.get("total_tokens", 0),
             "token_source": critique_metrics.get("token_source", "none"),
             "llm_used": bool(critique_metrics.get("llm_used", False)),
+            "llm_attempted": critique is not None,
+            "llm_status": critique_status,
+            "timing": critique_metrics.get("timing") or {},
         }
         if critique and not critique.get("ok"):
             metrics["error"] = critique.get("error", "critique_failed")
+            metrics["llm_error"] = critique.get("error", "critique_failed")
 
         return {
             "reflection_required": True,

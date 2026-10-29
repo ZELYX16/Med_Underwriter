@@ -11,6 +11,7 @@ class LLMProvider:
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        json_mode: bool = False,
     ) -> Any:
         raise NotImplementedError
 
@@ -21,6 +22,7 @@ class OllamaProvider(LLMProvider):
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        json_mode: bool = False,
     ) -> Any:
         from langchain_ollama import ChatOllama
 
@@ -34,6 +36,9 @@ class OllamaProvider(LLMProvider):
             ),
             num_predict=max_tokens or settings.max_tokens,
             keep_alive=settings.ollama_keep_alive,
+            num_ctx=settings.ollama_num_ctx,
+            # Constrains output to valid JSON when the caller asks for it.
+            **({"format": "json"} if json_mode else {}),
             timeout=settings.llm_timeout_sec,
             max_retries=settings.llm_max_retries,
         )
@@ -45,6 +50,7 @@ class GroqProvider(LLMProvider):
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        json_mode: bool = False,
     ) -> Any:
         from langchain_groq import ChatGroq
 
@@ -73,6 +79,7 @@ class GeminiProvider(LLMProvider):
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        json_mode: bool = False,
     ) -> Any:
         from langchain_google_genai import (
             ChatGoogleGenerativeAI,

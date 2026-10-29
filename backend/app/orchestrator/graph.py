@@ -47,7 +47,11 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
     # (tens of thousands for Agent 1, which makes no LLM call).
     passthrough = {
         key: metrics[key]
-        for key in ("token_source", "llm_used", "cache_hit", "retrieval", "error", "skipped_reason")
+        for key in (
+            "token_source", "llm_used", "cache_hit", "retrieval", "error",
+            "skipped_reason", "llm_status", "llm_error", "timing",
+            "evidence_stats",
+        )
         if key in metrics
     }
 
@@ -146,6 +150,68 @@ def _ensure_metrics(
     normalized["total_tokens"] = data_in + data_out
     normalized["token_source"] = "estimated"
     return normalized
+
+
+_EVIDENCE_KEYS = (
+    "medical_evidence",
+    "claims_evidence",
+    "policy_evidence",
+    "regulatory_evidence",
+    "underwriting_submission",
+    "underwriting_knowledge_evidence",
+    "underwriting_evidence",
+    "medical_knowledge",
+)
+
+
+def _chunk_identity(item: Any) -> str:
+    if isinstance(item, dict):
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        text = str(
+            item.get("content") or item.get("text") or item.get("document") or ""
+        )
+        ident = (
+            item.get("chunk_id")
+            or item.get("id")
+            or meta.get("chunk_id")
+            or (
+                f"{item.get('document_id') or meta.get('document_id') or ''}"
+                f"#{meta.get('chunk_index', '')}"
+            )
+        )
+        if ident and ident != "#":
+            return str(ident)
+        return text[:200]
+    return str(item)[:200]
+
+
+def _unique_evidence(result: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    """
+    Each retrieved chunk once, plus how many copies the result carries.
+
+    The Agent 1 result repeats evidence (top-level lists and inside
+    agent1_enrichment), so measuring the whole payload overstates what was
+    actually retrieved.
+    """
+    enrichment = result.get("agent1_enrichment")
+    sources = [result] + ([enrichment] if isinstance(enrichment, dict) else [])
+    unique: dict[str, Any] = {}
+    copies = 0
+    for source in sources:
+        for key in _EVIDENCE_KEYS:
+            items = source.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                copies += 1
+                unique.setdefault(_chunk_identity(item), item)
+    chars = sum(len(str(item)) for item in unique.values())
+    return list(unique.values()), {
+        "unique_chunks": len(unique),
+        "stored_copies": copies,
+        "duplicate_copies": max(0, copies - len(unique)),
+        "unique_chars": chars,
+    }
 
 
 def _workflow_metrics(
@@ -322,14 +388,19 @@ async def agent1_node(
                 time.perf_counter() - started,
                 4,
             )
+        unique_evidence, evidence_stats = _unique_evidence(result)
+        agent1_metrics["evidence_stats"] = evidence_stats
         agent1_metrics = _ensure_metrics(
             agent1_metrics,
             {
                 "applicant_profile": state.get("applicant_profile", {}),
                 "submission": state.get("submission", {}),
             },
-            result,
+            # Count each retrieved chunk once; the result stores the same
+            # chunks in several places for the UI.
+            unique_evidence,
         )
+        agent1_metrics["llm_status"] = "not used (retrieval only)"
         agent1_metrics["cache_events"] = cache_trace.events
 
         underwriting_submission = result.get(
@@ -376,6 +447,18 @@ async def agent1_node(
                 [],
             ),
             "agent1_enrichment": enrichment,
+            "security_review_reasons": list(
+                dict.fromkeys(
+                    list(state.get("security_review_reasons") or [])
+                    + [
+                        f"Document '{q['file']}' contains {q['flag'].replace('_', ' ')} "
+                        f"({q['chunks']} chunk(s)); excluded from analysis"
+                        for q in result.get("security_quarantine") or []
+                    ]
+                )
+            ),
+            "quarantined_inputs": list(state.get("quarantined_inputs") or [])
+            + list(result.get("security_quarantine") or []),
             "agent1_metrics": agent1_metrics,
             "agent_metrics": {
                 "agent1": agent1_metrics,
@@ -482,6 +565,7 @@ def complexity_node(
                 "agent1_enrichment",
                 {},
             ),
+            submission=state.get("submission", {}),
         )
 
         complexity_level = result.get(
@@ -510,6 +594,14 @@ def complexity_node(
                 details={
                     "complexity_level": complexity_level,
                     "routing_strategy": routing_strategy,
+                    "complexity_score": result.get(
+                        "complexity_score",
+                        0,
+                    ),
+                    "score_breakdown": result.get(
+                        "score_breakdown",
+                        [],
+                    ),
                     "condition_count": result.get(
                         "condition_count",
                         0,
@@ -602,7 +694,11 @@ def agent2_node(
             {
                 "applicant_profile": state.get("applicant_profile", {}),
                 "submission": state.get("submission", {}),
-                "enrichment": state.get("agent1_enrichment", {}),
+                # Same unique-evidence count as Agent 1's output, so the
+                # hand-off numbers match.
+                "enrichment": _unique_evidence(
+                    state.get("agent1_enrichment", {}) or {}
+                )[0],
             },
             result,
         )
@@ -668,6 +764,10 @@ def agent2_node(
             "agent2_reasoning": result.get(
                 "agent2_reasoning",
                 "",
+            ),
+            "reasoning_structured": result.get(
+                "reasoning_structured",
+                {},
             ),
             "decision_basis": result.get(
                 "decision_basis",
@@ -1165,6 +1265,18 @@ def _business_review_reasons(
             f"Fraud indicators score {fraud_score:.0f} is at or above "
             f"{settings.fraud_review_threshold:.0f}; verify the flagged items."
         )
+
+    from app.agents.fraud import MATERIAL_FLAG_CODES
+
+    for flag in state.get("fraud_flags") or []:
+        if isinstance(flag, dict) and flag.get("code") in MATERIAL_FLAG_CODES:
+            reasons.append(
+                "Possible non-disclosure: " + str(flag.get("detail", ""))
+                + " Verify with the applicant."
+            )
+
+    for reason in state.get("security_review_reasons") or []:
+        reasons.append(f"Security review: {reason}")
 
     constitutional_flag = False
     for key, value in state.items():

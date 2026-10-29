@@ -242,6 +242,16 @@ class APIClient:
             f"/api/case/{case_id}/status",
         )
 
+    def plan_batch(
+        self,
+        case_ids: list[str] | None = None,
+    ) -> Any:
+        return self._request(
+            "POST",
+            "/api/cases/batch/plan",
+            json={"case_ids": case_ids},
+        )
+
     def start_batch(
         self,
         case_ids: list[str],

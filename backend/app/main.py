@@ -45,6 +45,15 @@ async def lifespan(app: FastAPI):
 
     state_store.health_check()
 
+    if (
+        settings.secret_key == "development-secret-key"
+        and settings.environment.lower() != "development"
+    ):
+        logger.warning(
+            "SECRET_KEY is still the development default; set a real "
+            "value outside development."
+        )
+
     try:
         vector_health = vector_store.health_check()
         logger.info(
