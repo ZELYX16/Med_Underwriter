@@ -22,6 +22,7 @@ from typing import Any
 
 from app.config import settings
 from app.llm.factory import get_llm
+from app.llm.timing import extract_timing
 from app.security.guardrails import guardrails
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class LLMCritic:
                 self.llm = get_llm(
                     "reflection",
                     max_tokens=settings.reflection_max_tokens,
+                    json_mode=True,
                 )
 
             prompt = self._prompt(
@@ -75,21 +77,34 @@ class LLMCritic:
                 )
             raw = str(content).strip()
 
-            if not guardrails.validate_output(raw).allowed:
-                raise ValueError("critique blocked by output guardrails")
-
-            parsed = self._parse(raw)
             usage = self._usage(response, prompt, raw)
+            metrics = {
+                **usage,
+                "llm_latency_sec": llm_latency,
+                "latency_sec": round(time.perf_counter() - started, 4),
+                "llm_used": True,
+                "timing": extract_timing(response),
+            }
+
+            # From here a failure still reports the real time and tokens
+            # the model spent.
+            try:
+                if not guardrails.validate_output(raw).allowed:
+                    raise ValueError("critique blocked by output guardrails")
+                parsed = self._parse(raw)
+            except Exception as exc:
+                logger.warning("Agent 3 LLM critique unusable: %s", exc)
+                return {
+                    "ok": False,
+                    "error": str(exc)[:200],
+                    "metrics": metrics,
+                }
+
             return {
                 "ok": True,
                 "verdict": parsed["verdict"],
                 "concerns": parsed["concerns"],
-                "metrics": {
-                    **usage,
-                    "llm_latency_sec": llm_latency,
-                    "latency_sec": round(time.perf_counter() - started, 4),
-                    "llm_used": True,
-                },
+                "metrics": metrics,
             }
         except Exception as exc:  # critique must never break a case
             logger.warning("Agent 3 LLM critique skipped: %s", exc)
@@ -139,7 +154,7 @@ You are a senior underwriting reviewer. Critically check the decision below. Loo
 
 Reply with JSON only, no other text:
 {{"verdict": "agree" | "concerns" | "disagree", "concerns": [{{"persona": "medical_expert" | "actuary" | "compliance_officer" | "customer_advocate", "issue": "<one sentence>", "action": "<one sentence>"}}]}}
-Use "agree" with an empty list when the decision is sound. At most 3 concerns. Use "disagree" only if the recommendation itself is wrong.
+Use "agree" with an empty list when the decision is sound. At most 2 concerns, each issue and action under 25 words. Use "disagree" only if the recommendation itself is wrong.
 
 FACTS: {json.dumps(facts, default=str)}
 SCORES: {json.dumps(scores, default=str)}
@@ -151,11 +166,41 @@ RULE-BASED CONCERNS: {json.dumps(rule_concerns[:5], default=str)}
 """.strip()
 
     @staticmethod
-    def _parse(raw: str) -> dict[str, Any]:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
+    def _load_json(raw: str) -> dict[str, Any]:
+        """Parse the JSON object, repairing output cut off mid-way."""
+        match = re.search(r"\{.*", raw, re.DOTALL)
         if not match:
             raise ValueError("no JSON in critique")
-        data = json.loads(match.group(0))
+        text = match.group(0)
+        try:
+            return json.loads(text[: text.rindex("}") + 1])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        # Truncated or malformed: keep what is recoverable.
+        verdict = re.search(
+            r'"verdict"\s*:\s*"(agree|concerns|disagree)"', text, re.IGNORECASE
+        )
+        if not verdict:
+            raise ValueError("critique JSON unreadable (no verdict)")
+        concerns = []
+        for item in re.finditer(
+            r'"persona"\s*:\s*"([^"]*)"\s*,\s*"issue"\s*:\s*"([^"]*)"'
+            r'(?:\s*,\s*"action"\s*:\s*"([^"]*)")?',
+            text,
+        ):
+            concerns.append(
+                {
+                    "persona": item.group(1),
+                    "issue": item.group(2),
+                    "action": item.group(3) or "",
+                }
+            )
+        return {"verdict": verdict.group(1), "concerns": concerns}
+
+    @classmethod
+    def _parse(cls, raw: str) -> dict[str, Any]:
+        data = cls._load_json(raw)
         verdict = str(data.get("verdict", "")).strip().lower()
         if verdict not in {"agree", "concerns", "disagree"}:
             raise ValueError(f"unexpected verdict {verdict!r}")

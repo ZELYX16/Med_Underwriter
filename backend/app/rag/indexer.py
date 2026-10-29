@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import settings
 from app.rag.document_loader import document_loader
+from app.security.guardrails import guardrails
 from app.store.vector_store import vector_store
 
 
@@ -142,7 +143,13 @@ class DocumentIndexer:
                     "file_path": str(file_path),
                     "storage_path": str(file_path),
                     "chunk_index": index,
+                    "section": str(
+                        (chunk.get("metadata") or {}).get("section", "")
+                    ),
                 }
+                flags = guardrails.scan_document_text(text)
+                if flags:
+                    metadata["security_flag"] = ",".join(flags)
 
                 documents.append(text)
                 metadatas.append(metadata)
@@ -152,6 +159,22 @@ class DocumentIndexer:
                 continue
 
             try:
+                # Re-indexing replaces the document's chunks, so a changed
+                # chunking never leaves stale chunks behind.
+                try:
+                    vector_store.get_collection(
+                        self.COLLECTION_NAME
+                    ).delete(
+                        where={
+                            "$and": [
+                                {"applicant_id": applicant_id},
+                                {"document_id": document_id},
+                            ]
+                        }
+                    )
+                except Exception:
+                    pass
+
                 vector_store.add_documents(
                     collection_name=(
                         self.COLLECTION_NAME

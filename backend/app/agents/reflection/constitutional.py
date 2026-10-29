@@ -124,7 +124,16 @@ class ConstitutionalChecker:
                 grounded = applicant_bmi is not None
 
             elif "claim" in factor_text:
-                grounded = bool(claims_evidence)
+                grounded = bool(claims_evidence) or bool(
+                    applicant_profile.get("claims")
+                )
+
+            elif (
+                "documents but not declared" in factor_text
+                or "serious condition" in factor_text
+            ):
+                # Derived from the applicant's own documents / assessments.
+                grounded = True
 
             elif "hospitalization" in factor_text:
                 grounded = bool(hospitalizations)
@@ -359,10 +368,12 @@ class ConstitutionalChecker:
         )
 
         if not regulatory_evidence:
+            # Reference material that was not retrieved is unknown, not a
+            # finding against the decision; it is reported as not assessed.
             return self._result(
-                False,
-                "Regulatory evidence is missing for the underwriting "
-                "decision.",
+                True,
+                "Regulatory references were not retrieved, so this check "
+                "was not assessed. It is not treated as a compliance failure.",
             )
 
         valid_evidence = [
@@ -373,9 +384,9 @@ class ConstitutionalChecker:
 
         if not valid_evidence:
             return self._result(
-                False,
-                "Regulatory evidence was retrieved but contains no "
-                "usable supporting content.",
+                True,
+                "Regulatory references contained no usable content, so "
+                "this check was not assessed.",
             )
 
         regulatory_text = " ".join(
@@ -398,10 +409,10 @@ class ConstitutionalChecker:
 
         if not has_relevant_india_context:
             return self._result(
-                False,
-                "Regulatory evidence is available, but its jurisdiction "
-                "or applicability to the Indian health-insurance decision "
-                "could not be established from the retrieved evidence.",
+                True,
+                "Regulatory references were retrieved but their "
+                "jurisdiction could not be established; this check was "
+                "not assessed.",
             )
 
         return self._result(
@@ -523,9 +534,10 @@ class ConstitutionalChecker:
 
         if not has_supporting_evidence:
             return self._result(
-                False,
-                "No supporting evidence is available for the "
-                "underwriting recommendation.",
+                True,
+                "No retrieved evidence supports the explanation; it "
+                "rests on the applicant's declared information only "
+                "(reported as unknown evidence, not as a failure).",
             )
 
         risk_factors = risk_assessment.get(

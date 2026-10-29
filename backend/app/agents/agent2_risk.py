@@ -3,14 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
+from datetime import date
 from collections import OrderedDict
 from typing import Any
 
 from app.config import settings
 from app.agents.fraud import assess_fraud
+from app.services.evidence_state import completeness, evidence_states, verification_items
+from app.services.medical_groups import text_group
 from app.cache.pattern_cache import note_cache_event, pattern_cache
 from app.llm.factory import get_llm
+from app.llm.timing import extract_timing
 from app.security.guardrails import guardrails
 
 logger = logging.getLogger(__name__)
@@ -49,16 +54,75 @@ class RiskAssessmentAgent:
             enrichment_results,
         )
 
-        risk = self._calculate_risk(features)
-
         # Rule-based fraud indicators: no LLM call, no extra retrieval.
+        # Run first so conditions found in documents but not declared are
+        # counted in the medical risk score.
         fraud = assess_fraud(
             applicant_profile,
             submission,
             features,
             high_sum_insured=settings.fraud_high_sum_insured,
         )
+        features["condition_assessments"] = fraud.get("condition_assessments", [])
+        features["tier_by_group"] = {
+            a["group"]: a for a in features["condition_assessments"]
+        }
+        features["undeclared_conditions"] = [
+            {
+                "label": flag["condition"],
+                "group": flag.get("group"),
+                "tier": flag.get("tier", "serious"),
+            }
+            for flag in fraud["fraud_flags"]
+            if flag.get("code") == "undeclared_condition"
+            and flag.get("condition")
+        ]
+
+        # Unknown evidence is not negative evidence: scoring, protective
+        # factors and confidence all read these states.
+        states = evidence_states(
+            profile=applicant_profile,
+            structured=features.get("structured") or {},
+            evidence=enrichment_results,
+        )
+        features["evidence_states"] = states
+        verification = verification_items(
+            states,
+            conditions_declared=bool(features["conditions"]),
+            existing_policy_declared=bool(
+                (applicant_profile.get("existing_policy") or {}).get("policy_id")
+            ),
+            sum_insured=features["sum_insured"],
+            age=features["age"],
+            age_threshold=settings.doc_medical_age_threshold,
+            sum_insured_threshold=settings.doc_medical_sum_insured_threshold,
+        )
+
+        risk = self._calculate_risk(features)
         risk["fraud_flags"] = fraud["fraud_flags"]
+        risk["fraud_notes"] = fraud.get("fraud_notes", [])
+        risk["evidence_states"] = states
+        risk["verification_items"] = verification
+        risk["condition_assessments"] = features["condition_assessments"]
+        risk["coverage_notes"] = self._coverage_notes(
+            features, applicant_profile, submission
+        )
+
+        # Reasons that must reach a human. Deterministic and sticky: Agent 3
+        # and finalization read them but never clear them.
+        mandatory_reasons = [
+            f"Mandatory review: {r}" for r in fraud.get("mandatory_reasons", [])
+        ] + [
+            f"Verification required: {r}" for r in fraud.get("verification_reasons", [])
+        ]
+        material_unknown = [v for v in verification if v.get("material")]
+        if len(material_unknown) >= settings.max_material_unknowns:
+            mandatory_reasons.append(
+                "Verification required: evidence is missing on several points that "
+                "matter for this decision ("
+                + "; ".join(v["action"] for v in material_unknown)
+                + ")."
+            )
 
         pricing = self._calculate_pricing(
             submission=submission,
@@ -94,6 +158,20 @@ class RiskAssessmentAgent:
             confidence=confidence,
         )
 
+        try:
+            reasoning_structured = self._structured_reasoning(
+                features=features,
+                risk=risk,
+                pricing=pricing,
+                recommendation=recommendation,
+                confidence=confidence,
+                narrative=reasoning,
+                decision_basis=decision_basis,
+            )
+        except Exception as exc:  # the breakdown is display-only
+            logger.warning("Structured reasoning skipped: %s", exc)
+            reasoning_structured = {"summary": reasoning, "sections": []}
+
         metrics = self._build_metrics(
             started=agent_started,
             llm_metrics=getattr(self, "_last_llm_metrics", {}),
@@ -110,6 +188,10 @@ class RiskAssessmentAgent:
                 "evidence_completeness": risk["evidence_completeness"],
                 "evidence_domains": risk.get("evidence_domains", {}),
                 "evidence_gaps": risk.get("evidence_gaps", []),
+                "coverage_notes": risk.get("coverage_notes", []),
+                "evidence_states": risk.get("evidence_states", {}),
+                "verification_items": risk.get("verification_items", []),
+                "condition_assessments": risk.get("condition_assessments", []),
                 "decision_basis": decision_basis,
             },
             "medical_risk_score": risk["medical_risk_score"],
@@ -119,6 +201,8 @@ class RiskAssessmentAgent:
             "fraud_risk_score": fraud["fraud_risk_score"],
             "fraud_risk_level": fraud["fraud_risk_level"],
             "fraud_flags": fraud["fraud_flags"],
+            "fraud_notes": fraud.get("fraud_notes", []),
+            "mandatory_review_reasons": mandatory_reasons,
             "pricing_result": pricing,
             "base_premium": pricing["base_premium"],
             "loading_percentage": pricing["loading_percentage"],
@@ -126,6 +210,7 @@ class RiskAssessmentAgent:
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": reasoning,
+            "reasoning_structured": reasoning_structured,
             "reasoning_cache_key": self._last_cache_key,
             "decision_basis": decision_basis,
             "metrics": metrics,
@@ -220,10 +305,31 @@ class RiskAssessmentAgent:
             or submission.get("age")
         )
 
+        structured = enrichment_results.get("structured_facts") or {}
+        vitals = structured.get("vitals") or {}
+
         bmi = self._number(
             applicant_profile.get("bmi")
             or medical.get("bmi")
+            or vitals.get("bmi")
         )
+
+        # Claim records carry dates, amounts and status; the profile only has ids.
+        records = structured.get("claim_records") or []
+        if records and not any(
+            isinstance(c, dict) and (c.get("date") or c.get("claim_date"))
+            for c in claims
+        ):
+            claims = [
+                {
+                    "claim_id": r.get("claim_id"),
+                    "date": r.get("event_date"),
+                    "amount": r.get("approved"),
+                    "status": r.get("status"),
+                    "reason": r.get("reason"),
+                }
+                for r in records
+            ]
 
         sum_insured = self._extract_sum_insured(submission)
 
@@ -236,6 +342,7 @@ class RiskAssessmentAgent:
         return {
             "age": age,
             "bmi": bmi,
+            "structured": structured,
             "conditions": conditions,
             "medications": medications,
             "hospitalizations": hospitalizations,
@@ -447,6 +554,10 @@ class RiskAssessmentAgent:
             risk_factors.append("Age 50 or above")
         elif age >= 40:
             medical_score += 6
+        elif age >= 30:
+            medical_score += 5  # no applicant is zero-risk: age baseline
+        else:
+            medical_score += 3
 
         if bmi >= 30:
             medical_score += 10
@@ -490,16 +601,46 @@ class RiskAssessmentAgent:
 
             for keyword, weight in condition_weights.items():
                 if keyword in text:
-                    medical_score += weight
+                    assessment = (features.get("tier_by_group") or {}).get(
+                        text_group(condition_text)
+                    )
+                    # A controlled, routine condition counts for less; a
+                    # serious one for more.
+                    if assessment and assessment["tier"] == "routine" and assessment["control"] == "controlled":
+                        medical_score += weight * 0.5
+                    else:
+                        medical_score += weight
                     risk_factors.append(
                         "Medical condition requiring assessment: "
                         + condition_text
                     )
+                    if assessment and assessment["tier"] == "serious":
+                        medical_score += 10
+                        risk_factors.append(
+                            f"Serious condition: {assessment['label']} ("
+                            + "; ".join(assessment["reasons"]) + ")"
+                        )
                     matched = True
                     break
 
             if not matched:
                 medical_score += 3
+
+        # Conditions found in the applicant's documents but not declared
+        # still carry their medical risk.
+        for item in features.get("undeclared_conditions") or []:
+            label = item["label"] if isinstance(item, dict) else str(item)
+            tier = item.get("tier", "serious") if isinstance(item, dict) else "serious"
+            lowered = str(label).lower()
+            weight = next(
+                (w for k, w in condition_weights.items() if k in lowered), 3
+            )
+            medical_score += weight * (0.5 if tier == "routine" else 1.0)
+            if tier == "serious":
+                medical_score += 10
+            risk_factors.append(
+                f"Condition found in documents but not declared ({tier}): " + str(label)
+            )
 
         if len(conditions) >= 3:
             medical_score += 8
@@ -539,14 +680,15 @@ class RiskAssessmentAgent:
                 "Multiple recent claims"
             )
 
-        if len(claims) == 0:
+        states = features.get("evidence_states") or {}
+        if len(claims) == 0 and states.get("claims", {}).get("state") == "negative":
             protective_factors.append(
-                "No declared insurance claims"
+                "No claims (stated in the proposal or policy)"
             )
 
-        if len(hospitalizations) == 0:
+        if len(hospitalizations) == 0 and states.get("hospitalizations", {}).get("state") == "negative":
             protective_factors.append(
-                "No declared hospitalization history"
+                "No hospitalization history (stated in the proposal)"
             )
 
         coverage_gap_score = min(
@@ -575,27 +717,21 @@ class RiskAssessmentAgent:
             + (coverage_gap_score * 0.10),
             2,
         )
+        overall = max(overall, 3.0)  # never show a zero overall risk
 
         evidence_domains = {
-            "medical": bool(features["medical_evidence"]),
-            "claims": bool(features["claims_evidence"]),
-            "policy": bool(features["policy_evidence"]),
-            "regulatory": bool(features["regulatory_evidence"]),
-            "underwriting": bool(
-                features["underwriting_evidence"]
-            ),
+            domain: states.get(domain, {}).get("state") != "unknown"
+            for domain in ("medical", "claims", "hospitalizations", "policy", "regulatory")
         }
 
-        evidence_completeness = round(
-            sum(evidence_domains.values())
-            / len(evidence_domains),
-            2,
-        )
+        # Only a known state (positive or explicitly negative) counts; a
+        # failed retrieval is unknown, never "nothing found = nothing there".
+        evidence_completeness = completeness(states) if states else 0.0
 
         missing_domains = [
             domain
-            for domain, available in evidence_domains.items()
-            if not available
+            for domain, known in evidence_domains.items()
+            if not known
         ]
 
         return {
@@ -701,37 +837,35 @@ class RiskAssessmentAgent:
         enrichment_results: dict[str, Any],
         risk: dict[str, Any],
     ) -> float:
-        confidence = 0.55
+        """
+        How well the evidence supports the assessment.
 
-        evidence_count = (
-            len(features["medical_evidence"])
-            + len(features["claims_evidence"])
-            + len(features["policy_evidence"])
-            + len(features["regulatory_evidence"])
-        )
+        Starts from a baseline, adds credit for every evidence area whose
+        state is *known* (documented, or explicitly stated negative), and
+        subtracts for confirmed problems. An unknown area earns no credit
+        but is not punished beyond that; only unknowns that are material to
+        the decision cost extra, so a sound case with a few non-material
+        gaps is not pushed into human review.
+        """
+        states = risk.get("evidence_states") or {}
 
-        if evidence_count >= 2:
-            confidence += 0.10
+        def state(domain: str) -> str:
+            return states.get(domain, {}).get("state", "unknown")
 
-        if evidence_count >= 5:
-            confidence += 0.10
+        confidence = 0.60
 
-        if features["condition_count"] == 0:
+        if state("medical") == "positive":
+            confidence += 0.15
+
+        # A clean declaration is only reassuring if the documents agree.
+        if features["condition_count"] == 0 and not features.get(
+            "undeclared_conditions"
+        ):
             confidence += 0.08
 
-        if features["claim_count"] == 0:
-            confidence += 0.05
-
-        if features["medical_evidence"]:
-            confidence += 0.05
-
-        if features["claims_evidence"]:
-            confidence += 0.05
-
-        if risk["evidence_completeness"] >= 0.75:
-            confidence += 0.07
-        elif risk["evidence_completeness"] < 0.75:
-            confidence -= 0.10
+        for domain in ("claims", "hospitalizations", "policy"):
+            if state(domain) in {"positive", "negative"}:
+                confidence += 0.05
 
         if features["coverage_gaps"]:
             confidence -= 0.10
@@ -739,13 +873,19 @@ class RiskAssessmentAgent:
         if risk["overall_risk_score"] >= 70:
             confidence -= 0.05
 
-        return round(
-            max(
-                0.0,
-                min(confidence, 0.99),
-            ),
-            2,
+        flags = risk.get("fraud_flags") or []
+        needs_review = [f for f in flags if f.get("requires_review")]
+        confidence -= min(0.30, 0.15 * len(needs_review))
+        confidence -= min(
+            0.15, sum(float(f.get("points", 0) or 0) for f in flags) / 400
         )
+
+        material_unknown = [
+            v for v in risk.get("verification_items") or [] if v.get("material")
+        ]
+        confidence -= min(0.10, 0.05 * len(material_unknown))
+
+        return round(max(0.0, min(confidence, 0.95)), 2)
 
     @staticmethod
     def _extract_token_usage(response: Any) -> dict[str, int]:
@@ -829,7 +969,270 @@ class RiskAssessmentAgent:
             "token_source": llm_metrics.get("token_source", "none"),
             "llm_used": bool(llm_metrics.get("llm_used", False)),
             "cache_hit": bool(llm_metrics.get("cache_hit", False)),
+            "llm_status": llm_metrics.get("llm_status", "not used"),
+            "llm_error": llm_metrics.get("llm_error"),
+            "timing": llm_metrics.get("timing") or {},
         }
+
+    @staticmethod
+    def _coverage_notes(
+        features: dict[str, Any],
+        applicant_profile: dict[str, Any],
+        submission: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Check declared / documented conditions and past claims against the
+        existing policy's waiting periods and exclusions (structured policy
+        terms only; nothing is inferred when the schedule can't be read).
+        """
+        from app.services.medical_groups import declared_groups, group_label, text_group
+
+        structured = features.get("structured") or {}
+        policy = structured.get("policy") or {}
+        if not policy:
+            return []
+
+        notes: list[dict[str, Any]] = []
+        today = date.today()
+        inception = policy.get("inception_date")
+        months_in_force = None
+        if inception:
+            y, m, d = (int(x) for x in inception.split("-"))
+            months_in_force = (today.year - y) * 12 + (today.month - m)
+
+        groups = declared_groups(
+            applicant_profile.get("medical_conditions") or [],
+            (structured.get("submission") or {}).get("questionnaire"),
+        )
+        groups |= {d["group"] for d in structured.get("diagnoses", [])}
+
+        # Specific-illness waiting period
+        wait = policy.get("specific_illness_months")
+        for listed in policy.get("specific_illness_conditions") or []:
+            group = text_group(listed)
+            if group and group in groups and wait and months_in_force is not None:
+                satisfied = months_in_force >= wait
+                notes.append(
+                    {
+                        "type": "waiting_period",
+                        "status": "satisfied" if satisfied else "pending",
+                        "detail": (
+                            f"{group_label(group).capitalize()}: the existing policy has a "
+                            f"{wait}-month specific-illness waiting period for '{listed}'; "
+                            f"in force {months_in_force} months (since {inception}) - "
+                            + ("waiting period satisfied." if satisfied else "waiting period not yet complete.")
+                        ),
+                    }
+                )
+
+        # Pre-existing disease period
+        pre = policy.get("pre_existing_months")
+        if pre and months_in_force is not None and months_in_force < pre:
+            notes.append(
+                {
+                    "type": "pre_existing",
+                    "status": "pending",
+                    "detail": f"Pre-existing conditions are covered after {pre} months of continuous cover; {months_in_force} completed.",
+                }
+            )
+
+        # Claims the insurer only partly settled show where exclusions bite.
+        for record in structured.get("claim_records", []):
+            status = str(record.get("status", "")).lower()
+            if "partial" in status:
+                notes.append(
+                    {
+                        "type": "partly_settled_claim",
+                        "status": "info",
+                        "detail": (
+                            f"{record['claim_id']} ({record.get('reason') or 'claim'}) was only "
+                            f"partly settled: {record.get('coverage_applicability') or 'see claim record'}."
+                        ),
+                    }
+                )
+
+        # A higher sum insured than the existing cover.
+        requested = submission.get("sum_insured") or (structured.get("submission") or {}).get("sum_insured")
+        existing = policy.get("sum_insured")
+        if requested and existing and requested > existing:
+            notes.append(
+                {
+                    "type": "sum_insured_increase",
+                    "status": "confirm",
+                    "detail": (
+                        f"Requested sum insured {float(requested):,.0f} is above the existing "
+                        f"{float(existing):,.0f}. Confirm whether the policy's waiting periods "
+                        "apply afresh to the increase."
+                    ),
+                }
+            )
+        return notes
+
+    def _structured_reasoning(
+        self,
+        features: dict[str, Any],
+        risk: dict[str, Any],
+        pricing: dict[str, Any],
+        recommendation: str,
+        confidence: float,
+        narrative: str,
+        decision_basis: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Deterministic, fact-exact breakdown shown next to the LLM narrative.
+
+        Built from the same values the scores were computed from, so it can
+        never contradict them (the narrative is only a short explanation).
+        """
+
+        def names(items: list[Any]) -> list[str]:
+            out = []
+            for item in items:
+                if isinstance(item, dict):
+                    label = (
+                        item.get("condition")
+                        or item.get("name")
+                        or item.get("diagnosis")
+                        or item.get("type")
+                    )
+                    out.append(str(label or item)[:80])
+                else:
+                    out.append(str(item)[:80])
+            return out
+
+        def money(value: Any) -> str:
+            try:
+                return f"INR {float(value):,.0f}"
+            except (TypeError, ValueError):
+                return "-"
+
+        conditions = names(features.get("conditions") or [])
+        medications = names(features.get("medications") or [])
+        hospitalizations = int(features.get("hospitalization_count", 0) or 0)
+        claim_count = int(features.get("claim_count", 0) or 0)
+
+        profile_line = []
+        if features.get("age"):
+            profile_line.append(f"Age {features['age']:g}")
+        if features.get("bmi"):
+            profile_line.append(f"BMI {features['bmi']:g}")
+        medical_points = []
+        if profile_line:
+            medical_points.append(", ".join(profile_line))
+        medical_points.append(
+            f"Conditions ({len(conditions)}): " + ", ".join(conditions)
+            if conditions
+            else "No medical conditions declared."
+        )
+        if medications:
+            medical_points.append(
+                f"Medications ({len(medications)}): " + ", ".join(medications)
+            )
+        if hospitalizations:
+            medical_points.append(f"{hospitalizations} hospitalization(s) on record.")
+        for factor in (risk.get("risk_factors") or [])[:5]:
+            medical_points.append(f"Risk factor: {factor}")
+        for factor in (risk.get("protective_factors") or [])[:3]:
+            medical_points.append(f"Protective: {factor}")
+        for a in risk.get("condition_assessments") or []:
+            line = f"{a['label'].capitalize()}: {a['tier']}"
+            if a.get("control") not in (None, "unknown"):
+                line += f", {a['control']}"
+            if a.get("reasons"):
+                line += " - " + "; ".join(a["reasons"])
+            if a.get("reassuring"):
+                line += ". Reassuring: " + "; ".join(a["reassuring"])
+            if a.get("missing"):
+                line += ". Missing: " + ", ".join(a["missing"])
+            if not a.get("declared"):
+                line += " (not declared)"
+            medical_points.append(line)
+
+        claims_points = []
+        claims_state = (risk.get("evidence_states") or {}).get("claims", {})
+        if not claim_count and claims_state.get("state") == "unknown":
+            claims_points.append(
+                "Claims history unknown: no claims evidence was retrieved. This is not treated as zero claims."
+            )
+        elif claim_count:
+            claims_points.append(f"{claim_count} prior claim(s) identified.")
+            for claim in self._compact(features.get("claims") or [])[:4]:
+                if isinstance(claim, dict):
+                    claims_points.append(
+                        " · ".join(
+                            str(claim[k])
+                            for k in ("claim_id", "date", "type", "reason", "amount", "claim_amount", "status")
+                            if k in claim
+                        )
+                        or str(claim)
+                    )
+        else:
+            claims_points.append("No prior claims (stated).")
+
+        def gap_label(gap: Any) -> str:
+            if not isinstance(gap, dict):
+                return str(gap)
+            text = gap.get("gap") or gap.get("description") or gap.get("reason")
+            if text:
+                return str(text)
+            if gap.get("domain"):
+                return f"No {gap['domain']} evidence available"
+            return str(gap)
+
+        gaps = [gap_label(g) for g in (risk.get("coverage_gaps") or [])]
+        evidence_gaps = [gap_label(g) for g in (risk.get("evidence_gaps") or [])]
+        coverage_points = [
+            f"Coverage gap score {risk.get('coverage_gap_score', 0):g}"
+            + (": " + "; ".join(gaps) if gaps else " - no confirmed coverage gap.")
+        ]
+        if evidence_gaps:
+            coverage_points.append("Evidence gaps: " + "; ".join(evidence_gaps))
+        for note in risk.get("coverage_notes") or []:
+            coverage_points.append(note["detail"])
+        for domain, info in (risk.get("evidence_states") or {}).items():
+            if domain != "regulatory":
+                coverage_points.append(f"Evidence - {domain}: {info['state']} ({info['basis']})")
+        for item in risk.get("verification_items") or []:
+            coverage_points.append(
+                f"{'Verify (material)' if item['material'] else 'Verify'}: {item['action']}"
+            )
+        coverage_points.append(
+            f"Evidence completeness {float(risk.get('evidence_completeness', 0) or 0):.0%}"
+        )
+
+        overall = decision_basis.get("overall_risk", {})
+        rule = decision_basis.get("recommendation", {}).get("rule", "")
+        score_points = [
+            f"Medical {risk.get('medical_risk_score', 0):g} (60%), "
+            f"claims {risk.get('claims_risk_score', 0):g} (30%), "
+            f"coverage {risk.get('coverage_gap_score', 0):g} (10%)",
+            f"Overall {risk.get('overall_risk_score', 0):g} = {overall.get('formula', '')}",
+        ]
+
+        decision_points = [
+            f"Recommendation: {recommendation}" + (f" (rule: {rule})" if rule else ""),
+            f"Base premium {money(pricing.get('base_premium'))}, "
+            f"loading {pricing.get('loading_percentage', 0):g}%, "
+            f"final premium {money(pricing.get('final_premium'))}",
+            f"Confidence {float(confidence):.0%}",
+        ]
+
+        sections = [
+            {"title": "Medical", "points": medical_points},
+            {"title": "Claims", "points": claims_points},
+            {"title": "Coverage & Evidence", "points": coverage_points},
+            {"title": "Scoring", "points": score_points},
+            {"title": "Decision & Pricing", "points": decision_points},
+        ]
+        fraud_flags = risk.get("fraud_flags") or []
+        if fraud_flags:
+            sections.append(
+                {
+                    "title": "Items to verify (fraud indicators)",
+                    "points": [str(f.get("detail", "")) for f in fraud_flags],
+                }
+            )
+        return {"summary": narrative, "sections": sections}
 
     @staticmethod
     def _build_decision_basis(
@@ -972,7 +1375,13 @@ class RiskAssessmentAgent:
             facts = {
                 "age": features.get("age"),
                 "bmi": features.get("bmi"),
-                "smoker": applicant_profile.get("smoker"),
+                "smoker": (
+                    applicant_profile.get("smoker")
+                    if applicant_profile.get("smoker") is not None
+                    else {"smoker": True, "non-smoker": False}.get(
+                        (features.get("structured") or {}).get("smoking")
+                    )
+                ),
                 "alcohol_use": applicant_profile.get("alcohol_use"),
                 "conditions": features.get("conditions", []),
                 "medications": features.get("medications", []),
@@ -981,6 +1390,11 @@ class RiskAssessmentAgent:
                 ),
                 "claim_count": features.get("claim_count", 0),
                 "claims": self._compact(features.get("claims", [])),
+                "evidence_states": {
+                    k: v["state"]
+                    for k, v in (features.get("evidence_states") or {}).items()
+                    if k != "regulatory"
+                },
                 "evidence_counts": {
                     "medical": _count("medical_evidence"),
                     "claims": _count("claims_evidence"),
@@ -1005,6 +1419,7 @@ class RiskAssessmentAgent:
                     "token_source": "none",
                     "llm_used": False,
                     "skipped_reason": "simple_case",
+                    "llm_status": "skipped (simple case)",
                 }
                 note_cache_event(
                     "rationale",
@@ -1042,6 +1457,7 @@ class RiskAssessmentAgent:
                     "token_source": "cache",
                     "llm_used": False,
                     "cache_hit": True,
+                    "llm_status": "cache hit (rationale reused)",
                 }
                 return cached
 
@@ -1079,13 +1495,13 @@ class RiskAssessmentAgent:
             )
 
             prompt = f"""
-You are a medical insurance underwriting assistant. Explain the decision below in at most 180 words, as 4 short labelled sections: Medical Risk, Claims, Coverage and Evidence, Recommendation.
+You are a senior medical underwriter. In 3-4 sentences (at most 90 words, plain prose, no headings or bullets) assess the decision below: name the main risk drivers, what offsets them, and why the recommendation and loading follow from them. A detailed breakdown is shown separately, so do not list every fact.
 
 Rules:
 - Use only the data below. Never add or change conditions, medications, claims, scores, premium or recommendation.
 - State exact age, BMI, conditions, medications and claim_count. Hospitalizations are not claims.
-- claim_count 0 -> say no claims were identified; claim_count > 0 -> never say that.
-- coverage_gap_score 0 -> say no coverage gap was identified.
+- evidence_states tell what is known: if claims is unknown say the claims history is unknown (never that there were no claims); say no claims were identified only if claims is negative; claim_count > 0 -> never say that.
+- If policy is unknown say coverage was not assessed; only say no coverage gap was identified when policy is positive or negative and coverage_gap_score is 0.
 - Use evidence_counts only for evidence availability.
 - Regulatory/underwriting guidance is not applicant medical fact.
 
@@ -1131,9 +1547,12 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 "llm_latency_sec": llm_latency,
                 "token_source": token_source,
                 "llm_used": True,
+                "llm_status": "used",
+                "timing": extract_timing(response),
             }
 
             if not guardrails.validate_output(reasoning).allowed:
+                self._last_llm_metrics["llm_status"] = "rejected (blocked by guardrails)"
                 return self._fallback_reasoning(
                     risk=risk,
                     pricing=pricing,
@@ -1147,6 +1566,7 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 risk=risk,
                 recommendation=recommendation,
             ):
+                self._last_llm_metrics["llm_status"] = "rejected (failed consistency check)"
                 return self._fallback_reasoning(
                     risk=risk,
                     pricing=pricing,
@@ -1184,6 +1604,8 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 "token_source": "none",
                 "llm_used": False,
                 "error": "llm_unavailable",
+                "llm_status": "failed (fallback text used)",
+                "llm_error": str(exc)[:200],
             }
             return fallback
 
@@ -1202,6 +1624,16 @@ RECOMMENDATION: {recommendation}{fraud_line}
             return False
 
         text = reasoning.lower()
+
+        states = risk.get("evidence_states") or {}
+        if states.get("claims", {}).get("state") == "unknown" and re.search(
+            r"no (prior |previous |insurance )?claims|claim[- ]free|no claim history", text
+        ):
+            return False
+        if states.get("policy", {}).get("state") == "unknown" and re.search(
+            r"no coverage gaps?", text
+        ):
+            return False
 
         claim_count = int(
             features.get("claim_count", 0) or 0
@@ -1309,9 +1741,17 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 + "."
             )
 
-        if risk["coverage_gap_score"] == 0:
+        if (risk.get("evidence_states") or {}).get("policy", {}).get("state") == "unknown":
+            parts.append(
+                "Coverage was not assessed (no policy evidence was retrieved)."
+            )
+        elif risk["coverage_gap_score"] == 0:
             parts.append(
                 "No coverage gap was identified."
+            )
+        if (risk.get("evidence_states") or {}).get("claims", {}).get("state") == "unknown":
+            parts.append(
+                "Claims history is unknown (no claims evidence was retrieved); it is not treated as zero claims."
             )
 
         if risk.get("fraud_flags"):
@@ -1386,9 +1826,7 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 or ""
             )
 
-            if period.startswith(
-                ("2024", "2025", "2026")
-            ):
+            if period[:4].isdigit() and int(period[:4]) >= date.today().year - 2:
                 recent_count += 1
 
         return recent_count

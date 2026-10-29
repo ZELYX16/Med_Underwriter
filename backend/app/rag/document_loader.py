@@ -102,6 +102,9 @@ class DocumentLoader:
             )
 
         if extension == ".pdf":
+            structured = self._structured_chunks(path)
+            if structured:
+                return structured
             text = self._load_pdf(path)
         elif extension == ".txt":
             text = self._load_text(path)
@@ -212,10 +215,52 @@ class DocumentLoader:
 
         return documents
 
+    def _structured_chunks(self, path: Path) -> list[dict[str, Any]]:
+        """
+        Section-aware chunks: tables keep their headers on every row and each
+        chunk carries its section. Empty when the layout is not recognised, in
+        which case the plain text path is used.
+        """
+        try:
+            from app.rag.structured import parse_pdf, section_chunks
+
+            doc = parse_pdf(path)
+            if not doc or not doc["sections"]:
+                return []
+            return [
+                {
+                    "text": chunk["text"],
+                    "metadata": {
+                        "source": str(path),
+                        "file_name": path.name,
+                        "file_type": ".pdf",
+                        "chunk_index": index,
+                        "section": chunk["section"],
+                        "doc_title": doc["title"],
+                        "doc_ref": doc["doc_id"],
+                    },
+                }
+                for index, chunk in enumerate(
+                    section_chunks(doc, self.chunk_size)
+                )
+            ]
+        except Exception:
+            return []
+
     def _load_pdf(
         self,
         path: Path,
     ) -> str:
+        # Reviewer-facing text: sections with table rows as "Header: value".
+        try:
+            from app.rag.structured import parse_pdf, render_document
+
+            doc = parse_pdf(path)
+            if doc and doc["sections"]:
+                return render_document(doc)
+        except Exception:
+            pass
+
         reader = PdfReader(str(path))
 
         pages: list[str] = []

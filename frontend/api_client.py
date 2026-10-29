@@ -242,6 +242,16 @@ class APIClient:
             f"/api/case/{case_id}/status",
         )
 
+    def plan_batch(
+        self,
+        case_ids: list[str] | None = None,
+    ) -> Any:
+        return self._request(
+            "POST",
+            "/api/cases/batch/plan",
+            json={"case_ids": case_ids},
+        )
+
     def start_batch(
         self,
         case_ids: list[str],
@@ -269,10 +279,12 @@ class APIClient:
     def start_case(
         self,
         case_id: str,
+        proceed: bool = False,
     ) -> Any:
         return self._request(
             "POST",
             f"/api/case/{case_id}/start",
+            params={"proceed": "true"} if proceed else None,
         )
 
     # ========================================================

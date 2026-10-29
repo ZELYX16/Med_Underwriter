@@ -29,13 +29,15 @@ from app.models.state import (
 
 from app.api.schemas import (
     ApplicantCreate,
+    BatchPlanInput,
     BatchStartInput,
     CaseCreate,
     DocumentUploadResponse,
 )
 from app.cache.pattern_cache import pattern_cache
+from app.config import settings
 from app.orchestrator.graph import run_workflow
-from app.services.batch import plan_groups, run_batch
+from app.services.batch import describe_plan, plan_groups, run_batch
 from app.services.document_service import document_service
 from app.store.state_store import state_store
 from app.security.guardrails import guardrails
@@ -379,6 +381,8 @@ async def _run_case(
             or result.get("require_human_escalation")
             or result.get("human_review_reasons")
             or result.get("business_gate_reasons")
+            or result.get("mandatory_review_reasons")
+            or result.get("security_review_reasons")
         )
         if human_review_required:
             final_status = "awaiting_human_review"
@@ -622,7 +626,51 @@ async def create_case(
         "error": None,
     }
 
-def _prepare_case_for_run(case_id: str) -> dict[str, Any]:
+class AwaitingDocuments(Exception):
+    """Required documents are missing; the case waits instead of running."""
+
+    def __init__(self, missing: list[dict[str, Any]]) -> None:
+        super().__init__("Awaiting documents")
+        self.missing = missing
+
+
+def _document_check(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Which documents are required / missing for this case (None = can't tell)."""
+    try:
+        from app.rag.structured import (
+            applicant_files,
+            build_applicant_facts,
+            document_requirements,
+        )
+
+        profile = state.get("applicant_profile") or {}
+        applicant_id = profile.get("applicant_id") or state.get("applicant_id")
+        if not applicant_id:
+            return None
+        db_paths = [
+            d.get("file_path")
+            for d in state_store.list_applicant_documents(applicant_id)
+            if d.get("file_path")
+        ]
+        paths = applicant_files(
+            applicant_id, settings.synthetic_data_directory, db_paths
+        )
+        if not paths:
+            return None
+        facts = build_applicant_facts(paths)
+        return document_requirements(
+            facts,
+            profile,
+            state.get("submission") or {},
+            age_threshold=settings.doc_medical_age_threshold,
+            sum_insured_threshold=settings.doc_medical_sum_insured_threshold,
+        )
+    except Exception:
+        logger.exception("Document requirement check failed; continuing")
+        return None
+
+
+def _prepare_case_for_run(case_id: str, proceed: bool = False) -> dict[str, Any]:
     """Validate a case and mark it processing; shared by start and batch."""
     state = state_store.get_case(case_id)
 
@@ -657,28 +705,106 @@ def _prepare_case_for_run(case_id: str) -> dict[str, Any]:
     )
 
     if not guardrail_result.allowed:
+        quarantine = guardrails.quarantine_submission(
+            state.get("applicant_profile", {}),
+            state.get("submission", {}),
+        )
+
+        if not quarantine["recoverable"]:
+            state_store.add_workflow_event(
+                case_id=case_id,
+                event_type="security_guardrail",
+                node="guardrails",
+                status="blocked",
+                message="Underwriting request blocked by security guardrails.",
+                data=guardrail_result.to_dict(),
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Underwriting request blocked by security guardrails.",
+                    "risk_level": guardrail_result.risk_level,
+                    "reasons": guardrail_result.reasons,
+                    "checks": guardrail_result.checks,
+                },
+            )
+
+        # Keep the audit record of what was found, then continue on the
+        # clean remainder with mandatory human review.
+        _record_guardrail_result(state, guardrail_result.to_dict())
+        state["applicant_profile"] = quarantine["profile"]
+        state["submission"] = quarantine["submission"]
+        state["quarantined_inputs"] = list(
+            state.get("quarantined_inputs") or []
+        ) + quarantine["items"]
+        state["security_review_reasons"] = list(
+            dict.fromkeys(
+                list(state.get("security_review_reasons") or [])
+                + [
+                    f"'{item['field']}' was excluded from analysis "
+                    f"({'; '.join(item['reasons'])})"
+                    for item in quarantine["items"]
+                ]
+            )
+        )
         state_store.add_workflow_event(
             case_id=case_id,
             event_type="security_guardrail",
             node="guardrails",
-            status="blocked",
-            message="Underwriting request blocked by security guardrails.",
-            data=guardrail_result.to_dict(),
+            status="quarantined",
+            message=(
+                f"{len(quarantine['items'])} input field(s) excluded from "
+                "analysis by security guardrails; human review required."
+            ),
+            data={"items": quarantine["items"]},
         )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Underwriting request blocked by security guardrails.",
-                "risk_level": guardrail_result.risk_level,
-                "reasons": guardrail_result.reasons,
-                "checks": guardrail_result.checks,
-            },
-        )
+        guardrail_result = quarantine["recheck"]
 
     _record_guardrail_result(
         state,
         guardrail_result.to_dict(),
     )
+
+    requirements = _document_check(state)
+    if requirements and requirements["blocking_missing"] and not proceed:
+        state["final_status"] = "awaiting_documents"
+        state["missing_documents"] = (
+            requirements["blocking_missing"] + requirements["non_blocking_missing"]
+        )
+        state["updated_at"] = _now()
+        _save_state(
+            case_id=case_id,
+            state=state,
+            status="awaiting_documents",
+        )
+        state_store.add_workflow_event(
+            case_id=case_id,
+            event_type="documents",
+            node="documents",
+            status="awaiting",
+            message="Waiting for required documents: "
+            + "; ".join(m["document"] for m in requirements["blocking_missing"]),
+            data={"missing": state["missing_documents"]},
+        )
+        raise AwaitingDocuments(requirements["blocking_missing"])
+
+    # A new run decides afresh; within the run the reasons only accumulate.
+    state["mandatory_review_reasons"] = []
+    state["missing_documents"] = (
+        requirements["non_blocking_missing"] if requirements else []
+    )
+    if requirements and requirements["blocking_missing"] and proceed:
+        state["document_override"] = (
+            "Underwriter proceeded without: "
+            + "; ".join(m["document"] for m in requirements["blocking_missing"])
+        )
+        state_store.add_workflow_event(
+            case_id=case_id,
+            event_type="documents",
+            node="documents",
+            status="override",
+            message=state["document_override"],
+        )
 
     state["final_status"] = "processing"
     state["final_decision"] = ""
@@ -701,8 +827,24 @@ def _prepare_case_for_run(case_id: str) -> dict[str, Any]:
 async def start_existing_case(
     case_id: str,
     background_tasks: BackgroundTasks,
+    proceed: bool = False,
 ):
-    state = _prepare_case_for_run(case_id)
+    try:
+        state = await asyncio.to_thread(_prepare_case_for_run, case_id, proceed)
+    except AwaitingDocuments as waiting:
+        return {
+            "success": True,
+            "data": {
+                "case_id": case_id,
+                "status": "awaiting_documents",
+                "missing": waiting.missing,
+                "message": (
+                    "Required documents are missing. Upload them, or start "
+                    "again with proceed=true to underwrite without them."
+                ),
+            },
+            "error": None,
+        }
 
     background_tasks.add_task(
         _run_case,
@@ -726,6 +868,48 @@ async def start_existing_case(
         "error": None,
     }
 
+@router.post("/cases/batch/plan")
+async def plan_batch(body: BatchPlanInput):
+    """Propose groups of similar cases, with reasons, without running anything."""
+    if body.case_ids is None:
+        listed = await asyncio.to_thread(state_store.list_cases, limit=1000)
+        ids = [
+            c["case_id"]
+            for c in listed
+            if str(c.get("status", "")).strip().lower() in {"draft", "pending"}
+        ]
+    else:
+        ids = list(dict.fromkeys(body.case_ids))
+
+    cases: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+    for case_id in ids:
+        state = await asyncio.to_thread(state_store.get_case, case_id)
+        if state is None:
+            skipped[case_id] = "Case not found."
+            continue
+        status = str(state.get("final_status", "")).strip().lower()
+        if status in {
+            "processing",
+            "completed",
+            "awaiting_human_review",
+            "human_review",
+            "escalated",
+        }:
+            skipped[case_id] = f"Already {status}."
+            continue
+        cases[case_id] = state
+
+    return {
+        "success": True,
+        "data": {
+            "groups": describe_plan(cases),
+            "skipped": skipped,
+        },
+        "error": None,
+    }
+
+
 @router.post(
     "/cases/batch",
     status_code=202,
@@ -741,12 +925,36 @@ async def start_batch(
     for case_id in dict.fromkeys(body.case_ids):
         try:
             prepared[case_id] = _prepare_case_for_run(case_id)
+        except AwaitingDocuments as waiting:
+            skipped[case_id] = "Awaiting documents: " + "; ".join(
+                m["document"] for m in waiting.missing
+            )
         except HTTPException as exc:
             skipped[case_id] = (
                 exc.detail if isinstance(exc.detail, str) else "Not eligible."
             )
 
     if prepared:
+        for group in describe_plan(prepared):
+            for case_id in group["case_ids"]:
+                size = len(group["case_ids"])
+                state_store.add_workflow_event(
+                    case_id=case_id,
+                    event_type="batch",
+                    node="batch",
+                    status="grouped" if group["grouped"] else "single",
+                    message=(
+                        f"Run in batch group {group['group_id']} with "
+                        f"{size - 1} other similar case(s): {group['reason']}"
+                        if group["grouped"]
+                        else "Run in a batch, on its own (no similar case in the selection)."
+                    ),
+                    data={
+                        "group_id": group["group_id"],
+                        "case_ids": group["case_ids"],
+                        "shares": group["shares"],
+                    },
+                )
         background_tasks.add_task(run_batch, prepared, _run_case)
 
     return {

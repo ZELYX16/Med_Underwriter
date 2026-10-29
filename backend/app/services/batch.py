@@ -10,8 +10,10 @@ What is NOT shared: applicant evidence, scores, rationale. Every case still
 gets its own workflow run and its own LLM call, so one applicant's data can
 never leak into another's output.
 
-Grouping happens *before* Agent 1 using only the submission: product plus
-the set of recognised condition categories. A group is capped in size and
+Grouping happens *before* Agent 1 using only the declared profile and
+submission: product, recognised condition categories and age band. The plan
+is shown to the underwriter with the reason for each group before anything
+runs. A group is capped in size and
 runs with bounded concurrency (Ollama serves one model well, a few
 parallel requests badly), and cases that don't fit any group run alone.
 """
@@ -26,55 +28,23 @@ from typing import Any, Awaitable, Callable
 from app.agents.agent1_submission import submission_agent
 from app.cache.pattern_cache import cache_scope
 from app.config import settings
+from app.services.similarity import condition_text, describe_group, group_key
 from app.store.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
 
-# Coarse condition categories used only for grouping.
-_CATEGORIES = {
-    "diabet": "metabolic",
-    "thyroid": "metabolic",
-    "hypertens": "cardio",
-    "cardi": "cardio",
-    "coronary": "cardio",
-    "heart": "cardio",
-    "cancer": "oncology",
-    "renal": "renal",
-    "kidney": "renal",
-    "liver": "hepatic",
-    "copd": "respiratory",
-    "asthma": "respiratory",
-    "arthritis": "musculoskeletal",
-    "rheumat": "musculoskeletal",
-}
-
-
-def group_key(
-    applicant_profile: dict[str, Any],
-    submission: dict[str, Any],
-) -> tuple[str, tuple[str, ...]]:
-    product = str(submission.get("product") or "").strip().lower()
-    conditions = applicant_profile.get("medical_conditions") or []
-    categories = {
-        category
-        for condition in conditions
-        for term, category in _CATEGORIES.items()
-        if term in str(condition).lower()
-    }
-    return product, tuple(sorted(categories))
-
-
 def plan_groups(
     cases: dict[str, dict[str, Any]],
 ) -> list[list[str]]:
-    """Group case ids by key, then split groups to the size cap."""
+    """Group case ids by similarity key, then split groups to the size cap."""
     buckets: dict[tuple, list[str]] = defaultdict(list)
     for case_id, state in cases.items():
-        key = group_key(
-            state.get("applicant_profile", {}),
-            state.get("submission", {}),
-        )
-        buckets[key].append(case_id)
+        buckets[
+            group_key(
+                state.get("applicant_profile", {}),
+                state.get("submission", {}),
+            )
+        ].append(case_id)
 
     size = max(1, settings.batch_max_group_size)
     groups: list[list[str]] = []
@@ -82,6 +52,57 @@ def plan_groups(
         for start in range(0, len(ids), size):
             groups.append(ids[start: start + size])
     return groups
+
+
+def describe_plan(
+    cases: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Proposed groups with the reason each was formed, for approval."""
+    plan: list[dict[str, Any]] = []
+    for index, ids in enumerate(plan_groups(cases), start=1):
+        members = []
+        keys = []
+        for case_id in ids:
+            profile = cases[case_id].get("applicant_profile", {})
+            submission = cases[case_id].get("submission", {})
+            keys.append(group_key(profile, submission))
+            members.append(
+                {
+                    "case_id": case_id,
+                    "applicant": profile.get("name")
+                    or profile.get("applicant_id"),
+                    "age": profile.get("age"),
+                    "product": submission.get("product"),
+                    "conditions": [
+                        condition_text(c)
+                        for c in profile.get("medical_conditions") or []
+                    ],
+                }
+            )
+        grouped = len(ids) > 1
+        plan.append(
+            {
+                "group_id": f"G{index}",
+                "case_ids": ids,
+                "cases": members,
+                "grouped": grouped,
+                "reason": (
+                    describe_group(keys)
+                    if grouped
+                    else "No similar case in this selection; runs on its own."
+                ),
+                "shares": (
+                    [
+                        "regulatory lookup",
+                        "underwriting-guidance lookup",
+                        "query embeddings",
+                    ]
+                    if grouped
+                    else []
+                ),
+            }
+        )
+    return plan
 
 
 def _warm_shared_work(state: dict[str, Any]) -> None:
@@ -93,9 +114,10 @@ def _warm_shared_work(state: dict[str, Any]) -> None:
     # Regulatory + guidance land in the pattern cache for the whole group,
     # attributed to the case that triggered the warm-up.
     with cache_scope(state.get("case_id")):
-        submission_agent._retrieve_regulatory(queries["regulatory"])
+        declared = profile.get("medical_conditions") or []
+        submission_agent._retrieve_regulatory(queries["regulatory"], declared)
         submission_agent._retrieve_actuarial_guidance(
-            queries["actuarial"], submission.get("product")
+            queries["actuarial"], submission.get("product"), declared
         )
     vector_store.warm_query_embeddings(list(queries.values()))
 

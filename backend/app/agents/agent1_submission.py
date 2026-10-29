@@ -10,6 +10,7 @@ from app.config import settings
 from app.rag.agentic_rag import agentic_rag
 from app.rag.budget import retrieval_budget
 from app.rag.hybrid_rag import hybrid_rag
+from app.services.similarity import knowledge_key
 from app.rag.medgraph_rag import medgraph_rag
 from app.rag.retriever import retriever
 
@@ -26,7 +27,10 @@ def _knowledge_cache(key: tuple, fetch) -> list[dict[str, Any]]:
     """Cache non-applicant knowledge lookups; failures return [] uncached."""
     now = time.monotonic()
     hit = _KNOWLEDGE_CACHE.get(key)
-    pattern_key = "|".join(str(part) for part in key)
+    pattern_key = "|".join(
+        "+".join(part) if isinstance(part, tuple) else str(part)
+        for part in key
+    )
     if hit and now - hit[0] < _KNOWLEDGE_TTL_SEC:
         pattern_cache.record_hit("knowledge", pattern_key)
         return hit[1]
@@ -237,11 +241,14 @@ class SubmissionIntelligenceAgent:
     def _retrieve_regulatory(
         self,
         query: str,
+        conditions: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
         # Regulatory text is the same for every applicant asking the same
-        # thing, so serve it from a short-lived cache.
+        # thing, so serve it from a cache keyed on condition categories.
         return _knowledge_cache(
-            ("regulatory", query),
+            knowledge_key("regulatory", conditions, None)
+            if conditions is not None
+            else ("regulatory", query),
             lambda: hybrid_rag.search_regulatory(
                 query=query,
                 jurisdiction="India",
@@ -253,6 +260,7 @@ class SubmissionIntelligenceAgent:
         self,
         query: str,
         product: str | None,
+        conditions: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Retrieves underwriting, pricing and actuarial guidance.
@@ -262,7 +270,9 @@ class SubmissionIntelligenceAgent:
         is required.
         """
         return _knowledge_cache(
-            ("actuarial", query, product),
+            knowledge_key("actuarial", conditions, product)
+            if conditions is not None
+            else ("actuarial", query, product),
             lambda: hybrid_rag.search_underwriting(
                 query=query,
                 product=product,
@@ -352,6 +362,39 @@ class SubmissionIntelligenceAgent:
             return []
 
         return results if isinstance(results, list) else []
+
+    @staticmethod
+    def _quarantine_flagged(
+        enrichment: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Remove security-flagged applicant chunks; report what was removed."""
+        removed: dict[str, dict[str, Any]] = {}
+        for key in (
+            "medical_evidence",
+            "claims_evidence",
+            "policy_evidence",
+            "underwriting_submission",
+        ):
+            items = enrichment.get(key)
+            if not isinstance(items, list):
+                continue
+            kept = []
+            for item in items:
+                metadata = item.get("metadata") if isinstance(item, dict) else None
+                flag = (metadata or {}).get("security_flag")
+                if flag:
+                    name = (
+                        (metadata or {}).get("filename")
+                        or (metadata or {}).get("file_name")
+                        or "document"
+                    )
+                    removed.setdefault(
+                        name, {"file": name, "flag": flag, "chunks": 0}
+                    )["chunks"] += 1
+                else:
+                    kept.append(item)
+            enrichment[key] = kept
+        return list(removed.values())
 
     @staticmethod
     def _unique_documents(
@@ -607,15 +650,19 @@ class SubmissionIntelligenceAgent:
             queries["claims"],
         )
 
+        declared = applicant_profile.get("medical_conditions") or []
+
         regulatory_task = asyncio.to_thread(
             self._retrieve_regulatory,
             queries["regulatory"],
+            declared,
         )
 
         actuarial_task = asyncio.to_thread(
             self._retrieve_actuarial_guidance,
             queries["actuarial"],
             submission.get("product"),
+            declared,
         )
 
         # Nothing to look up in the medical knowledge graph when the
@@ -642,6 +689,11 @@ class SubmissionIntelligenceAgent:
             queries["underwriting"],
         )
 
+        structured_task = asyncio.to_thread(
+            self._load_structured_facts,
+            applicant_id,
+        )
+
         (
             medical_evidence,
             claims_evidence,
@@ -650,6 +702,7 @@ class SubmissionIntelligenceAgent:
             medical_knowledge,
             policy_evidence,
             underwriting_submission,
+            structured_facts,
         ) = await asyncio.gather(
             medical_task,
             claims_task,
@@ -658,6 +711,7 @@ class SubmissionIntelligenceAgent:
             medical_knowledge_task,
             policy_task,
             underwriting_task,
+            structured_task,
         )
 
         # Coverage analysis reuses the applicant evidence fetched above
@@ -683,6 +737,97 @@ class SubmissionIntelligenceAgent:
             "medical_knowledge": medical_knowledge,
             "policy_evidence": policy_evidence,
             "underwriting_submission": underwriting_submission,
+            "structured_facts": structured_facts,
+        }
+
+    @staticmethod
+    def _load_structured_facts(applicant_id: str) -> dict[str, Any]:
+        """
+        Read the applicant's PDFs table-aware (diagnoses with ICD codes,
+        vitals, claim records, policy terms, the proposal's declarations).
+        Never raises: no facts just means the text-based checks are used.
+        """
+        try:
+            from app.rag.structured import applicant_files, build_applicant_facts
+            from app.store.state_store import state_store
+
+            db_paths = [
+                d.get("file_path")
+                for d in state_store.list_applicant_documents(applicant_id)
+                if d.get("file_path")
+            ]
+            paths = applicant_files(
+                applicant_id, settings.synthetic_data_directory, db_paths
+            )
+            return build_applicant_facts(paths) if paths else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _summarise_facts(
+        facts: dict[str, Any],
+        applicant_profile: dict[str, Any],
+        submission: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compact, JSON-friendly facts and document requirements for the state."""
+        if not facts or not facts.get("documents"):
+            return {"available": False}
+        from app.rag.structured import document_requirements
+
+        # The table-aware checks only apply when the documents actually
+        # yielded structure (diagnoses, claim records, a policy schedule or a
+        # questionnaire); otherwise the text-based checks are used.
+        has_structure = bool(
+            facts.get("diagnoses")
+            or facts.get("claim_records")
+            or facts.get("policy")
+            or (facts.get("submission") or {}).get("questionnaire")
+        )
+
+        requirements = document_requirements(
+            facts,
+            applicant_profile,
+            submission,
+            age_threshold=settings.doc_medical_age_threshold,
+            sum_insured_threshold=settings.doc_medical_sum_insured_threshold,
+        )
+        sub = facts.get("submission") or {}
+        return {
+            "available": has_structure,
+            "documents": facts["documents"],
+            "unparsed_files": facts.get("unparsed_files", []),
+            "excluded_documents": facts.get("excluded_documents", []),
+            "age_issues": facts.get("age_issues", []),
+            "labs": facts.get("labs", []),
+            "negatives": facts.get("negatives", []),
+            "medications": facts.get("medications", []),
+            "narrative": (facts.get("narrative") or "")[:6000],
+            "diagnoses": facts["diagnoses"],
+            "vitals": facts["vitals"],
+            "smoking": facts["smoking"],
+            "alcohol": facts["alcohol"],
+            "family_history": facts["family_history"],
+            "claim_records": [
+                {
+                    k: c.get(k)
+                    for k in (
+                        "claim_id", "policy_id", "applicant_id", "applicant_name",
+                        "dob", "event_date", "discharge_date", "reason", "status",
+                        "billed", "claimed", "approved", "coverage_applicability",
+                    )
+                }
+                for c in facts["claim_records"]
+            ],
+            "policy": facts["policy"],
+            "submission": {
+                k: sub.get(k)
+                for k in (
+                    "name", "dob", "age", "applicant_id", "sum_insured",
+                    "questionnaire", "supporting_documents", "claim_ids",
+                    "insurance", "remarks",
+                )
+            },
+            "document_requirements": requirements,
         }
 
     async def run(
@@ -722,6 +867,10 @@ class SubmissionIntelligenceAgent:
                 queries=queries,
             )
         retrieval_stats = budget.summary()
+
+        # Chunks flagged at index time (embedded instructions, secrets) are
+        # excluded from analysis; the case is routed to human review.
+        security_quarantine = self._quarantine_flagged(enrichment)
 
         workflow_trace.append(
             {
@@ -870,6 +1019,11 @@ class SubmissionIntelligenceAgent:
         return {
             "agent1_enrichment": {
                 "applicant_id": applicant_id,
+                "structured_facts": self._summarise_facts(
+                    enrichment.get("structured_facts") or {},
+                    applicant_profile,
+                    submission,
+                ),
                 "medical_evidence": medical_evidence,
                 "claims_evidence": claims_evidence,
                 "policy_evidence": policy_evidence,
@@ -915,6 +1069,7 @@ class SubmissionIntelligenceAgent:
             "metrics": metrics,
             "agent1_metrics": metrics,
             "agent1_completed": True,
+            "security_quarantine": security_quarantine,
             "retrieved_at": utc_now(),
         }
 

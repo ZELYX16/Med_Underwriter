@@ -112,13 +112,28 @@ def extract_applicant_profile(
     if not name:
         name = applicant_id
 
-    return {
+    profile: dict[str, Any] = {
         "applicant_id": applicant_id,
         "name": name,
         "date_of_birth": dob,
         "age": age,
         "source": "synthetic_dataset",
     }
+
+    # Optional lifestyle fields; only set when the document states them.
+    smoking = extract_single_line(text, r"Smoking status\s*\n([^\n]+)")
+    if smoking:
+        profile["smoker"] = not re.search(
+            r"\b(non[- ]?smoker|never|no|former|quit)\b",
+            smoking,
+            flags=re.IGNORECASE,
+        )
+
+    bmi_match = re.search(r"\bBMI\b\s*\n?\s*(\d{2}(?:\.\d+)?)", text)
+    if bmi_match:
+        profile["bmi"] = float(bmi_match.group(1))
+
+    return profile
 
 
 # ============================================================
@@ -538,7 +553,7 @@ def extract_submission(
         else 1
     )
 
-    return {
+    submission: dict[str, Any] = {
         "product": product,
         "policy_type": policy_type,
         "sum_insured": sum_insured,
@@ -547,6 +562,17 @@ def extract_submission(
         "jurisdiction": "India",
         "insurer": "DEMO_INSURER",
     }
+
+    # Optional free-text note from the submitter (screened by guardrails).
+    notes = extract_between(
+        text,
+        r"Underwriting note",
+        r"(?:\n\d+\.\s|\Z)",
+    )
+    if notes:
+        submission["notes"] = clean_text(notes)[:1000]
+
+    return submission
 
 
 # ============================================================
@@ -617,6 +643,11 @@ def validate_profile(
 
         if details:
             cleaned["details"] = details
+
+        for extra in ("indication", "duration"):
+            value = clean_text(medication.get(extra))
+            if value:
+                cleaned[extra] = value
 
         valid_medications.append(cleaned)
 
@@ -729,6 +760,66 @@ def build_case_state(
 # SEED ONE APPLICANT
 # ============================================================
 
+def structured_profile(
+    applicant_id: str,
+    pdf_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Profile and submission from the table-aware reader, if it can read it."""
+    try:
+        from app.rag.structured import parse_pdf, submission_facts
+
+        doc = parse_pdf(pdf_path)
+        if not doc or doc["doc_type"] != "underwriting":
+            return None
+        facts = submission_facts(doc)
+    except Exception:
+        return None
+
+    if not facts.get("name") or not (
+        facts["conditions"] or facts["medications"] or facts["hospitalizations"]
+    ):
+        return None
+
+    insurance = (facts["insurance"] or [{}])[0]
+    profile: dict[str, Any] = {
+        "applicant_id": applicant_id,
+        "name": facts["name"],
+        "date_of_birth": facts.get("dob_text") or "",
+        "age": facts.get("age"),
+        "source": "synthetic_dataset",
+        "medical_conditions": facts["conditions"],
+        "medications": facts["medications"],
+        "hospitalizations": facts["hospitalizations"],
+        "claims": [
+            {"claim_id": claim_id, "status": "historical"}
+            for claim_id in facts["claim_ids"]
+        ],
+        "existing_policy": {
+            "policy_id": insurance.get("policy_id", ""),
+            "insurer": insurance.get("insurer", ""),
+            "sum_insured": insurance.get("sum_insured"),
+            "status": insurance.get("status", ""),
+            "claims_declared": insurance.get("claims_declared", ""),
+        },
+    }
+    product = re.sub(r"\s*\(DEMO\)\s*$", "", facts.get("product") or "")
+    submission: dict[str, Any] = {
+        "product": product,
+        "policy_type": facts.get("policy_type") or "",
+        "sum_insured": int(facts["sum_insured"]) if facts.get("sum_insured") else None,
+        "term_years": facts.get("term_years") or 1,
+        "requested_start_date": facts.get("requested_start_date") or "",
+        "jurisdiction": "India",
+        "insurer": "DEMO_INSURER",
+        "add_ons": facts.get("add_ons") or "",
+        "applicant_remarks": facts.get("remarks") or "",
+        "proposal_reference": facts.get("proposal_reference") or "",
+        "questionnaire": facts["questionnaire"],
+        "supporting_documents": facts["supporting_documents"],
+    }
+    return validate_profile(profile), submission
+
+
 def seed_applicant(
     applicant_dir: Path,
 ) -> bool:
@@ -757,14 +848,19 @@ def seed_applicant(
         )
         return False
 
-    profile = build_profile(
-        applicant_id,
-        text,
-    )
+    structured = structured_profile(applicant_id, submission_pdf)
 
-    submission = extract_submission(
-        text
-    )
+    if structured:
+        profile, submission = structured
+    else:
+        profile = build_profile(
+            applicant_id,
+            text,
+        )
+
+        submission = extract_submission(
+            text
+        )
 
     existing = state_store.get_applicant(
         applicant_id

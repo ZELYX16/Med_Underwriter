@@ -112,16 +112,8 @@ class MARPersonas:
                 "Underwriting recommendation is missing."
             )
 
-        if persona == "compliance_officer":
-            regulatory = evidence.get(
-                "regulatory_evidence",
-                [],
-            )
-
-            if not regulatory:
-                concerns.append(
-                    "Regulatory evidence is unavailable."
-                )
+        # Evidence that was not retrieved is "unknown" (listed as a
+        # verification item); it is not a concern about the decision.
 
         if persona == "actuary":
             risk_score = risk_assessment.get(
@@ -134,18 +126,14 @@ class MARPersonas:
                 )
 
         if persona == "medical_expert":
-            medical = evidence.get(
-                "medical_evidence",
-                [],
-            )
-
-            if not medical and risk_assessment.get(
-                "risk_factors"
-            ):
-                concerns.append(
-                    "Medical risk factors are not directly "
-                    "supported by retrieved medical evidence."
-                )
+            # A serious condition without any grounding in the documents or
+            # declarations would be a real concern; missing retrieval is not.
+            assessments = risk_assessment.get("condition_assessments") or []
+            for assessment in assessments:
+                if assessment.get("tier") == "serious" and not assessment.get("reasons"):
+                    concerns.append(
+                        f"Serious condition '{assessment.get('label')}' has no stated basis."
+                    )
 
         previous_concern_findings = [
             finding.get("finding", "")

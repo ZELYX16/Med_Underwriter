@@ -563,5 +563,10 @@ class HealthResponse(BaseModel):
     chromadb: str
 
 
+class BatchPlanInput(BaseModel):
+    # None = every draft/pending case
+    case_ids: list[str] | None = Field(default=None, max_length=100)
+
+
 class BatchStartInput(BaseModel):
     case_ids: list[str] = Field(min_length=1, max_length=100)

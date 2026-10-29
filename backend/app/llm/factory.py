@@ -17,6 +17,7 @@ def get_llm(
     role: LLMRole = "reasoning",
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> Any:
     model = settings.get_model(role)
 
@@ -26,4 +27,5 @@ def get_llm(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        json_mode=json_mode,
     )

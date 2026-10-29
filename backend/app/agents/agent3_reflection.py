@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -118,11 +119,38 @@ class ReflectionAgent:
         if reflection_round > max_rounds:
             reflection_round = max_rounds
 
-        # LLM critique: only where it earns its cost (complex or high-risk).
-        critique: dict[str, Any] | None = None
-        if settings.reflection_llm_enabled and (
+        # LLM critique: only where it earns its cost. It can only add
+        # caution, so it is pointless when the rules already send the case
+        # to a human.
+        preliminary_verdict = self._determine_verdict(
+            mar_result=final_mar,
+            constitutional=constitutional,
+            flag_count=flag_count,
+        )
+        rules_force_review = (
+            flag_count > 0
+            or str(final_mar.get("verdict", "")).strip().lower()
+            in {"fail", "failed"}
+            or preliminary_verdict in {"escalate", "fail"}
+            or (
+                reflection_round >= self.MAX_REFLECTION_ROUNDS
+                and not final_mar.get("consensus", False)
+            )
+        )
+        needs_critique = (
             reflection_type == "full_mar" or complexity_level == "complex"
-        ):
+        )
+        if not settings.reflection_llm_enabled:
+            critique_status = "disabled"
+        elif not needs_critique:
+            critique_status = "not required (simple or standard case)"
+        elif rules_force_review:
+            critique_status = "not needed (rules already require human review)"
+        else:
+            critique_status = "used"
+
+        critique: dict[str, Any] | None = None
+        if critique_status == "used":
             critique = llm_critic.critique(
                 applicant_profile=applicant_profile,
                 risk_assessment=risk_assessment,
@@ -150,11 +178,34 @@ class ReflectionAgent:
                             "source": "llm",
                         }
                     )
-        llm_disagrees = bool(
-            critique
-            and critique.get("ok")
-            and critique["verdict"] == "disagree"
-        )
+        # An LLM "disagree" only blocks when something verifiable backs it;
+        # otherwise it is shown to the reviewer as an advisory note.
+        llm_advisory: list[str] = []
+        llm_disagrees = False
+        if critique and critique.get("ok"):
+            concerns = critique["concerns"]
+            corroborated = self._corroborated(
+                concerns=concerns,
+                rule_findings=[f for f in findings if f.get("source") != "llm"],
+                flag_count=flag_count,
+                risk_assessment=risk_assessment,
+                pricing_result=pricing_result,
+                fraud_flags=risk_result.get("fraud_flags") or [],
+            )
+            if critique["verdict"] == "disagree":
+                if corroborated:
+                    llm_disagrees = True
+                else:
+                    llm_advisory.append(
+                        "LLM critique disagreed with the recommendation but nothing in "
+                        "the rule checks or case data confirms it."
+                    )
+            for concern in concerns:
+                llm_advisory.append(
+                    f"LLM critique ({concern['persona'].replace('_', ' ')}): "
+                    f"{concern['issue']}"
+                    + (f" Suggested: {concern['action']}" if concern.get("action") else "")
+                )
 
         verdict = self._determine_verdict(
             mar_result=final_mar,
@@ -206,6 +257,8 @@ class ReflectionAgent:
         # Rules/personas use no tokens; the LLM critique (complex or
         # high-risk cases only) reports its own usage.
         critique_metrics = critique["metrics"] if critique else {}
+        if critique and not critique.get("ok"):
+            critique_status = "failed (rules only)"
         metrics = {
             "latency_sec": round(time.perf_counter() - started, 4),
             "llm_latency_sec": critique_metrics.get("llm_latency_sec", 0.0),
@@ -214,9 +267,12 @@ class ReflectionAgent:
             "total_tokens": critique_metrics.get("total_tokens", 0),
             "token_source": critique_metrics.get("token_source", "none"),
             "llm_used": bool(critique_metrics.get("llm_used", False)),
+            "llm_status": critique_status,
+            "timing": critique_metrics.get("timing") or {},
         }
         if critique and not critique.get("ok"):
             metrics["error"] = critique.get("error", "critique_failed")
+            metrics["llm_error"] = critique.get("error", "critique_failed")
 
         return {
             "reflection_required": True,
@@ -262,6 +318,7 @@ class ReflectionAgent:
                 {},
             ),
 
+            "llm_advisory_notes": llm_advisory,
             "reflection_verdict": verdict,
             "require_human_review": require_human_review,
             "require_human_escalation": require_human_review,
@@ -287,6 +344,45 @@ class ReflectionAgent:
                 "original_confidence": confidence,
             },
         }
+
+    @staticmethod
+    def _corroborated(
+        concerns: list[dict[str, Any]],
+        rule_findings: list[dict[str, Any]],
+        flag_count: int,
+        risk_assessment: dict[str, Any],
+        pricing_result: dict[str, Any],
+        fraud_flags: list[dict[str, Any]],
+    ) -> bool:
+        """
+        Is the LLM's objection backed by something checkable in code?
+
+        True when a rule check already raised a concern, or when a concern's
+        claim is confirmed by the case data (non-disclosure flags, a
+        loading that contradicts the risk band, claim-record mismatches).
+        """
+        if flag_count > 0 or any(
+            f.get("verdict") not in (None, "pass") for f in rule_findings
+        ):
+            return True
+
+        codes = {f.get("code") for f in fraud_flags}
+        needs_review = any(f.get("requires_review") for f in fraud_flags)
+        overall = float(risk_assessment.get("overall_risk_score", 0) or 0)
+        loading = float(pricing_result.get("loading_percentage", 0) or 0)
+        for concern in concerns:
+            text = f"{concern.get('issue', '')} {concern.get('action', '')}".lower()
+            if re.search(r"undeclared|undisclosed|not declared|non-disclos|disclos", text) and needs_review:
+                return True
+            if re.search(r"loading|premium|pric", text) and (
+                (overall >= 45 and loading == 0) or (overall < 30 and loading >= 20)
+            ):
+                return True
+            if re.search(r"claim", text) and codes & {
+                "claim_record_mismatch", "claim_count_mismatch", "duplicate_claim"
+            }:
+                return True
+        return False
 
     @staticmethod
     def _select_reflection_type(
