@@ -19,6 +19,7 @@ groq
 google-generativeai
 langsmith
 python-dotenv
+pyyaml
 httpx
 aiofiles
 pypdf

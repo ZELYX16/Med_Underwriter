@@ -11,6 +11,8 @@ from app.agents.agent1_submission import submission_agent
 from app.agents.agent2_risk import risk_agent
 from app.agents.agent3_reflection import reflection_agent
 from app.agents.routing.complexity_router import complexity_router
+from app.cache.pattern_cache import cache_scope
+from app.config import settings
 from app.models.state import UnderwritingState
 
 
@@ -40,7 +42,21 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
         or input_tokens + output_tokens
     )
 
+    # Keep the agent's own honesty markers: without token_source,
+    # _ensure_metrics would "estimate" tokens from the whole output payload
+    # (tens of thousands for Agent 1, which makes no LLM call).
+    passthrough = {
+        key: metrics[key]
+        for key in (
+            "token_source", "llm_used", "cache_hit", "retrieval", "error",
+            "skipped_reason", "llm_status", "llm_error", "timing",
+            "evidence_stats",
+        )
+        if key in metrics
+    }
+
     return {
+        **passthrough,
         "agent": agent,
         "latency_sec": round(
             float(metrics.get("latency_sec", metrics.get("duration_sec", 0.0)) or 0.0),
@@ -54,6 +70,41 @@ def _agent_metrics(result: dict[str, Any], agent: str) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _merge_agent_metrics(
+    existing: dict[str, Any] | None,
+    new: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Accumulate an agent's metrics across reflection/rescore rounds instead
+    of letting the latest round overwrite earlier ones.
+    """
+    if not existing:
+        return {**new, "runs": 1}
+
+    merged = dict(new)
+    for key in (
+        "latency_sec",
+        "llm_latency_sec",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "data_input_tokens",
+        "data_output_tokens",
+        "data_total_tokens",
+    ):
+        merged[key] = round(
+            float(existing.get(key, 0) or 0) + float(new.get(key, 0) or 0),
+            4,
+        )
+        if key.endswith("tokens"):
+            merged[key] = int(merged[key])
+    merged["runs"] = int(existing.get("runs", 1) or 1) + 1
+    merged["llm_used"] = bool(
+        existing.get("llm_used") or new.get("llm_used")
+    )
+    return merged
 
 
 def _estimate_tokens(value: Any) -> int:
@@ -71,18 +122,96 @@ def _ensure_metrics(
     input_payload: Any,
     output_payload: Any,
 ) -> dict[str, Any]:
+    """
+    Fill in the per-agent numbers the UI shows.
+
+    Two separate families:
+      data_*  estimated size of what the agent read and produced (every
+              agent, LLM or not; ~4 chars/token), and
+      input_tokens / output_tokens / total_tokens / llm_latency_sec
+              what the model actually used (0 when no LLM call was made).
+    """
     normalized = dict(metrics or {})
+
+    data_in = _estimate_tokens(input_payload)
+    data_out = _estimate_tokens(output_payload)
+    normalized["data_input_tokens"] = data_in
+    normalized["data_output_tokens"] = data_out
+    normalized["data_total_tokens"] = data_in + data_out
+
     total = int(normalized.get("total_tokens", 0) or 0)
-    if total > 0:
+    # An agent that states its token_source (provider / cache / none) has
+    # already reported honestly; only estimate when it said nothing.
+    if total > 0 or normalized.get("token_source"):
         return normalized
 
-    input_tokens = _estimate_tokens(input_payload)
-    output_tokens = _estimate_tokens(output_payload)
-    normalized["input_tokens"] = input_tokens
-    normalized["output_tokens"] = output_tokens
-    normalized["total_tokens"] = input_tokens + output_tokens
+    normalized["input_tokens"] = data_in
+    normalized["output_tokens"] = data_out
+    normalized["total_tokens"] = data_in + data_out
     normalized["token_source"] = "estimated"
     return normalized
+
+
+_EVIDENCE_KEYS = (
+    "medical_evidence",
+    "claims_evidence",
+    "policy_evidence",
+    "regulatory_evidence",
+    "underwriting_submission",
+    "underwriting_knowledge_evidence",
+    "underwriting_evidence",
+    "medical_knowledge",
+)
+
+
+def _chunk_identity(item: Any) -> str:
+    if isinstance(item, dict):
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        text = str(
+            item.get("content") or item.get("text") or item.get("document") or ""
+        )
+        ident = (
+            item.get("chunk_id")
+            or item.get("id")
+            or meta.get("chunk_id")
+            or (
+                f"{item.get('document_id') or meta.get('document_id') or ''}"
+                f"#{meta.get('chunk_index', '')}"
+            )
+        )
+        if ident and ident != "#":
+            return str(ident)
+        return text[:200]
+    return str(item)[:200]
+
+
+def _unique_evidence(result: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    """
+    Each retrieved chunk once, plus how many copies the result carries.
+
+    The Agent 1 result repeats evidence (top-level lists and inside
+    agent1_enrichment), so measuring the whole payload overstates what was
+    actually retrieved.
+    """
+    enrichment = result.get("agent1_enrichment")
+    sources = [result] + ([enrichment] if isinstance(enrichment, dict) else [])
+    unique: dict[str, Any] = {}
+    copies = 0
+    for source in sources:
+        for key in _EVIDENCE_KEYS:
+            items = source.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                copies += 1
+                unique.setdefault(_chunk_identity(item), item)
+    chars = sum(len(str(item)) for item in unique.values())
+    return list(unique.values()), {
+        "unique_chunks": len(unique),
+        "stored_copies": copies,
+        "duplicate_copies": max(0, copies - len(unique)),
+        "unique_chars": chars,
+    }
 
 
 def _workflow_metrics(
@@ -99,11 +228,30 @@ def _workflow_metrics(
         for item in normalized.values()
     )
 
+    def _sum(key: str) -> int:
+        return sum(
+            int(item.get(key, 0) or 0) for item in normalized.values()
+        )
+
+    llm_latency = round(
+        sum(
+            float(item.get("llm_latency_sec", 0) or 0)
+            for item in normalized.values()
+        ),
+        4,
+    )
+
     return {
         "workflow_latency_sec": round(time.perf_counter() - started, 4),
+        "llm_latency_sec": llm_latency,
+        # LLM-only (measured by the model/provider).
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
+        # Everything the agents read and produced (estimated).
+        "data_input_tokens": _sum("data_input_tokens"),
+        "data_output_tokens": _sum("data_output_tokens"),
+        "data_total_tokens": _sum("data_total_tokens"),
         "agents": normalized,
     }
 
@@ -215,16 +363,17 @@ async def agent1_node(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        result = await submission_agent.run(
-            applicant_profile=state.get(
-                "applicant_profile",
-                {},
-            ),
-            submission=state.get(
-                "submission",
-                {},
-            ),
-        )
+        with cache_scope(state.get("case_id")) as cache_trace:
+            result = await submission_agent.run(
+                applicant_profile=state.get(
+                    "applicant_profile",
+                    {},
+                ),
+                submission=state.get(
+                    "submission",
+                    {},
+                ),
+            )
 
         enrichment = result.get(
             "agent1_enrichment",
@@ -239,14 +388,20 @@ async def agent1_node(
                 time.perf_counter() - started,
                 4,
             )
+        unique_evidence, evidence_stats = _unique_evidence(result)
+        agent1_metrics["evidence_stats"] = evidence_stats
         agent1_metrics = _ensure_metrics(
             agent1_metrics,
             {
                 "applicant_profile": state.get("applicant_profile", {}),
                 "submission": state.get("submission", {}),
             },
-            result,
+            # Count each retrieved chunk once; the result stores the same
+            # chunks in several places for the UI.
+            unique_evidence,
         )
+        agent1_metrics["llm_status"] = "not used (retrieval only)"
+        agent1_metrics["cache_events"] = cache_trace.events
 
         underwriting_submission = result.get(
             "underwriting_submission",
@@ -292,6 +447,18 @@ async def agent1_node(
                 [],
             ),
             "agent1_enrichment": enrichment,
+            "security_review_reasons": list(
+                dict.fromkeys(
+                    list(state.get("security_review_reasons") or [])
+                    + [
+                        f"Document '{q['file']}' contains {q['flag'].replace('_', ' ')} "
+                        f"({q['chunks']} chunk(s)); excluded from analysis"
+                        for q in result.get("security_quarantine") or []
+                    ]
+                )
+            ),
+            "quarantined_inputs": list(state.get("quarantined_inputs") or [])
+            + list(result.get("security_quarantine") or []),
             "agent1_metrics": agent1_metrics,
             "agent_metrics": {
                 "agent1": agent1_metrics,
@@ -398,6 +565,7 @@ def complexity_node(
                 "agent1_enrichment",
                 {},
             ),
+            submission=state.get("submission", {}),
         )
 
         complexity_level = result.get(
@@ -426,6 +594,14 @@ def complexity_node(
                 details={
                     "complexity_level": complexity_level,
                     "routing_strategy": routing_strategy,
+                    "complexity_score": result.get(
+                        "complexity_score",
+                        0,
+                    ),
+                    "score_breakdown": result.get(
+                        "score_breakdown",
+                        [],
+                    ),
                     "condition_count": result.get(
                         "condition_count",
                         0,
@@ -488,21 +664,22 @@ def agent2_node(
             ),
         }
 
-        result = risk_agent.run(
-            applicant_profile=state.get(
-                "applicant_profile",
-                {},
-            ),
-            submission=state.get(
-                "submission",
-                {},
-            ),
-            enrichment_results=state.get(
-                "agent1_enrichment",
-                {},
-            ),
-            routing_result=routing_result,
-        )
+        with cache_scope(state.get("case_id")) as cache_trace:
+            result = risk_agent.run(
+                applicant_profile=state.get(
+                    "applicant_profile",
+                    {},
+                ),
+                submission=state.get(
+                    "submission",
+                    {},
+                ),
+                enrichment_results=state.get(
+                    "agent1_enrichment",
+                    {},
+                ),
+                routing_result=routing_result,
+            )
 
         risk_assessment = result.get(
             "risk_assessment",
@@ -517,10 +694,15 @@ def agent2_node(
             {
                 "applicant_profile": state.get("applicant_profile", {}),
                 "submission": state.get("submission", {}),
-                "enrichment": state.get("agent1_enrichment", {}),
+                # Same unique-evidence count as Agent 1's output, so the
+                # hand-off numbers match.
+                "enrichment": _unique_evidence(
+                    state.get("agent1_enrichment", {}) or {}
+                )[0],
             },
             result,
         )
+        agent2_metrics["cache_events"] = cache_trace.events
 
         pricing = result.get(
             "pricing_result",
@@ -573,11 +755,19 @@ def agent2_node(
                 "final_premium",
                 0.0,
             ),
+            "reasoning_cache_key": result.get("reasoning_cache_key"),
+            "fraud_risk_score": result.get("fraud_risk_score", 0.0),
+            "fraud_risk_level": result.get("fraud_risk_level", "low"),
+            "fraud_flags": result.get("fraud_flags", []),
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": result.get(
                 "agent2_reasoning",
                 "",
+            ),
+            "reasoning_structured": result.get(
+                "reasoning_structured",
+                {},
             ),
             "decision_basis": result.get(
                 "decision_basis",
@@ -586,7 +776,10 @@ def agent2_node(
             "agent2_metrics": agent2_metrics,
             "agent_metrics": {
                 **state.get("agent_metrics", {}),
-                "agent2": agent2_metrics,
+                "agent2": _merge_agent_metrics(
+                    state.get("agent_metrics", {}).get("agent2"),
+                    agent2_metrics,
+                ),
             },
             "agent2_completed": True,
             "reflection_requires_rescore": False,
@@ -783,8 +976,13 @@ def reflection_node(
                     "agent2_confidence",
                     0.0,
                 ),
+                "agent2_reasoning": state.get(
+                    "agent2_reasoning",
+                    "",
+                ),
             },
             previous_findings=previous_findings,
+            complexity_level=str(state.get("complexity_level", "")),
         )
 
         agent3_metrics = _agent_metrics(
@@ -951,7 +1149,10 @@ def reflection_node(
             "agent3_metrics": agent3_metrics,
             "agent_metrics": {
                 **state.get("agent_metrics", {}),
-                "agent3": agent3_metrics,
+                "agent3": _merge_agent_metrics(
+                    state.get("agent_metrics", {}).get("agent3"),
+                    agent3_metrics,
+                ),
             },
             "agent3_completed": True,
 
@@ -1057,6 +1258,25 @@ def _business_review_reasons(
         reasons.append(
             f"Agent 2 confidence {confidence:.2f} is below {HUMAN_REVIEW_CONFIDENCE_THRESHOLD:.2f}."
         )
+
+    fraud_score = float(state.get("fraud_risk_score", 0.0) or 0.0)
+    if fraud_score >= settings.fraud_review_threshold:
+        reasons.append(
+            f"Fraud indicators score {fraud_score:.0f} is at or above "
+            f"{settings.fraud_review_threshold:.0f}; verify the flagged items."
+        )
+
+    from app.agents.fraud import MATERIAL_FLAG_CODES
+
+    for flag in state.get("fraud_flags") or []:
+        if isinstance(flag, dict) and flag.get("code") in MATERIAL_FLAG_CODES:
+            reasons.append(
+                "Possible non-disclosure: " + str(flag.get("detail", ""))
+                + " Verify with the applicant."
+            )
+
+    for reason in state.get("security_review_reasons") or []:
+        reasons.append(f"Security review: {reason}")
 
     constitutional_flag = False
     for key, value in state.items():
@@ -1436,4 +1656,3 @@ async def run_workflow(
     }
 
     return result
-

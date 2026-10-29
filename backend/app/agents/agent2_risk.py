@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import time
+from collections import OrderedDict
 from typing import Any
 
 from app.config import settings
+from app.agents.fraud import MATERIAL_FLAG_CODES, assess_fraud
+from app.cache.pattern_cache import note_cache_event, pattern_cache
 from app.llm.factory import get_llm
+from app.llm.timing import extract_timing
+from app.security.guardrails import guardrails
+
+logger = logging.getLogger(__name__)
+
+# fact-set hash -> rationale; lets rescore rounds and repeat cases skip the LLM
+_REASONING_CACHE: "OrderedDict[str, str]" = OrderedDict()
 
 
 class RiskAssessmentAgent:
@@ -18,6 +31,7 @@ class RiskAssessmentAgent:
     def __init__(self) -> None:
         self.llm = None
         self._last_llm_metrics: dict[str, Any] = {}
+        self._last_cache_key: str | None = None
 
     def run(
         self,
@@ -28,6 +42,7 @@ class RiskAssessmentAgent:
     ) -> dict[str, Any]:
         agent_started = time.perf_counter()
         self._last_llm_metrics = {}
+        self._last_cache_key = None
 
         features = self._extract_features(
             applicant_profile,
@@ -35,7 +50,24 @@ class RiskAssessmentAgent:
             enrichment_results,
         )
 
+        # Rule-based fraud indicators: no LLM call, no extra retrieval.
+        # Run first so conditions found in documents but not declared are
+        # counted in the medical risk score.
+        fraud = assess_fraud(
+            applicant_profile,
+            submission,
+            features,
+            high_sum_insured=settings.fraud_high_sum_insured,
+        )
+        features["undeclared_conditions"] = [
+            flag["condition"]
+            for flag in fraud["fraud_flags"]
+            if flag.get("code") == "undeclared_condition"
+            and flag.get("condition")
+        ]
+
         risk = self._calculate_risk(features)
+        risk["fraud_flags"] = fraud["fraud_flags"]
 
         pricing = self._calculate_pricing(
             submission=submission,
@@ -71,6 +103,20 @@ class RiskAssessmentAgent:
             confidence=confidence,
         )
 
+        try:
+            reasoning_structured = self._structured_reasoning(
+                features=features,
+                risk=risk,
+                pricing=pricing,
+                recommendation=recommendation,
+                confidence=confidence,
+                narrative=reasoning,
+                decision_basis=decision_basis,
+            )
+        except Exception as exc:  # the breakdown is display-only
+            logger.warning("Structured reasoning skipped: %s", exc)
+            reasoning_structured = {"summary": reasoning, "sections": []}
+
         metrics = self._build_metrics(
             started=agent_started,
             llm_metrics=getattr(self, "_last_llm_metrics", {}),
@@ -93,6 +139,9 @@ class RiskAssessmentAgent:
             "claims_risk_score": risk["claims_risk_score"],
             "coverage_gap_score": risk["coverage_gap_score"],
             "overall_risk_score": risk["overall_risk_score"],
+            "fraud_risk_score": fraud["fraud_risk_score"],
+            "fraud_risk_level": fraud["fraud_risk_level"],
+            "fraud_flags": fraud["fraud_flags"],
             "pricing_result": pricing,
             "base_premium": pricing["base_premium"],
             "loading_percentage": pricing["loading_percentage"],
@@ -100,6 +149,8 @@ class RiskAssessmentAgent:
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": reasoning,
+            "reasoning_structured": reasoning_structured,
+            "reasoning_cache_key": self._last_cache_key,
             "decision_basis": decision_basis,
             "metrics": metrics,
             "agent2_metrics": metrics,
@@ -420,6 +471,10 @@ class RiskAssessmentAgent:
             risk_factors.append("Age 50 or above")
         elif age >= 40:
             medical_score += 6
+        elif age >= 30:
+            medical_score += 5  # no applicant is zero-risk: age baseline
+        else:
+            medical_score += 3
 
         if bmi >= 30:
             medical_score += 10
@@ -473,6 +528,18 @@ class RiskAssessmentAgent:
 
             if not matched:
                 medical_score += 3
+
+        # Conditions found in the applicant's documents but not declared
+        # still carry their medical risk.
+        for label in features.get("undeclared_conditions") or []:
+            lowered = str(label).lower()
+            weight = next(
+                (w for k, w in condition_weights.items() if k in lowered), 3
+            )
+            medical_score += weight
+            risk_factors.append(
+                "Condition found in documents but not declared: " + str(label)
+            )
 
         if len(conditions) >= 3:
             medical_score += 8
@@ -548,6 +615,7 @@ class RiskAssessmentAgent:
             + (coverage_gap_score * 0.10),
             2,
         )
+        overall = max(overall, 3.0)  # never show a zero overall risk
 
         evidence_domains = {
             "medical": bool(features["medical_evidence"]),
@@ -689,7 +757,10 @@ class RiskAssessmentAgent:
         if evidence_count >= 5:
             confidence += 0.10
 
-        if features["condition_count"] == 0:
+        # Declaring nothing is only reassuring if the documents agree.
+        if features["condition_count"] == 0 and not features.get(
+            "undeclared_conditions"
+        ):
             confidence += 0.08
 
         if features["claim_count"] == 0:
@@ -711,6 +782,13 @@ class RiskAssessmentAgent:
 
         if risk["overall_risk_score"] >= 70:
             confidence -= 0.05
+
+        flags = risk.get("fraud_flags") or []
+        material = [f for f in flags if f.get("code") in MATERIAL_FLAG_CODES]
+        confidence -= min(0.30, 0.15 * len(material))
+        confidence -= min(
+            0.15, sum(float(f.get("points", 0) or 0) for f in flags) / 400
+        )
 
         return round(
             max(
@@ -801,7 +879,150 @@ class RiskAssessmentAgent:
             "total_tokens": total_tokens,
             "token_source": llm_metrics.get("token_source", "none"),
             "llm_used": bool(llm_metrics.get("llm_used", False)),
+            "cache_hit": bool(llm_metrics.get("cache_hit", False)),
+            "llm_status": llm_metrics.get("llm_status", "not used"),
+            "llm_error": llm_metrics.get("llm_error"),
+            "timing": llm_metrics.get("timing") or {},
         }
+
+    def _structured_reasoning(
+        self,
+        features: dict[str, Any],
+        risk: dict[str, Any],
+        pricing: dict[str, Any],
+        recommendation: str,
+        confidence: float,
+        narrative: str,
+        decision_basis: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Deterministic, fact-exact breakdown shown next to the LLM narrative.
+
+        Built from the same values the scores were computed from, so it can
+        never contradict them (the narrative is only a short explanation).
+        """
+
+        def names(items: list[Any]) -> list[str]:
+            out = []
+            for item in items:
+                if isinstance(item, dict):
+                    label = (
+                        item.get("condition")
+                        or item.get("name")
+                        or item.get("diagnosis")
+                        or item.get("type")
+                    )
+                    out.append(str(label or item)[:80])
+                else:
+                    out.append(str(item)[:80])
+            return out
+
+        def money(value: Any) -> str:
+            try:
+                return f"INR {float(value):,.0f}"
+            except (TypeError, ValueError):
+                return "-"
+
+        conditions = names(features.get("conditions") or [])
+        medications = names(features.get("medications") or [])
+        hospitalizations = int(features.get("hospitalization_count", 0) or 0)
+        claim_count = int(features.get("claim_count", 0) or 0)
+
+        profile_line = []
+        if features.get("age"):
+            profile_line.append(f"Age {features['age']:g}")
+        if features.get("bmi"):
+            profile_line.append(f"BMI {features['bmi']:g}")
+        medical_points = []
+        if profile_line:
+            medical_points.append(", ".join(profile_line))
+        medical_points.append(
+            f"Conditions ({len(conditions)}): " + ", ".join(conditions)
+            if conditions
+            else "No medical conditions declared."
+        )
+        if medications:
+            medical_points.append(
+                f"Medications ({len(medications)}): " + ", ".join(medications)
+            )
+        if hospitalizations:
+            medical_points.append(f"{hospitalizations} hospitalization(s) on record.")
+        for factor in (risk.get("risk_factors") or [])[:5]:
+            medical_points.append(f"Risk factor: {factor}")
+        for factor in (risk.get("protective_factors") or [])[:3]:
+            medical_points.append(f"Protective: {factor}")
+
+        claims_points = []
+        if claim_count:
+            claims_points.append(f"{claim_count} prior claim(s) identified.")
+            for claim in self._compact(features.get("claims") or [])[:4]:
+                if isinstance(claim, dict):
+                    claims_points.append(
+                        " · ".join(
+                            str(claim[k])
+                            for k in ("claim_id", "date", "type", "reason", "amount", "claim_amount", "status")
+                            if k in claim
+                        )
+                        or str(claim)
+                    )
+        else:
+            claims_points.append("No prior claims identified.")
+
+        def gap_label(gap: Any) -> str:
+            if not isinstance(gap, dict):
+                return str(gap)
+            text = gap.get("gap") or gap.get("description") or gap.get("reason")
+            if text:
+                return str(text)
+            if gap.get("domain"):
+                return f"No {gap['domain']} evidence available"
+            return str(gap)
+
+        gaps = [gap_label(g) for g in (risk.get("coverage_gaps") or [])]
+        evidence_gaps = [gap_label(g) for g in (risk.get("evidence_gaps") or [])]
+        coverage_points = [
+            f"Coverage gap score {risk.get('coverage_gap_score', 0):g}"
+            + (": " + "; ".join(gaps) if gaps else " - no confirmed coverage gap.")
+        ]
+        if evidence_gaps:
+            coverage_points.append("Evidence gaps: " + "; ".join(evidence_gaps))
+        coverage_points.append(
+            f"Evidence completeness {float(risk.get('evidence_completeness', 0) or 0):.0%}"
+        )
+
+        overall = decision_basis.get("overall_risk", {})
+        rule = decision_basis.get("recommendation", {}).get("rule", "")
+        score_points = [
+            f"Medical {risk.get('medical_risk_score', 0):g} (60%), "
+            f"claims {risk.get('claims_risk_score', 0):g} (30%), "
+            f"coverage {risk.get('coverage_gap_score', 0):g} (10%)",
+            f"Overall {risk.get('overall_risk_score', 0):g} = {overall.get('formula', '')}",
+        ]
+
+        decision_points = [
+            f"Recommendation: {recommendation}" + (f" (rule: {rule})" if rule else ""),
+            f"Base premium {money(pricing.get('base_premium'))}, "
+            f"loading {pricing.get('loading_percentage', 0):g}%, "
+            f"final premium {money(pricing.get('final_premium'))}",
+            f"Confidence {float(confidence):.0%}",
+        ]
+
+        sections = [
+            {"title": "Medical", "points": medical_points},
+            {"title": "Claims", "points": claims_points},
+            {"title": "Coverage & Evidence", "points": coverage_points},
+            {"title": "Scoring", "points": score_points},
+            {"title": "Decision & Pricing", "points": decision_points},
+        ]
+        fraud_flags = risk.get("fraud_flags") or []
+        if fraud_flags:
+            sections.append(
+                {
+                    "title": "Items to verify (fraud indicators)",
+                    "points": [str(f.get("detail", "")) for f in fraud_flags],
+                }
+            )
+        return {"summary": narrative, "sections": sections}
 
     @staticmethod
     def _build_decision_basis(
@@ -873,6 +1094,52 @@ class RiskAssessmentAgent:
             },
         }
 
+    @staticmethod
+    def _compact(value: Any, limit: int = 160) -> Any:
+        """Shrink nested values so the prompt carries facts, not raw chunks."""
+        if isinstance(value, dict):
+            keys = (
+                "name", "condition", "diagnosis", "type", "date",
+                "amount", "claim_amount", "status", "reason", "id",
+                "claim_id",
+            )
+            picked = {k: value[k] for k in keys if k in value}
+            return picked or str(value)[:limit]
+        if isinstance(value, (list, tuple)):
+            return [RiskAssessmentAgent._compact(v, limit) for v in value[:10]]
+        return str(value)[:limit] if isinstance(value, str) else value
+
+    def _reasoning_cache_key(
+        self,
+        facts: dict[str, Any],
+        risk: dict[str, Any],
+        pricing: dict[str, Any],
+        recommendation: str,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "f": facts,
+                "r": {
+                    k: risk.get(k)
+                    for k in (
+                        "fraud_flags",
+                        "medical_risk_score",
+                        "claims_risk_score",
+                        "coverage_gap_score",
+                        "overall_risk_score",
+                        "risk_factors",
+                        "protective_factors",
+                    )
+                },
+                "p": pricing,
+                "rec": recommendation,
+                "v": settings.prompt_version,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _reason(
         self,
         applicant_profile: dict[str, Any],
@@ -887,206 +1154,142 @@ class RiskAssessmentAgent:
         Generate grounded underwriting reasoning.
 
         Deterministic risk, pricing, and recommendation outputs are
-        authoritative. The LLM only explains those outputs.
+        authoritative. The LLM only explains those outputs. Simple cases
+        and repeated fact sets skip the LLM entirely.
         """
         try:
-            if self.llm is None:
-                self.llm = get_llm("reasoning")
+            def _count(key: str) -> int:
+                value = features.get(key)
+                return len(value) if isinstance(value, list) else 0
 
-            authoritative_facts = {
-                "applicant_id": applicant_profile.get(
-                    "applicant_id"
-                ),
+            facts = {
                 "age": features.get("age"),
-                "gender": applicant_profile.get("gender"),
                 "bmi": features.get("bmi"),
                 "smoker": applicant_profile.get("smoker"),
-                "alcohol_use": applicant_profile.get(
-                    "alcohol_use"
+                "alcohol_use": applicant_profile.get("alcohol_use"),
+                "conditions": features.get("conditions", []),
+                "medications": features.get("medications", []),
+                "hospitalizations": self._compact(
+                    features.get("hospitalizations", [])
                 ),
-                "medical_conditions": features.get(
-                    "conditions",
-                    [],
-                ),
-                "medications": features.get(
-                    "medications",
-                    [],
-                ),
-                "hospitalizations": features.get(
-                    "hospitalizations",
-                    [],
-                ),
-                "claims": features.get(
-                    "claims",
-                    [],
-                ),
-                "condition_count": features.get(
-                    "condition_count",
-                    0,
-                ),
-                "medication_count": features.get(
-                    "medication_count",
-                    0,
-                ),
-                "hospitalization_count": features.get(
-                    "hospitalization_count",
-                    0,
-                ),
-                "claim_count": features.get(
-                    "claim_count",
-                    0,
-                ),
+                "claim_count": features.get("claim_count", 0),
+                "claims": self._compact(features.get("claims", [])),
+                "evidence_counts": {
+                    "medical": _count("medical_evidence"),
+                    "claims": _count("claims_evidence"),
+                    "policy": _count("policy_evidence"),
+                    "underwriting": _count("underwriting_evidence"),
+                    "regulatory": _count("regulatory_evidence"),
+                },
             }
 
-            evidence_summary = {
-                "medical_evidence_count": len(
-                    features.get("medical_evidence", [])
-                    if isinstance(
-                        features.get("medical_evidence"),
-                        list,
-                    )
-                    else []
-                ),
-                "claims_evidence_count": len(
-                    features.get("claims_evidence", [])
-                    if isinstance(
-                        features.get("claims_evidence"),
-                        list,
-                    )
-                    else []
-                ),
-                "policy_evidence_count": len(
-                    features.get("policy_evidence", [])
-                    if isinstance(
-                        features.get("policy_evidence"),
-                        list,
-                    )
-                    else []
-                ),
-                "underwriting_evidence_count": len(
-                    features.get(
-                        "underwriting_evidence",
-                        [],
-                    )
-                    if isinstance(
-                        features.get("underwriting_evidence"),
-                        list,
-                    )
-                    else []
-                ),
-                "regulatory_evidence_count": len(
-                    features.get("regulatory_evidence", [])
-                    if isinstance(
-                        features.get("regulatory_evidence"),
-                        list,
-                    )
-                    else []
-                ),
+            # 1. Simple, low-risk cases: deterministic template, no LLM.
+            if (
+                settings.skip_llm_for_simple_cases
+                and routing_result.get("complexity_level") == "simple"
+                and float(risk.get("overall_risk_score", 0) or 0)
+                < settings.skip_llm_risk_ceiling
+            ):
+                self._last_llm_metrics = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "llm_latency_sec": 0.0,
+                    "token_source": "none",
+                    "llm_used": False,
+                    "skipped_reason": "simple_case",
+                    "llm_status": "skipped (simple case)",
+                }
+                note_cache_event(
+                    "rationale",
+                    "",
+                    "skipped",
+                    pattern="simple, low-risk case: deterministic rationale, no LLM or cache needed",
+                )
+                return self._fallback_reasoning(
+                    risk=risk,
+                    pricing=pricing,
+                    recommendation=recommendation,
+                )
+
+            # 2. Same facts + scores already explained: reuse.
+            cache_key = self._reasoning_cache_key(
+                facts, risk, pricing, recommendation
+            )
+            self._last_cache_key = cache_key
+            cached = _REASONING_CACHE.get(cache_key)
+            if cached is None:
+                cached = pattern_cache.get("rationale", cache_key)
+                if isinstance(cached, str) and cached:
+                    _REASONING_CACHE[cache_key] = cached
+                else:
+                    cached = None
+            else:
+                pattern_cache.record_hit("rationale", cache_key)
+            if cached is not None:
+                _REASONING_CACHE.move_to_end(cache_key)
+                self._last_llm_metrics = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "llm_latency_sec": 0.0,
+                    "token_source": "cache",
+                    "llm_used": False,
+                    "cache_hit": True,
+                    "llm_status": "cache hit (rationale reused)",
+                }
+                return cached
+
+            if self.llm is None:
+                self.llm = get_llm(
+                    "reasoning",
+                    max_tokens=settings.reasoning_max_tokens,
+                )
+
+            scores = {
+                k: risk.get(k)
+                for k in (
+                    "medical_risk_score",
+                    "claims_risk_score",
+                    "coverage_gap_score",
+                    "overall_risk_score",
+                )
             }
+            money = {
+                k: pricing.get(k)
+                for k in (
+                    "base_premium",
+                    "loading_percentage",
+                    "final_premium",
+                )
+            }
+
+            fraud_flags = risk.get("fraud_flags") or []
+            fraud_line = (
+                "\nFRAUD INDICATORS (for reviewer attention; state them "
+                "neutrally as items to verify, not as findings): "
+                + "; ".join(f["detail"] for f in fraud_flags[:3])
+                if fraud_flags
+                else ""
+            )
 
             prompt = f"""
-You are a medical insurance underwriting reasoning assistant.
+You are a senior medical underwriter. In 3-4 sentences (at most 90 words, plain prose, no headings or bullets) assess the decision below: name the main risk drivers, what offsets them, and why the recommendation and loading follow from them. A detailed breakdown is shown separately, so do not list every fact.
 
-Generate a concise, factual underwriting rationale from the supplied data.
+Rules:
+- Use only the data below. Never add or change conditions, medications, claims, scores, premium or recommendation.
+- State exact age, BMI, conditions, medications and claim_count. Hospitalizations are not claims.
+- claim_count 0 -> say no claims were identified; claim_count > 0 -> never say that.
+- coverage_gap_score 0 -> say no coverage gap was identified.
+- Use evidence_counts only for evidence availability.
+- Regulatory/underwriting guidance is not applicant medical fact.
 
-AUTHORITATIVE RULES:
-- Applicant profile is authoritative for applicant facts.
-- Retrieved applicant evidence is authoritative for applicant-specific evidence.
-- Deterministic risk, pricing, and recommendation are authoritative.
-- The LLM explains the decision; it must not make a new decision.
-- Use only supplied information.
-- Never invent, infer, estimate, or assume applicant facts.
-- Medical conditions must come only from AUTHORITATIVE APPLICANT FACTS.
-- Medications must come only from AUTHORITATIVE APPLICANT FACTS.
-- Do not use regulatory or underwriting knowledge as applicant medical facts.
-- Do not use general medical knowledge to create diagnoses.
-- Always use the exact supplied age, BMI, medical conditions, and medications.
-- Never replace an exact supplied value with a different value.
-- Do not change any risk score, loading, premium, confidence, or recommendation.
-- Do not infer a claim from a hospitalization.
-- Do not infer a hospitalization from a claim.
-- Do not treat a medical event as a claim unless it is explicitly identified as a claim.
-- Do not introduce unsupported diagnoses, procedures, policy terms, coverage gaps, or regulations.
-- Do not use regulatory evidence as medical-risk evidence.
-- If coverage_gap_score is 0, explicitly state that no coverage gap was identified.
-- If claims evidence count is greater than 0, do not state that claims evidence is absent.
-
-AUTHORITATIVE APPLICANT FACTS:
-{authoritative_facts}
-
-EVIDENCE AVAILABILITY:
-{evidence_summary}
-
-APPLICANT SUBMISSION:
-{submission}
-
-EXTRACTED FEATURES:
-{features}
-
-DETERMINISTIC RISK ASSESSMENT:
-{risk}
-
-DETERMINISTIC PRICING:
-{pricing}
-
-DETERMINISTIC RECOMMENDATION:
-{recommendation}
-
-ROUTING:
-{routing_result}
-
-Write exactly these five sections:
-
-1. Main Medical Risk Factors
-- State the exact applicant age.
-- State the exact BMI when supplied.
-- List only medical conditions from AUTHORITATIVE APPLICANT FACTS.
-- List only medications from AUTHORITATIVE APPLICANT FACTS.
-- Do not replace a specific condition with a broader or different condition.
-- Mention smoking/alcohol status only when supplied.
-- Mention hospitalizations only when explicitly present.
-- Explain how these facts relate to the deterministic medical risk score.
-- Do not introduce any new diagnosis, condition, medication, or medical interpretation.
-
-2. Claims and Utilization
-- State the deterministic claim count exactly when it is greater than zero.
-- Describe claims only when supported by supplied claims data or applicant-specific claims evidence.
-- Describe hospitalizations separately from claims.
-- Do not convert hospitalizations into claims or claims into hospitalizations.
-- If claim count is zero, state that no claims were identified.
-- If claim count is greater than zero, never state that no claims were identified.
-
-3. Protective Factors
-- Mention only protective factors explicitly supported by the supplied data.
-- If none are supported, state that no specific protective factors were identified.
-
-4. Coverage and Evidence
-- State the deterministic coverage_gap_score.
-- If coverage_gap_score is 0, state that no coverage gap was identified.
-- Mention evidence availability only using the supplied evidence counts.
-- Do not call an evidence limitation a coverage gap.
-
-5. Recommendation Rationale
-- State the deterministic recommendation.
-- Explain it using the deterministic overall risk assessment and pricing.
-- Mention the final premium/loading when supplied.
-- Do not modify or reinterpret the deterministic decision.
-
-FINAL VALIDATION:
-- Every medical condition mentioned must appear in AUTHORITATIVE APPLICANT FACTS.
-- Every medication mentioned must appear in AUTHORITATIVE APPLICANT FACTS.
-- Do not add diagnoses.
-- Do not add medications.
-- Claim count must match deterministic claim_count.
-- Claims and hospitalizations must remain separate.
-- If claim_count > 0, never say no claims were identified.
-- If claim_count = 0, never imply claims exist.
-- coverage_gap_score = 0 means no coverage gap was identified.
-- Do not use regulatory or underwriting knowledge as applicant facts.
-- Do not contradict the deterministic risk assessment.
-- Do not modify recommendation, loading, premium, or risk scores.
-
-Return only the underwriting rationale.
+FACTS: {json.dumps(facts, default=str)}
+SCORES: {json.dumps(scores, default=str)}
+RISK FACTORS: {json.dumps(risk.get("risk_factors", [])[:5], default=str)}
+PROTECTIVE FACTORS: {json.dumps(risk.get("protective_factors", [])[:5], default=str)}
+PRICING: {json.dumps(money, default=str)}
+RECOMMENDATION: {recommendation}{fraud_line}
 """.strip()
 
             llm_started = time.perf_counter()
@@ -1096,11 +1299,7 @@ Return only the underwriting rationale.
             usage = self._extract_token_usage(response)
             token_source = "provider" if usage["total_tokens"] > 0 else "estimated"
 
-            content = getattr(
-                response,
-                "content",
-                response,
-            )
+            content = getattr(response, "content", response)
 
             if isinstance(content, list):
                 content = " ".join(
@@ -1127,7 +1326,18 @@ Return only the underwriting rationale.
                 "llm_latency_sec": llm_latency,
                 "token_source": token_source,
                 "llm_used": True,
+                "llm_status": "used",
+                "timing": extract_timing(response),
             }
+
+            if not guardrails.validate_output(reasoning).allowed:
+                self._last_llm_metrics["llm_status"] = "rejected (blocked by guardrails)"
+                return self._fallback_reasoning(
+                    risk=risk,
+                    pricing=pricing,
+                    recommendation=recommendation,
+                    error="LLM output blocked by guardrails.",
+                )
 
             if not self._reasoning_is_consistent(
                 reasoning=reasoning,
@@ -1135,6 +1345,7 @@ Return only the underwriting rationale.
                 risk=risk,
                 recommendation=recommendation,
             ):
+                self._last_llm_metrics["llm_status"] = "rejected (failed consistency check)"
                 return self._fallback_reasoning(
                     risk=risk,
                     pricing=pricing,
@@ -1145,30 +1356,35 @@ Return only the underwriting rationale.
                     ),
                 )
 
+            _REASONING_CACHE[cache_key] = reasoning
+            while len(_REASONING_CACHE) > settings.reasoning_cache_size:
+                _REASONING_CACHE.popitem(last=False)
+
+            # Persist only clean cases; fraud-flagged ones are never reused.
+            if not risk.get("fraud_flags"):
+                pattern_cache.put("rationale", cache_key, reasoning)
+
             return reasoning
 
         except Exception as exc:
+            logger.warning("Agent 2 LLM reasoning failed: %s", exc)
             fallback = self._fallback_reasoning(
                 risk=risk,
                 pricing=pricing,
                 recommendation=recommendation,
                 error=str(exc),
             )
-            input_tokens = self._estimate_tokens(
-                self.llm,
-                locals().get("prompt", ""),
-            )
-            output_tokens = self._estimate_tokens(
-                self.llm,
-                fallback,
-            )
+            # No completed call, so no tokens were consumed.
             self._last_llm_metrics = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
                 "llm_latency_sec": 0.0,
-                "token_source": "estimated",
-                "llm_used": True,
+                "token_source": "none",
+                "llm_used": False,
+                "error": "llm_unavailable",
+                "llm_status": "failed (fallback text used)",
+                "llm_error": str(exc)[:200],
             }
             return fallback
 
@@ -1297,6 +1513,14 @@ Return only the underwriting rationale.
         if risk["coverage_gap_score"] == 0:
             parts.append(
                 "No coverage gap was identified."
+            )
+
+        if risk.get("fraud_flags"):
+            parts.append(
+                "Items to verify (fraud indicators): "
+                + "; ".join(
+                    f["detail"] for f in risk["fraud_flags"][:3]
+                )
             )
 
         parts.append(

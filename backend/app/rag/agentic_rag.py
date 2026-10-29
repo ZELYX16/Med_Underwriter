@@ -85,6 +85,7 @@ class AgenticRAG:
             coverage_evidence, evidence_status = (
                 self._search_coverage_evidence(
                     applicant_id=applicant_id,
+                    prefetched=context.get("prefetched_evidence"),
                 )
             )
 
@@ -316,6 +317,7 @@ class AgenticRAG:
     def _search_coverage_evidence(
         self,
         applicant_id: str,
+        prefetched: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, str],
@@ -380,6 +382,23 @@ class AgenticRAG:
                 source_query,
             ),
         ) in sources.items():
+            # Reuse evidence the caller already retrieved instead of
+            # running the same applicant queries a second time.
+            if prefetched is not None and source_name in prefetched:
+                source_results = prefetched[source_name]
+                source_results = (
+                    source_results
+                    if isinstance(source_results, list)
+                    else []
+                )
+                evidence[source_name] = source_results
+                evidence_status[source_name] = (
+                    "evidence_found"
+                    if source_results
+                    else "no_evidence_retrieved"
+                )
+                continue
+
             try:
                 source_results = method(
                     applicant_id=applicant_id,

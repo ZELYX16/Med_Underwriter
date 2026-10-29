@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
@@ -19,6 +22,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _warm_models() -> None:
+    """Preload Ollama models so the first case doesn't pay the load time."""
+    from app.llm.factory import get_llm
+
+    for role in dict.fromkeys(("reasoning", "reflection")):
+        try:
+            llm = get_llm(role, max_tokens=1)
+            await asyncio.to_thread(llm.invoke, "ok")
+            logger.info("Warmed %s model (%s)", role, settings.get_model(role))
+        except Exception as exc:
+            logger.warning("Model warm-up for %s skipped: %s", role, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
@@ -28,6 +44,15 @@ async def lifespan(app: FastAPI):
     )
 
     state_store.health_check()
+
+    if (
+        settings.secret_key == "development-secret-key"
+        and settings.environment.lower() != "development"
+    ):
+        logger.warning(
+            "SECRET_KEY is still the development default; set a real "
+            "value outside development."
+        )
 
     try:
         vector_health = vector_store.health_check()
@@ -41,7 +66,14 @@ async def lifespan(app: FastAPI):
             exc,
         )
 
+    warm_task = None
+    if settings.llm_provider == "ollama" and settings.warm_llm_on_startup:
+        warm_task = asyncio.create_task(_warm_models())
+
     yield
+
+    if warm_task and not warm_task.done():
+        warm_task.cancel()
 
     logger.info(
         "Shutting down %s",
@@ -73,6 +105,46 @@ app.include_router(
     router,
     prefix="/api",
 )
+
+
+def _error_body(code: str, message: str, retryable: bool) -> dict:
+    return {
+        "success": False,
+        "data": None,
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        },
+    }
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    logger.info("Validation error on %s: %s", request.url.path, exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content=_error_body(
+            "invalid_request",
+            "Some of the submitted information is missing or invalid. "
+            "Please check the form and try again.",
+            False,
+        ),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    # Technical detail is logged; clients only get a stable, safe message.
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=_error_body(
+            "internal_error",
+            "The service hit a temporary problem. Please try again in a moment.",
+            True,
+        ),
+    )
 
 
 @app.get(
