@@ -14,6 +14,11 @@ from app.agents.routing.complexity_router import complexity_router
 from app.cache.pattern_cache import cache_scope
 from app.config import settings
 from app.models.state import UnderwritingState
+from app.observability.langfuse_tracer import (
+    flush_traces,
+    get_langfuse_callback,
+    trace_context,
+)
 
 
 MAX_REFLECTION_ROUNDS = 3
@@ -1668,6 +1673,11 @@ async def run_workflow(
         "case_id",
         "unknown",
     )
+    applicant_id = (
+        initial_state.get("applicant_profile", {}).get("applicant_id")
+        or initial_state.get("applicant_id")
+        or "unknown"
+    )
 
     config = {
         "configurable": {
@@ -1678,21 +1688,33 @@ async def run_workflow(
         }
     }
 
+    langfuse_cb = get_langfuse_callback()
+    if langfuse_cb is not None:
+        config["callbacks"] = [langfuse_cb]
+
     started = time.perf_counter()
     result = dict(initial_state)
 
-    # Stream completed node states so the API can persist progress while
-    # the asynchronous workflow is still running.
-    async for update in workflow.astream(
-        initial_state,
-        config=config,
-        stream_mode="values",
-    ):
-        result = dict(update)
-        if on_update is not None:
-            callback_result = on_update(result)
-            if hasattr(callback_result, "__await__"):
-                await callback_result
+    trace_meta = {
+        "case_id": case_id,
+        "product": initial_state.get("submission", {}).get("product_name", ""),
+    }
+
+    with trace_context(case_id=case_id, applicant_id=applicant_id, metadata=trace_meta):
+        # Stream completed node states so the API can persist progress while
+        # the asynchronous workflow is still running.
+        async for update in workflow.astream(
+            initial_state,
+            config=config,
+            stream_mode="values",
+        ):
+            result = dict(update)
+            if on_update is not None:
+                callback_result = on_update(result)
+                if hasattr(callback_result, "__await__"):
+                    await callback_result
+
+    flush_traces()
 
     agent_metrics = result.get(
         "agent_metrics",

@@ -27,3 +27,4 @@ reportlab
 ragas
 deepeval
 pytest
+langfuse

@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "medunderwrite-ai"
 
+    # Langfuse
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+
     # API / Security
     cors_origins: str = "http://localhost:4200,http://localhost:8501"
     secret_key: str = "development-secret-key"

@@ -41,6 +41,7 @@ from app.services.batch import describe_plan, plan_groups, run_batch
 from app.services.document_service import document_service
 from app.store.state_store import state_store
 from app.security.guardrails import guardrails
+from app.observability.langfuse_tracer import record_score
 
 
 logger = logging.getLogger(__name__)
@@ -1443,6 +1444,7 @@ async def approve_case(
             "reviewer": body.reviewer,
         },
     )
+    record_score(case_id, "human_review_decision", 1.0, comment=body.comments)
 
     return {
         "success": True,
@@ -1555,6 +1557,7 @@ async def override_case(
             "reviewer": body.reviewer,
         },
     )
+    record_score(case_id, "human_review_decision", 0.0, comment=body.comments)
 
     return {
         "success": True,
