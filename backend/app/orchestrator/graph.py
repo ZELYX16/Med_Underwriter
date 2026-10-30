@@ -17,6 +17,7 @@ from app.models.state import UnderwritingState
 from app.observability.langfuse_tracer import (
     flush_traces,
     get_langfuse_callback,
+    observe_span,
     trace_context,
 )
 
@@ -337,6 +338,7 @@ def _append_error(
     return errors
 
 
+@observe_span(name="intake", as_type="span")
 def intake_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -363,6 +365,7 @@ def intake_node(
     }
 
 
+@observe_span(name="agent1_submission", as_type="span")
 async def agent1_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -557,6 +560,7 @@ async def agent1_node(
         }
 
 
+@observe_span(name="complexity_router", as_type="span")
 def complexity_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -650,6 +654,7 @@ def complexity_node(
         }
 
 
+@observe_span(name="agent2_risk", as_type="span")
 def agent2_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -848,6 +853,7 @@ def agent2_node(
         }
 
 
+@observe_span(name="confidence_gate", as_type="span")
 def confidence_gate_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -939,6 +945,7 @@ def confidence_gate_node(
     }
 
 
+@observe_span(name="agent3_reflection", as_type="span")
 def reflection_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1406,6 +1413,7 @@ def post_reflection_router(
     return "finalize"
 
 
+@observe_span(name="human_review", as_type="span")
 def human_review_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1447,6 +1455,7 @@ def human_review_node(
     }
 
 
+@observe_span(name="finalize", as_type="span")
 def finalize_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1664,6 +1673,7 @@ def create_async_graph():
     return workflow
 
 
+@observe_span(name="underwriting_case_pipeline")
 async def run_workflow(
     initial_state: UnderwritingState,
     thread_id: str | None = None,

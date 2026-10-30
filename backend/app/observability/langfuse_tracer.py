@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 from app.config import settings
 
@@ -43,6 +44,26 @@ def get_langfuse_callback() -> Any | None:
     except Exception as exc:
         logger.warning("Langfuse callback initialization failed: %s", exc)
         return None
+
+
+def observe_span(name: str | None = None, as_type: str = "span") -> Callable:
+    """
+    Decorator to wrap async/sync functions as Langfuse trace spans.
+    Falls back gracefully to a no-op if Langfuse is disabled or errors.
+    """
+    def decorator(fn: Callable) -> Callable:
+        if not is_langfuse_enabled():
+            return fn
+
+        try:
+            _init_env()
+            from langfuse import observe
+            return observe(name=name, as_type=as_type)(fn)
+        except Exception as exc:
+            logger.debug("Langfuse observe decorator skipped for %s: %s", name, exc)
+            return fn
+
+    return decorator
 
 
 @contextmanager
@@ -108,6 +129,7 @@ def flush_traces() -> None:
         return
 
     try:
+        _init_env()
         from langfuse import get_client
 
         get_client().flush()
