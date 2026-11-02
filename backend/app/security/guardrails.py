@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from pathlib import Path
 from typing import Any
 
 from app.config import settings
@@ -81,6 +83,25 @@ class Guardrails:
 
     def __init__(self) -> None:
         self.enabled = True
+        self.max_length = 30000
+        self._load_config()
+
+    def _load_config(self) -> None:
+        """Read `enabled` and `max_length` from config/guardrails.yml."""
+        path = Path(__file__).parent / "config" / "guardrails.yml"
+        try:
+            import yaml
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return  # keep the safe defaults
+
+        self.enabled = bool(config.get("enabled", True))
+        self.max_length = int(
+            (config.get("prompt_validation") or {}).get(
+                "max_length", self.max_length
+            )
+        )
 
     def validate_prompt(
         self,
@@ -171,11 +192,11 @@ class Guardrails:
                 "Potential personal identifiers detected and masked."
             )
 
-        if len(prompt) > 30000:
+        if len(prompt) > self.max_length:
             reasons.append("Prompt exceeds the maximum permitted length.")
 
         checks["length"] = {
-            "passed": len(prompt) <= 30000,
+            "passed": len(prompt) <= self.max_length,
             "characters": len(prompt),
         }
 
@@ -185,7 +206,7 @@ class Guardrails:
             injection_matches
             or secret_matches
             or medical_decision_matches
-            or len(prompt) > 30000
+            or len(prompt) > self.max_length
         )
 
         risk_level = self._risk_level(
@@ -307,6 +328,14 @@ class Guardrails:
 
     @staticmethod
     def _normalize(text: str) -> str:
+        # NFKC folds look-alike / full-width characters; zero-width and
+        # control characters are removed so they cannot split a keyword.
+        text = unicodedata.normalize("NFKC", text)
+        text = "".join(
+            ch for ch in text
+            if unicodedata.category(ch) not in {"Cf", "Cc"}
+            or ch in ("\n", "\t", " ")
+        )
         return re.sub(
             r"\s+",
             " ",
@@ -328,6 +357,97 @@ class Guardrails:
                 continue
 
         return matches
+
+    def quarantine_submission(
+        self,
+        applicant_profile: dict[str, Any],
+        submission: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Isolate fields with injected instructions, secrets or forced-decision
+        language instead of rejecting the whole case.
+
+        Scores and the recommendation are computed in code, so such text can't
+        change the decision; it only must not reach prompts or mislead a
+        reviewer. Offending fields are removed from the working copy, kept
+        (redacted) for the audit trail, and the case is routed to human review.
+        recoverable is False when the remainder still fails validation.
+        """
+        profile = dict(applicant_profile)
+        clean_submission = dict(submission)
+        items: list[dict[str, Any]] = []
+        # Structured fields the decision depends on: removing them would
+        # silently understate risk, so tampering there is still a hard block.
+        protected = {
+            "applicant_id", "age", "date_of_birth", "medical_conditions",
+            "medications", "hospitalizations", "claims", "existing_policy",
+            "product", "sum_insured", "term_years",
+        }
+        unrecoverable = False
+
+        for label, source, target in (
+            ("submission", submission, clean_submission),
+            ("profile", applicant_profile, profile),
+        ):
+            for key, value in source.items():
+                if value in (None, "", [], {}):
+                    continue
+                result = self.validate_prompt(str(value))
+                checks = result.checks
+                flagged = [
+                    name
+                    for name in (
+                        "prompt_injection",
+                        "secrets",
+                        "medical_decision_safety",
+                    )
+                    if not (checks.get(name) or {}).get("passed", True)
+                ]
+                if not flagged:
+                    continue
+                if key in protected:
+                    unrecoverable = True
+                    continue
+                items.append(
+                    {
+                        "field": f"{label}.{key}",
+                        "reasons": [r for r in result.reasons],
+                        "checks": flagged,
+                        "excerpt": self._redact(str(value))[:160],
+                    }
+                )
+                target.pop(key, None)
+
+        recheck = self.validate_submission(profile, clean_submission)
+        return {
+            "recoverable": bool(items) and not unrecoverable and recheck.allowed,
+            "profile": profile,
+            "submission": clean_submission,
+            "items": items,
+            "recheck": recheck,
+        }
+
+    def _redact(self, text: str) -> str:
+        for pattern in self.SECRET_PATTERNS:
+            try:
+                text = re.sub(pattern, "[REDACTED]", text)
+            except re.error:
+                continue
+        return self._sanitize(text)
+
+    def scan_document_text(self, text: str) -> list[str]:
+        """
+        Index-time scan of document text (regex only, no runtime cost).
+
+        Returns the kinds of problems found, e.g. embedded instructions
+        aimed at an LLM or credentials, so the chunk can be flagged.
+        """
+        found: list[str] = []
+        if self._find_matches(text, self.INJECTION_PATTERNS):
+            found.append("possible_prompt_injection")
+        if self._find_matches(text, self.SECRET_PATTERNS):
+            found.append("possible_secret")
+        return found
 
     def _find_pii(self, text: str) -> list[str]:
         detected: list[str] = []

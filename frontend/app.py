@@ -26,6 +26,7 @@ from config import settings
 from styles import (
     footer,
     inject_css,
+    metric_card,
     page_header,
     section_title,
     status_badge,
@@ -69,6 +70,21 @@ for key, value in DEFAULTS.items():
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
+
+def show_error(action: str, exc: Exception | None = None) -> None:
+    """
+    Show a friendly, non-technical notice instead of raw exception text.
+    Technical detail goes to the log only.
+    """
+    import logging
+
+    if exc is not None:
+        logging.getLogger("frontend").warning("%s: %s", action, exc)
+    message = getattr(exc, "user_message", None) or (
+        "Something went wrong. Please try again in a moment."
+    )
+    st.warning(f"{action}. {message}")
+
 
 def esc(value: Any) -> str:
     return html.escape(
@@ -610,9 +626,7 @@ def load_cases() -> list[dict[str, Any]]:
             )
         )
     except APIError as exc:
-        st.error(
-            f"Unable to load cases: {exc}"
-        )
+        show_error("Unable to load cases", exc)
         return []
 
 
@@ -656,9 +670,7 @@ def load_case(
             )
             return cached
 
-        st.error(
-            f"Unable to load case: {exc}"
-        )
+        show_error("Unable to load this case", exc)
 
     return None
 
@@ -671,7 +683,7 @@ def load_applicants(
             api.list_applicants(limit=200)
         )
     except APIError as exc:
-        st.error(f"Unable to load applicants: {exc}")
+        show_error("Unable to load applicants", exc)
         return []
 
     if not search:
@@ -725,9 +737,7 @@ def load_applicant(
             )
             return cached
 
-        st.error(
-            f"Unable to load applicant: {exc}"
-        )
+        show_error("Unable to load this applicant", exc)
 
     return None
 
@@ -876,13 +886,16 @@ def run_underwriting(
             for _ in range(180):
                 _time.sleep(1)
 
-                current = normalize_data(
-                    api.get_case(case_id)
-                )
+                # Lightweight status poll; the full case is fetched once
+                # after the loop, not every second.
+                try:
+                    current = normalize_data(
+                        api.get_case_status(case_id)
+                    )
+                except APIError:
+                    continue
                 if not isinstance(current, dict):
                     continue
-
-                st.session_state.case_cache[case_id] = current
 
                 current_status = status_key(
                     current.get("final_status")
@@ -961,11 +974,11 @@ def run_underwriting(
 
     except APIError as exc:
         st.session_state.underwriting_running = False
-        st.error(f"Underwriting failed: {exc}")
+        show_error("Underwriting could not be started", exc)
 
     except Exception as exc:
         st.session_state.underwriting_running = False
-        st.error(f"Unexpected underwriting error: {exc}")
+        show_error("Underwriting could not be completed", exc)
 
 
 # ============================================================
@@ -1176,6 +1189,109 @@ def render_dashboard() -> None:
 # CASE ROW
 # ============================================================
 
+def run_batch_underwriting(case_ids: list[str]) -> None:
+    """Start several cases through the backend batch endpoint and track them."""
+    import time as _time
+
+    if st.session_state.underwriting_running:
+        return
+    st.session_state.underwriting_running = True
+    st.session_state.batch_summary = None
+    batch_started = _time.time()
+
+    terminal = {
+        "completed",
+        "failed",
+        "awaiting-human-review",
+        "human-review",
+        "escalated",
+    }
+
+    try:
+        with st.status("Batch underwriting in progress", expanded=True) as box:
+            response = normalize_data(api.start_batch(case_ids))
+            accepted = (response or {}).get("accepted", []) if isinstance(response, dict) else []
+            skipped = (response or {}).get("skipped", {}) if isinstance(response, dict) else {}
+            groups = (response or {}).get("groups", []) if isinstance(response, dict) else []
+
+            for cid, reason in skipped.items():
+                st.warning(f"{cid} skipped: {reason}")
+            if not accepted:
+                box.update(label="No cases were started", state="error")
+                return
+
+            st.write(
+                f"Started {len(accepted)} case(s) in {len(groups)} group(s) "
+                f"(group sizes: {groups}). Similar cases share retrieval work; "
+                "each case still gets its own scoring and reasoning."
+            )
+
+            overall = st.progress(0.0)
+            table = st.empty()
+            for case_id in accepted:
+                st.session_state.case_cache.pop(case_id, None)
+
+            for _ in range(1800):
+                _time.sleep(2)
+                rows = []
+                done = 0
+                total_progress = 0.0
+                for case_id in accepted:
+                    try:
+                        current = normalize_data(api.get_case_status(case_id))
+                    except APIError:
+                        current = None
+                    if not isinstance(current, dict):
+                        rows.append({"Case": case_id, "Stage": "Unknown", "Status": "-"})
+                        continue
+                    state = status_key(
+                        current.get("final_status")
+                        or current.get("status")
+                        or current.get("processing_status")
+                    )
+                    if state in terminal:
+                        done += 1
+                    total_progress += 1.0 if state in terminal else get_progress(current)
+                    rows.append(
+                        {
+                            "Case": case_id,
+                            "Stage": workflow_stage(current),
+                            "Status": humanize(state),
+                        }
+                    )
+                table.dataframe(rows, use_container_width=True, hide_index=True)
+                overall.progress(min(total_progress / len(accepted), 1.0))
+                if done == len(accepted):
+                    break
+            else:
+                st.warning(
+                    "Some cases are still processing. They keep running in the "
+                    "backend; refresh the case list later."
+                )
+
+            st.session_state.batch_summary = {
+                "done": done,
+                "total": len(accepted),
+                "groups": groups,
+                "seconds": round(_time.time() - batch_started),
+                "case_ids": accepted,
+            }
+            box.update(
+                label=f"Batch finished: {done}/{len(accepted)} case(s) done",
+                state="complete",
+                expanded=False,
+            )
+    except APIError as exc:
+        show_error("start the batch", exc)
+    finally:
+        st.session_state.underwriting_running = False
+        st.session_state.case_cache.clear()
+
+    # Reload the list so finished cases show their real status and action.
+    if st.session_state.get("batch_summary"):
+        st.rerun()
+
+
 def render_case_row(
     case: dict[str, Any],
     key_suffix: str = "cases",
@@ -1303,6 +1419,89 @@ def render_case_row(
 # ALL CASES
 # ============================================================
 
+def render_batch_panel(startable: list[dict[str, Any]]) -> None:
+    """Propose groups of similar draft cases; run only the approved ones."""
+    summary = st.session_state.get("batch_summary")
+    if summary:
+        minutes, seconds = divmod(int(summary.get("seconds", 0)), 60)
+        st.success(
+            f"Last batch: {summary.get('done')}/{summary.get('total')} case(s) "
+            f"finished in {minutes}m {seconds}s across "
+            f"{len(summary.get('groups') or [])} group(s) "
+            f"(sizes {summary.get('groups')}): "
+            + ", ".join(summary.get("case_ids") or [])
+        )
+        if st.button("Dismiss batch summary"):
+            st.session_state.batch_summary = None
+            st.rerun()
+
+    with st.expander(
+        f"Batch underwriting ({len(startable)} draft case(s))",
+        expanded=False,
+    ):
+        st.caption(
+            "Similar cases (same product, condition categories and age band) "
+            "are grouped so they share regulatory and guidance retrieval. "
+            "Each case still gets its own scoring, rationale and review."
+        )
+        if st.button("Suggest groups of similar cases"):
+            try:
+                st.session_state.batch_plan = normalize_data(
+                    api.plan_batch(
+                        [str(case.get("case_id")) for case in startable]
+                    )
+                )
+            except APIError as exc:
+                show_error("build the batch plan", exc)
+
+        plan = st.session_state.get("batch_plan")
+        groups = plan.get("groups", []) if isinstance(plan, dict) else []
+        if not groups:
+            return
+
+        chosen: list[str] = []
+        for group in groups:
+            members = group.get("cases", [])
+            grouped = bool(group.get("grouped"))
+            title = (
+                f"{group.get('group_id')} · {len(members)} similar cases"
+                if grouped
+                else f"{group.get('group_id')} · runs on its own"
+            )
+            with st.container(border=True):
+                if st.checkbox(
+                    title,
+                    value=grouped,
+                    key=f"batch_pick_{group.get('group_id')}",
+                ):
+                    chosen.extend(group.get("case_ids", []))
+                st.caption(f"Why: {group.get('reason', '')}")
+                if group.get("shares"):
+                    st.caption("Shares: " + ", ".join(group["shares"]))
+                st.dataframe(
+                    [
+                        {
+                            "Case": member.get("case_id"),
+                            "Applicant": member.get("applicant"),
+                            "Age": member.get("age"),
+                            "Product": member.get("product"),
+                            "Conditions": ", ".join(member.get("conditions") or []) or "-",
+                        }
+                        for member in members
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        if st.button(
+            f"Run selected groups ({len(chosen)} case(s))",
+            type="primary",
+            disabled=not chosen,
+        ):
+            st.session_state.batch_plan = None
+            run_batch_underwriting(chosen)
+
+
 def render_cases() -> None:
     page_header(
         "All Cases",
@@ -1410,6 +1609,14 @@ def render_cases() -> None:
             "Try a different applicant, case ID, or status filter.",
         )
         return
+
+    startable = [
+        case for case in filtered
+        if status_key(case.get("status") or case.get("processing_status"))
+        in {"draft", "pending"}
+    ]
+    if startable:
+        render_batch_panel(startable)
 
     st.caption(
         f"{len(filtered)} case(s)"
@@ -1610,20 +1817,13 @@ def render_applicant_detail() -> None:
 
     st.divider()
 
-    render_applicant_medical_profile(
-        profile
-    )
-
-    render_treatment_history(
-        profile
-    )
-
-    render_claim_history(
-        profile
-    )
-
-    render_existing_policy(
-        profile
+    applicant_card(
+        {
+            "applicant_profile": profile,
+            "applicant_id": app_id,
+            "source": applicant.get("source") or profile.get("source"),
+            "cases": [],
+        }
     )
 
     render_applicant_cases(
@@ -2200,6 +2400,7 @@ WORKSPACE_SECTIONS = [
     "Agent 3",
     "Decision",
     "Workflow",
+    "Cache",
     "Human Review",
 ]
 
@@ -2321,6 +2522,9 @@ def render_case_workspace() -> None:
     elif section == "Workflow":
         render_workflow_section(case)
 
+    elif section == "Cache":
+        render_case_cache(case)
+
     elif section == "Human Review":
         render_human_review(case)
 
@@ -2428,14 +2632,55 @@ def render_case_action_bar(
 
     elif status == "failed":
 
-        st.error(
-            "The underwriting workflow failed. "
-            "Review the workflow and audit information below."
+        st.warning(
+            "This case could not be fully processed automatically and "
+            "has been flagged for an underwriter to review. Details are "
+            "in the workflow and audit sections below."
         )
+
+
+# The backend reports the last *completed* node. While a case is processing
+# the node that is actually running is the one after it.
+NEXT_NODE = {
+    "": "intake",
+    "intake": "agent1_submission",
+    "agent1_submission": "complexity_router",
+    "complexity_router": "agent2_risk",
+    "agent2_risk": "agent3_reflection",
+    "confidence_gate": "agent3_reflection",
+    "agent3_reflection": "finalize",
+}
+
+RUNNING_NODE_LABELS = {
+    "intake": "Intake",
+    "agent1_submission": "Agent 1 · Submission Intelligence",
+    "complexity_router": "Complexity Router",
+    "agent2_risk": "Agent 2 · Risk Assessment",
+    "agent3_reflection": "Agent 3 · Reflection",
+    "finalize": "Finalization",
+}
+
+
+def running_node(case: dict[str, Any]) -> str | None:
+    """Node currently executing, or None when the case is not processing."""
+    status = status_key(
+        case.get("final_status")
+        or case.get("status")
+        or case.get("processing_status")
+    )
+    if status not in {"processing", "in-progress", "running"}:
+        return None
+    last = str(
+        case.get("current_node") or case.get("current_step") or ""
+    ).strip().lower().replace("-", "_")
+    return NEXT_NODE.get(last)
 
 
 def workflow_stage(case: dict[str, Any]) -> str:
     """Return the backend workflow node for human-readable progress."""
+    running = running_node(case)
+    if running:
+        return RUNNING_NODE_LABELS.get(running, humanize(running))
     for key in ("current_node", "current_agent", "current_step"):
         value = case.get(key)
         if value:
@@ -2460,6 +2705,24 @@ def workflow_stage(case: dict[str, Any]) -> str:
         "failed": "Workflow Failed",
     }
     return mapping.get(status, humanize(status))
+
+
+REVIEW_STATUSES = {"human-review", "review", "awaiting-human-review", "escalated"}
+
+
+def review_pending(case: dict[str, Any]) -> bool:
+    """
+    True only while the case is waiting for a reviewer.
+
+    The backend's computed `review_state` wins; stale status text or old
+    review reasons must never re-open a finished review.
+    """
+    state = case.get("review_state")
+    if state in {"none", "pending", "done"}:
+        return state == "pending"
+    return status_key(
+        case.get("status") or case.get("processing_status")
+    ) in REVIEW_STATUSES
 
 
 def review_reasons(case: dict[str, Any]) -> list[str]:
@@ -2514,6 +2777,16 @@ def get_progress(
             pass
 
     status = status_key(case.get("status") or case.get("processing_status"))
+    running = running_node(case)
+    if running:
+        return {
+            "intake": 0.08,
+            "agent1_submission": 0.20,
+            "complexity_router": 0.38,
+            "agent2_risk": 0.50,
+            "agent3_reflection": 0.78,
+            "finalize": 0.95,
+        }.get(running, 0.5)
     node = str(case.get("current_node") or case.get("current_step") or "").strip().lower().replace("-", "_")
     stage_values = {
         "intake": 0.08,
@@ -2620,6 +2893,11 @@ def render_case_overview(
 
     st.divider()
 
+    render_fraud_panel(case, always=True)
+    render_security_panel(case)
+
+    st.divider()
+
     render_recommendation_summary(
         case
     )
@@ -2634,6 +2912,97 @@ def render_case_overview(
 # ============================================================
 # DECISION SNAPSHOT
 # ============================================================
+
+def render_structured_reasoning(case: dict[str, Any], fallback: Any = "") -> None:
+    """
+    Short assessment first, then a fact-exact breakdown by topic.
+
+    The breakdown is built by the backend from the same values the scores
+    came from; the narrative only explains it. Older cases without the
+    breakdown show the plain text.
+    """
+    structured = case.get("reasoning_structured")
+    sections = structured.get("sections") if isinstance(structured, dict) else None
+    if not sections:
+        if fallback:
+            st.write(fallback)
+        return
+
+    summary = structured.get("summary")
+    if summary:
+        st.markdown("**Assessment**")
+        st.info(str(summary))
+
+    for start in range(0, len(sections), 2):
+        pair = sections[start:start + 2]
+        for column, section in zip(st.columns(len(pair)), pair):
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"**{esc(section.get('title', ''))}**")
+                    for point in section.get("points", []):
+                        st.markdown(f"- {esc(point)}")
+
+
+def render_security_panel(case: dict[str, Any]) -> None:
+    """Inputs the guardrails excluded from analysis (case goes to human review)."""
+    reasons = case.get("security_review_reasons")
+    items = case.get("quarantined_inputs")
+    if not reasons and not items:
+        return
+    with st.container(border=True):
+        st.markdown("**Security review**")
+        st.caption(
+            "These inputs were excluded from scoring and prompts. The case "
+            "continues on the remaining data and requires human review."
+        )
+        for reason in reasons or []:
+            st.markdown(f"- {esc(reason)}")
+        for item in items or []:
+            if isinstance(item, dict) and item.get("excerpt"):
+                st.caption(
+                    f"{item.get('field', 'input')}: {item.get('excerpt')}"
+                )
+
+
+def render_fraud_panel(case: dict[str, Any], always: bool = False) -> None:
+    """
+    Fraud-indicator card shown on every assessed case.
+
+    Flags are leads for the reviewer to verify, never verdicts; they do not
+    decline a case on their own.
+    """
+    if case.get("fraud_risk_level") is None and not case.get("fraud_flags"):
+        return  # not assessed yet
+
+    flags = case.get("fraud_flags")
+    flags = [f for f in flags if isinstance(f, dict)] if isinstance(flags, list) else []
+    level = text(case.get("fraud_risk_level", "low")).title()
+    score = case.get("fraud_risk_score", 0)
+
+    with st.container(border=True):
+        head = st.columns([1.2, 1, 3])
+        with head[0]:
+            st.caption("FRAUD INDICATORS")
+            st.markdown(f"**{level}**")
+        with head[1]:
+            st.caption("SCORE")
+            st.markdown(f"**{text(score)} / 100**")
+        with head[2]:
+            st.caption(
+                "Checked: undeclared conditions or smoking against documents, "
+                "claim frequency, same-month clusters, duplicate claims, "
+                "claims vs sum insured, high cover with heavy history."
+            )
+        if flags:
+            for item in flags:
+                st.markdown(f"- {esc(item.get('detail', ''))}")
+            st.caption(
+                "Indicators to verify, not findings. A high score routes the "
+                "case to human review but never declines it on its own."
+            )
+        else:
+            st.caption("No indicators raised for this case.")
+
 
 def render_decision_snapshot(
     case: dict[str, Any],
@@ -3548,6 +3917,13 @@ def render_agent2_result(
             pricing
         )
 
+    if isinstance(case.get("reasoning_structured"), dict):
+        st.markdown("#### Reasoning")
+        render_structured_reasoning(case)
+
+    render_fraud_panel(case, always=True)
+    render_security_panel(case)
+
 
 # ============================================================
 # AGENT 3 / REFLECTION
@@ -3994,9 +4370,7 @@ def render_decision_details(
             "#### Underwriting Rationale"
         )
 
-        st.write(
-            reasoning
-        )
+        render_structured_reasoning(case, reasoning)
 
     st.divider()
 
@@ -4190,6 +4564,86 @@ def _merge_workflow_metrics(case: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def render_case_cache(case: dict[str, Any]) -> None:
+    section_title(
+        "Cache",
+        "Which stored patterns this case reused, and which earlier case stored them.",
+    )
+    case_id = str(case.get("case_id") or "")
+    if status_key(case.get("status") or case.get("processing_status")) in {"draft", "pending"}:
+        st.info("Cache activity appears after underwriting runs.")
+        return
+    try:
+        data = normalize_data(api.get_case_cache(case_id))
+    except APIError as exc:
+        show_error("load cache details", exc)
+        return
+    if not isinstance(data, dict):
+        st.info("No cache details are available.")
+        return
+
+    summary = data.get("summary") or {}
+    cols = st.columns(4)
+    for col, (label, key) in zip(
+        cols,
+        (("Reused (hit)", "hits"), ("Fresh (miss)", "misses"), ("Newly stored", "stored"), ("Skipped", "skipped")),
+    ):
+        with col:
+            metric_card(label, summary.get(key, 0))
+
+    entries = data.get("entries") or []
+    if not entries:
+        st.info("This case made no cache lookups.")
+    labels = {
+        "hit": "Reused from cache",
+        "miss": "Not cached, computed fresh",
+        "stored": "Stored for future cases",
+        "skipped": "Skipped",
+    }
+    for index, entry in enumerate(entries):
+        outcome = str(entry.get("outcome", ""))
+        agent = humanize(entry.get("agent", ""))
+        kind = "Rationale" if entry.get("namespace") == "rationale" else "Knowledge lookup"
+        with st.container(border=True):
+            st.markdown(f"**{kind}** · {agent} · {labels.get(outcome, humanize(outcome))}")
+            st.caption(text(entry.get("pattern", "")))
+            if outcome != "hit":
+                continue
+            if entry.get("reuse_count"):
+                st.caption(f"Reused {entry['reuse_count']} time(s) in total")
+            source = entry.get("source")
+            source_id = entry.get("source_case_id")
+            if source_id == case_id:
+                st.caption("Stored earlier by this same case (rescore or re-run).")
+            elif isinstance(source, dict) and source.get("exists"):
+                st.write(
+                    f"Matched case **{esc(source['case_id'])}**"
+                    + (f" · {esc(source.get('applicant') or '')}" if source.get("applicant") else "")
+                    + (f" · {esc(source.get('product') or '')}" if source.get("product") else "")
+                )
+                if st.button(
+                    "Open matched case",
+                    key=f"open_cache_source_{index}_{source['case_id']}",
+                ):
+                    open_case(str(source["case_id"]), "Cache")
+            elif source_id:
+                st.caption(f"Stored by case {source_id}, which no longer exists.")
+            else:
+                st.caption("Source case not recorded (entry predates tracking or came from a batch warm-up).")
+
+    totals = data.get("cache_totals") or {}
+    if totals:
+        st.markdown("##### Stored patterns overall")
+        st.dataframe(
+            [
+                {"Type": humanize(ns), "Entries": v.get("entries", 0), "Total reuses": v.get("hits", 0)}
+                for ns, v in totals.items()
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
 def render_workflow_section(
     case: dict[str, Any],
 ) -> None:
@@ -4197,6 +4651,19 @@ def render_workflow_section(
         "Workflow",
         "Execution trace and persisted underwriting events.",
     )
+    events = load_events(
+        str(
+            case.get(
+                "case_id",
+                "",
+            )
+        )
+    )
+    for event in events or []:
+        if isinstance(event, dict) and event.get("event_type") == "batch":
+            st.info(f"Batch: {event.get('message', '')}")
+            break
+
     metrics = _merge_workflow_metrics(case)
     workflow_metrics(metrics)
     trace = case.get(
@@ -4214,15 +4681,6 @@ def render_workflow_section(
         workflow_timeline(
             trace
         )
-
-    events = load_events(
-        str(
-            case.get(
-                "case_id",
-                "",
-            )
-        )
-    )
 
     if events:
 
@@ -4300,10 +4758,16 @@ def render_human_review(
     )
 
     status = status_key(case.get("status") or case.get("processing_status"))
-    review_statuses = {"human-review", "review", "awaiting-human-review", "escalated"}
-    reasons = review_reasons(case)
+    pending = review_pending(case)
+    reasons = review_reasons(case) if pending else []
 
-    if status in review_statuses:
+    if case.get("review_state") == "done":
+        st.success(
+            "Human review completed"
+            + (f" by {esc(case.get('human_reviewed_by'))}" if case.get("human_reviewed_by") else "")
+            + "."
+        )
+    elif pending:
         st.warning("HUMAN REVIEW REQUIRED — finalization is blocked until a reviewer records an action.")
         if reasons:
             st.markdown("**Review reasons**")
@@ -4354,6 +4818,10 @@ def render_human_review(
         st.markdown("#### Key Risk Factors")
         risk_factors(factors)
 
+    if case.get("fraud_flags"):
+        st.divider()
+        render_fraud_panel(case)
+
     evidence = case.get("evidence")
     if isinstance(evidence, dict) and evidence:
         st.divider()
@@ -4380,7 +4848,7 @@ def render_human_review(
         st.markdown("#### Review History")
         review_summary(reviews)
 
-    if status not in review_statuses:
+    if not pending:
         return
 
     st.divider()
@@ -4408,7 +4876,7 @@ def render_human_review(
         st.session_state.workspace_section = "Overview"
         st.rerun()
     except APIError as exc:
-        st.error(f"Unable to record review decision: {exc}")
+        show_error("Unable to record the review decision", exc)
 
 
 # ============================================================
@@ -4426,16 +4894,7 @@ def render_review_queue() -> None:
     review_cases = [
         case
         for case in cases
-        if status_key(
-            case.get("status")
-            or case.get("processing_status")
-        )
-        in {
-            "human-review",
-            "review",
-            "awaiting-human-review",
-            "escalated",
-        }
+        if review_pending(case)
     ]
 
     if not review_cases:
@@ -4541,9 +5000,7 @@ def render_system_status() -> None:
 
     except APIError as exc:
 
-        st.error(
-            f"Backend unavailable: {exc}"
-        )
+        show_error("Some live data is unavailable right now", exc)
 
     st.divider()
 

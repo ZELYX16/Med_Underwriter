@@ -20,8 +20,8 @@ SUPPORTED_EXTENSIONS = {
 class DocumentLoader:
     def __init__(
         self,
-        chunk_size: int = 1200,
-        chunk_overlap: int = 200,
+        chunk_size: int = 800,
+        chunk_overlap: int = 120,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError(
@@ -40,6 +40,7 @@ class DocumentLoader:
 
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self._splitter = self._build_splitter()
 
     def load_full_text(
         self,
@@ -296,6 +297,30 @@ class DocumentLoader:
 
         return "\n".join(rows)
 
+    def _build_splitter(self):
+        """
+        LangChain's recursive splitter breaks on paragraph, line, sentence
+        and word boundaries (in that order) instead of slicing mid-word.
+        Falls back to the window slicer below if it is not installed.
+        """
+        try:
+            from langchain_text_splitters import (
+                RecursiveCharacterTextSplitter,
+            )
+        except ImportError:
+            try:
+                from langchain.text_splitter import (
+                    RecursiveCharacterTextSplitter,
+                )
+            except ImportError:
+                return None
+
+        return RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
+        )
+
     def _chunk_text(
         self,
         text: str,
@@ -307,6 +332,13 @@ class DocumentLoader:
 
         if len(text) <= self.chunk_size:
             return [text]
+
+        if self._splitter is not None:
+            return [
+                chunk.strip()
+                for chunk in self._splitter.split_text(text)
+                if chunk.strip()
+            ]
 
         chunks: list[str] = []
 

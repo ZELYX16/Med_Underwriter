@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import settings
 from app.rag.document_loader import document_loader
+from app.security.guardrails import guardrails
 from app.store.vector_store import vector_store
 
 
@@ -143,6 +144,9 @@ class DocumentIndexer:
                     "storage_path": str(file_path),
                     "chunk_index": index,
                 }
+                flags = guardrails.scan_document_text(text)
+                if flags:
+                    metadata["security_flag"] = ",".join(flags)
 
                 documents.append(text)
                 metadatas.append(metadata)

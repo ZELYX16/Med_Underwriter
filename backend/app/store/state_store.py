@@ -8,14 +8,93 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.config import settings
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _norm(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def derive_review_state(status: Any, state: dict[str, Any]) -> str:
+    """
+    Single source of truth for the human-review UI: none | pending | done.
+
+    A finished review (approved / overridden and completed) always wins, so
+    stale review reasons or flags in the stored state can never re-open it.
+    """
+    review = _norm(state.get("human_review_status"))
+    final = _norm(state.get("final_status"))
+    row = _norm(status)
+
+    if review in {"approved", "overridden"} and "completed" in {final, row}:
+        return "done"
+
+    if (
+        final in {"awaiting-human-review", "human-review", "escalated"}
+        or row in {"awaiting-human-review", "human-review", "escalated"}
+        or review in {"awaiting-review", "escalated"}
+    ):
+        return "pending"
+
+    return "none"
+
+
+# Evidence payloads that are stored once at the top level (or as
+# document-level review evidence); the copies inside agent1_enrichment and
+# the working-memory scratchpad are dropped before persisting.
+_ENRICHMENT_DUPLICATES = {
+    "medical_evidence",
+    "claims_evidence",
+    "policy_evidence",
+    "underwriting_submission",
+    "regulatory_evidence",
+    "actuarial_guidance",
+    "underwriting_knowledge_evidence",
+    "medical_knowledge",
+    "medical_review_evidence",
+    "claims_review_evidence",
+    "policy_review_evidence",
+    "underwriting_review_evidence",
+    "scratchpad",
+}
+_STATE_DUPLICATES = {"scratchpad", "actuarial_guidance", "underwriting_submission"}
+
+
+def slim_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Drop duplicated evidence so each save/read moves far less JSON."""
+    slim = {k: v for k, v in state.items() if k not in _STATE_DUPLICATES}
+    enrichment = slim.get("agent1_enrichment")
+    if isinstance(enrichment, dict):
+        slim["agent1_enrichment"] = {
+            k: v
+            for k, v in enrichment.items()
+            if k not in _ENRICHMENT_DUPLICATES
+        }
+    return slim
+
+
+def _case_view(
+    row_status: Any,
+    state: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay computed fields; the DB status column stays authoritative."""
+    if row_status is not None:
+        result["status"] = row_status
+    result["review_state"] = derive_review_state(row_status, state)
+    if result["review_state"] != "pending":
+        result["require_human_review"] = False
+        result["require_human_escalation"] = False
+    return result
+
+
 class StateStore:
-    def __init__(self, db_path: str | Path = "data/medunderwrite.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = Path(db_path or settings.sqlite_file).resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -422,6 +501,7 @@ class StateStore:
         case_id: str,
         state: dict[str, Any],
         status: str | None = None,
+        return_case: bool = True,
     ) -> dict[str, Any] | None:
         now = _now()
 
@@ -436,7 +516,7 @@ class StateStore:
                         WHERE case_id = ?
                         """,
                         (
-                            self._json(state),
+                            self._json(slim_state(state)),
                             now,
                             case_id,
                         ),
@@ -451,14 +531,14 @@ class StateStore:
                         WHERE case_id = ?
                         """,
                         (
-                            self._json(state),
+                            self._json(slim_state(state)),
                             status,
                             now,
                             case_id,
                         ),
                     )
 
-        return self.get_case(case_id)
+        return self.get_case(case_id) if return_case else None
 
     def get_case(
         self,
@@ -478,6 +558,7 @@ class StateStore:
             return None
 
         result = dict(row)
+        row_status = result.get("status")
 
         state = self._from_json(
             result.pop("state_json", "{}"),
@@ -492,7 +573,57 @@ class StateStore:
             or state.get("applicant_id")
         )
 
-        return result
+        return _case_view(row_status, state, result)
+
+    def get_case_status(self, case_id: str) -> dict[str, Any] | None:
+        """
+        Small status payload for polling. Uses SQLite JSON extraction so the
+        full (large) state document is never loaded or parsed.
+        """
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT status,
+                           updated_at,
+                           json_extract(state_json, '$.final_status') AS final_status,
+                           json_extract(state_json, '$.human_review_status') AS human_review_status,
+                           json_extract(state_json, '$.workflow_trace[#-1].node') AS current_node
+                    FROM underwriting_cases
+                    WHERE case_id = ?
+                    """,
+                    (case_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            full = self.get_case(case_id)
+            if full is None:
+                return None
+            trace = full.get("workflow_trace") or []
+            row = {
+                "status": full.get("status"),
+                "updated_at": full.get("updated_at"),
+                "final_status": full.get("final_status"),
+                "human_review_status": full.get("human_review_status"),
+                "current_node": (
+                    trace[-1].get("node")
+                    if trace and isinstance(trace[-1], dict)
+                    else None
+                ),
+            }
+
+        if row is None:
+            return None
+
+        data = dict(row)
+        data["case_id"] = case_id
+        data["review_state"] = derive_review_state(
+            data.get("status"),
+            {
+                "human_review_status": data.get("human_review_status"),
+                "final_status": data.get("final_status"),
+            },
+        )
+        return data
 
     def list_cases(
         self,
@@ -534,6 +665,7 @@ class StateStore:
 
         for row in rows:
             raw = dict(row)
+            row_status = raw.get("status")
 
             state = self._from_json(
                 raw.pop("state_json", "{}"),
@@ -542,7 +674,7 @@ class StateStore:
 
             raw.update(state)
 
-            results.append(raw)
+            results.append(_case_view(row_status, state, raw))
 
         return results
 

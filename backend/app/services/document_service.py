@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -8,8 +10,12 @@ from fastapi import UploadFile
 
 from app.config import settings
 from app.rag.document_loader import document_loader
+from app.security.guardrails import guardrails
 from app.store.state_store import state_store
 from app.store.vector_store import vector_store
+
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentService:
@@ -77,6 +83,9 @@ class DocumentService:
         filename = Path(
             upload.filename or ""
         ).name.strip()
+        # Keep only safe characters so the name can't escape the folder or
+        # smuggle odd characters into paths and logs.
+        filename = re.sub(r"[^\w.\- ]", "_", filename).strip(" .")
 
         if not filename:
             raise ValueError(
@@ -358,6 +367,15 @@ class DocumentService:
                 "filename": filename,
                 "chunk_index": index,
             }
+            flags = guardrails.scan_document_text(text)
+            if flags:
+                metadata["security_flag"] = ",".join(flags)
+                logger.warning(
+                    "Document %s chunk %s flagged: %s",
+                    filename,
+                    index,
+                    metadata["security_flag"],
+                )
 
             chunk_id = (
                 f"{applicant_id}:"
@@ -495,6 +513,12 @@ class DocumentService:
         if not content:
             raise ValueError(
                 "Uploaded file is empty."
+            )
+
+        limit = int(settings.max_upload_mb) * 1024 * 1024
+        if len(content) > limit:
+            raise ValueError(
+                f"File is too large (limit {settings.max_upload_mb} MB)."
             )
 
         destination.write_bytes(

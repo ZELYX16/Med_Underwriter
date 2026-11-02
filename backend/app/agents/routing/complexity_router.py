@@ -26,66 +26,159 @@ class ComplexityRouter:
         self,
         applicant_profile: dict[str, Any],
         enrichment_results: dict[str, Any],
+        submission: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """
+        Weighted complexity score over explainable signals.
+
+        score 0            -> simple   (deterministic rationale, no LLM)
+        score < threshold  -> standard
+        score >= threshold -> complex  (tree-of-thought, LLM critique)
+
+        Hard rules still force "complex": any high-risk condition keyword,
+        conflicting evidence, or three or more declared conditions,
+        regardless of the score.
+        """
+        from app.config import settings
+
+        submission = submission or {}
         conditions = self._extract_conditions(
             applicant_profile,
             enrichment_results,
         )
-
         condition_count = len(conditions)
+        red_flags = self._find_red_flags(conditions)
+        conflicting = self._has_conflicting_evidence(enrichment_results)
 
-        red_flags = self._find_red_flags(
-            conditions
+        breakdown: list[dict[str, Any]] = []
+
+        def add(signal: str, points: int, detail: str) -> None:
+            if points:
+                breakdown.append(
+                    {"signal": signal, "points": points, "detail": detail}
+                )
+
+        add(
+            "conditions",
+            min(condition_count, 4),
+            f"{condition_count} medical condition(s) identified",
+        )
+        add(
+            "high_risk_indicators",
+            min(3 * len(red_flags), 6),
+            f"High-risk indicator(s): {', '.join(red_flags)}",
+        )
+        add("conflicting_evidence", 2 if conflicting else 0, "Conflicting evidence")
+
+        medical = applicant_profile.get("medical")
+        medical = medical if isinstance(medical, dict) else {}
+
+        claims = self._count(
+            applicant_profile.get("claims") or submission.get("claims")
+        )
+        add(
+            "claims",
+            2 if claims >= 4 else 1 if claims >= 2 else 0,
+            f"{claims} prior claim(s)",
         )
 
-        reasons: list[str] = []
+        hospitalizations = self._count(
+            applicant_profile.get("hospitalizations")
+            or medical.get("hospitalizations")
+        )
+        add(
+            "hospitalizations",
+            2 if hospitalizations >= 3 else 1 if hospitalizations else 0,
+            f"{hospitalizations} hospitalization(s)",
+        )
 
-        if condition_count <= 2:
-            complexity_level = "standard"
-            routing_strategy = "plan_and_execute"
+        medications = self._count(
+            applicant_profile.get("medications") or medical.get("medications")
+        )
+        add(
+            "medications",
+            2 if medications >= 5 else 1 if medications >= 3 else 0,
+            f"{medications} current medication(s)",
+        )
 
-            if condition_count == 0:
-                reasons.append(
-                    "No active medical conditions identified."
-                )
-            else:
-                reasons.append(
-                    f"{condition_count} medical condition(s) identified."
-                )
+        age = self._number(applicant_profile.get("age") or submission.get("age"))
+        add(
+            "age",
+            2 if age >= 65 else 1 if age >= 50 else 0,
+            f"Age {age:g}",
+        )
 
-        else:
-            complexity_level = "complex"
-            routing_strategy = "tree_of_thought"
-            reasons.append(
-                f"{condition_count} medical conditions identified."
-            )
+        bmi = self._number(applicant_profile.get("bmi") or medical.get("bmi"))
+        add(
+            "bmi",
+            1 if bmi and (bmi >= 35 or bmi < 17) else 0,
+            f"BMI {bmi:g}",
+        )
 
-        if red_flags:
-            complexity_level = "complex"
-            routing_strategy = "tree_of_thought"
-            reasons.append(
-                "High-risk medical indicators require "
-                "deeper reasoning."
-            )
+        smoker = applicant_profile.get("smoker")
+        add(
+            "smoker",
+            1 if smoker in (True, "True", "true", "yes", "Yes", 1) else 0,
+            "Declared smoker",
+        )
 
-        if self._has_conflicting_evidence(
-            enrichment_results
+        sum_insured = self._number(
+            submission.get("sum_insured")
+            or submission.get("requested_sum_insured")
+        )
+        add(
+            "sum_insured",
+            1 if sum_insured >= 2_500_000 and condition_count else 0,
+            f"High sum insured ({sum_insured:,.0f}) with medical history",
+        )
+
+        score = sum(item["points"] for item in breakdown)
+        threshold = max(1, int(settings.router_complex_threshold))
+
+        if (
+            red_flags
+            or conflicting
+            or condition_count >= 3
+            or score >= threshold
         ):
             complexity_level = "complex"
             routing_strategy = "tree_of_thought"
-            reasons.append(
-                "Conflicting evidence requires "
-                "additional analysis."
-            )
+        elif score == 0:
+            complexity_level = "simple"
+            routing_strategy = "plan_and_execute"
+        else:
+            complexity_level = "standard"
+            routing_strategy = "plan_and_execute"
+
+        reasons = [
+            f"{item['detail']} (+{item['points']})" for item in breakdown
+        ] or ["No complexity signals found (score 0)."]
+        reasons.append(
+            f"Complexity score {score} (complex at {threshold}+): "
+            f"{complexity_level}."
+        )
 
         return {
             "complexity_level": complexity_level,
             "complexity_reasons": reasons,
             "routing_strategy": routing_strategy,
+            "complexity_score": score,
+            "score_breakdown": breakdown,
             "condition_count": condition_count,
             "conditions": conditions,
             "red_flags": red_flags,
         }
+
+    @staticmethod
+    def _count(value: Any) -> int:
+        return len(value) if isinstance(value, (list, tuple)) else 0
+
+    @staticmethod
+    def _number(value: Any) -> float:
+        try:
+            return float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return 0.0
 
     def _extract_conditions(
         self,

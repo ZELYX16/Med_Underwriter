@@ -66,6 +66,7 @@ class UnderwritingState(TypedDict, total=False):
     agent2_recommendation: str
     agent2_confidence: float
     agent2_reasoning: str
+    reasoning_structured: dict[str, Any]
     agent2_completed: bool
 
     # ------------------------------------------------------------------
@@ -100,6 +101,12 @@ class UnderwritingState(TypedDict, total=False):
     business_gate_reasons: list[str]
 
     human_review_reason: str
+    reasoning_cache_key: str | None
+    fraud_risk_score: float
+    fraud_risk_level: str
+    fraud_flags: list[dict[str, Any]]
+    security_review_reasons: list[str]
+    quarantined_inputs: list[dict[str, Any]]
     human_review_status: str
     human_reviewed_by: str
     human_review_comments: str

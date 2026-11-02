@@ -2,13 +2,49 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 import requests
 
 from config import settings
 
+logger = logging.getLogger(__name__)
+
 
 class APIError(RuntimeError):
-    """Raised when the backend request fails."""
+    """
+    Raised when the backend request fails.
+
+    `str(exc)` keeps the technical detail for logs. UI code should show
+    `exc.user_message`, which never contains raw exception text.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        user_message: str | None = None,
+        status_code: int | None = None,
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.user_message = user_message or (
+            "Something went wrong while contacting the underwriting "
+            "service. Please try again in a moment."
+        )
+
+
+def _friendly_detail(payload: Any) -> str | None:
+    """Return the backend's user-safe message, if it supplied one."""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        detail = payload.get("detail")
+        if isinstance(detail, str) and len(detail) < 200:
+            return detail
+    return None
 
 
 class APIClient:
@@ -34,8 +70,14 @@ class APIClient:
                 **kwargs,
             )
         except requests.RequestException as exc:
+            logger.warning("Backend unreachable: %s", exc)
             raise APIError(
-                f"Unable to connect to backend: {exc}"
+                f"Unable to connect to backend: {exc}",
+                user_message=(
+                    "The underwriting service is temporarily "
+                    "unavailable. Your data is safe - please retry "
+                    "in a moment."
+                ),
             ) from exc
 
         if not response.ok:
@@ -44,9 +86,29 @@ class APIClient:
             except ValueError:
                 detail = response.text
 
+            logger.warning(
+                "Backend %s returned %s: %s",
+                path,
+                response.status_code,
+                detail,
+            )
+
+            code = response.status_code
+            if code == 404:
+                user_message = "The requested record could not be found."
+            elif code in (400, 409, 422):
+                user_message = _friendly_detail(detail) or (
+                    "That action could not be completed in the "
+                    "case's current state."
+                )
+            else:
+                user_message = None
+
             raise APIError(
-                f"Backend returned "
-                f"{response.status_code}: {detail}"
+                f"Backend returned {code}: {detail}",
+                user_message=user_message,
+                status_code=code,
+                retryable=code >= 500,
             )
 
         if not response.content:
@@ -160,6 +222,44 @@ class APIClient:
         return self._request(
             "GET",
             f"/api/case/{case_id}",
+        )
+
+    def get_case_cache(
+        self,
+        case_id: str,
+    ) -> Any:
+        return self._request(
+            "GET",
+            f"/api/case/{case_id}/cache",
+        )
+
+    def get_case_status(
+        self,
+        case_id: str,
+    ) -> Any:
+        return self._request(
+            "GET",
+            f"/api/case/{case_id}/status",
+        )
+
+    def plan_batch(
+        self,
+        case_ids: list[str] | None = None,
+    ) -> Any:
+        return self._request(
+            "POST",
+            "/api/cases/batch/plan",
+            json={"case_ids": case_ids},
+        )
+
+    def start_batch(
+        self,
+        case_ids: list[str],
+    ) -> Any:
+        return self._request(
+            "POST",
+            "/api/cases/batch",
+            json={"case_ids": case_ids},
         )
 
     def create_case(
