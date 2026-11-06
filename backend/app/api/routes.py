@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -436,6 +437,9 @@ async def _run_case(
                 "timestamp": _now(),
                 "type": type(exc).__name__,
                 "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "stage": current.get("current_node") or current.get("workflow_stage") or "workflow",
+                "user_message": "Automated processing stopped at this stage. The technical details are available to the underwriter.",
             }
         )
 

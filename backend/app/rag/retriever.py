@@ -1,467 +1,151 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from app.store.vector_store import vector_store
-from app.store.state_store import state_store
 from app.rag.document_loader import document_loader
+from app.store.state_store import state_store
 
 
 class ApplicantRetriever:
-    COLLECTION_NAME = "applicant_documents"
+    """Applicant evidence retrieval from SQLite metadata and original files only."""
 
-    def __init__(self) -> None:
-        self.synthetic_data_path = Path(settings.synthetic_data_path)
+    TYPE_ALIASES = {
+        "medical": {"medical", "medical_report", "medical_reports", "medical_documents", "applicant_profile"},
+        "claims": {"claims", "claim", "claim_documents"},
+        "policy": {"policy", "previous_policy", "policy_documents"},
+        "underwriting": {"underwriting", "submission", "proposal", "underwriting_submission"},
+    }
 
-    def _build_filter(
-        self,
-        applicant_id: str,
-        document_type: str | None = None,
-    ) -> dict[str, Any]:
-        filters: dict[str, Any] = {
-            "applicant_id": applicant_id,
-        }
+    @staticmethod
+    def _terms(text: str) -> set[str]:
+        ignored = {"the", "and", "for", "with", "from", "that", "this", "applicant", "document", "evidence"}
+        return {w.lower() for w in re.findall(r"[a-zA-Z0-9]{3,}", text or "") if w.lower() not in ignored}
 
-        if document_type:
-            filters["document_type"] = document_type
+    @classmethod
+    def _matches_type(cls, actual: str | None, requested: str | None) -> bool:
+        if not requested:
+            return True
+        return (actual or "other").lower() in cls.TYPE_ALIASES.get(requested.lower(), {requested.lower()})
 
-        if len(filters) == 1:
-            return filters
-
-        return {
-            "$and": [
-                {key: value}
-                for key, value in filters.items()
-            ]
-        }
-
-    def search(
-        self,
-        applicant_id: str,
-        query: str,
-        document_type: str | None = None,
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        if not applicant_id or not query.strip():
+    def search(self, applicant_id: str, query: str, document_type: str | None = None,
+               top_k: int | None = None) -> list[dict[str, Any]]:
+        if not applicant_id:
             return []
+        limit = max(1, min(top_k or settings.top_k_results, 20))
+        query_terms = self._terms(query)
+        candidates: list[tuple[int, dict[str, Any]]] = []
 
-        limit = max(
-            1,
-            min(
-                top_k or settings.top_k_results,
-                20,
-            ),
-        )
-
-        where = self._build_filter(
-            applicant_id=applicant_id,
-            document_type=document_type,
-        )
-
-        try:
-            results = vector_store.query(
-                collection_name=self.COLLECTION_NAME,
-                query_text=query,
-                n_results=limit,
-                where=where,
-            )
-        except Exception:
-            return []
-
-        return self._normalize_results(
-            results,
-            applicant_id=applicant_id,
-            document_type=document_type,
-        )
-
-    def search_by_type(
-        self,
-        applicant_id: str,
-        query: str,
-        document_type: str,
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.search(
-            applicant_id=applicant_id,
-            query=query,
-            document_type=document_type,
-            top_k=top_k,
-        )
-
-    def retrieve_medical_evidence(
-        self,
-        applicant_id: str,
-        query: str = (
-            "medical examination diagnosis conditions treatment"
-        ),
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.search_by_type(
-            applicant_id,
-            query,
-            "medical",
-            top_k,
-        )
-
-    def retrieve_claims_evidence(
-        self,
-        applicant_id: str,
-        query: str = (
-            "claims hospitalization treatment claim history"
-        ),
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.search_by_type(
-            applicant_id,
-            query,
-            "claims",
-            top_k,
-        )
-
-    def retrieve_policy_evidence(
-        self,
-        applicant_id: str,
-        query: str = (
-            "existing policy coverage sum insured claims policy status"
-        ),
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.search_by_type(
-            applicant_id,
-            query,
-            "policy",
-            top_k,
-        )
-
-    def retrieve_underwriting_submission(
-        self,
-        applicant_id: str,
-        query: str = (
-            "underwriting submission requested product "
-            "sum insured declarations"
-        ),
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self.search_by_type(
-            applicant_id,
-            query,
-            "underwriting",
-            top_k,
-        )
-
-    def retrieve_all(
-        self,
-        applicant_id: str,
-        query: str = (
-            "applicant underwriting medical claims policy evidence"
-        ),
-        top_k: int | None = None,
-    ) -> dict[str, list[dict[str, Any]]]:
-        return {
-            "medical": self.retrieve_medical_evidence(
-                applicant_id,
-                query,
-                top_k,
-            ),
-            "claims": self.retrieve_claims_evidence(
-                applicant_id,
-                query,
-                top_k,
-            ),
-            "policy": self.retrieve_policy_evidence(
-                applicant_id,
-                query,
-                top_k,
-            ),
-            "underwriting": self.retrieve_underwriting_submission(
-                applicant_id,
-                query,
-                top_k,
-            ),
-        }
-
-    def _normalize_results(
-        self,
-        results: Any,
-        applicant_id: str | None = None,
-        document_type: str | None = None,
-    ) -> list[dict[str, Any]]:
-        if not isinstance(results, dict):
-            return []
-
-        documents = results.get("documents", [])
-        metadatas = results.get("metadatas", [])
-        distances = results.get("distances", [])
-
-        if documents and isinstance(documents[0], list):
-            documents = documents[0]
-
-        if metadatas and isinstance(metadatas[0], list):
-            metadatas = metadatas[0]
-
-        if distances and isinstance(distances[0], list):
-            distances = distances[0]
-
-        normalized: list[dict[str, Any]] = []
-
-        for index, document in enumerate(documents):
-            metadata = (
-                metadatas[index]
-                if index < len(metadatas)
-                and isinstance(metadatas[index], dict)
-                else {}
-            )
-
-            result_applicant_id = metadata.get(
-                "applicant_id"
-            )
-            result_document_type = metadata.get(
-                "document_type"
-            )
-
-            if (
-                applicant_id
-                and result_applicant_id != applicant_id
-            ):
+        for row in state_store.list_applicant_documents(applicant_id):
+            doc_type = row.get("document_type") or "other"
+            if not self._matches_type(doc_type, document_type):
                 continue
-
-            if (
-                document_type
-                and result_document_type != document_type
-            ):
+            metadata = dict(row.get("metadata") or {})
+            path_value = row.get("file_path") or metadata.get("storage_path")
+            if not path_value:
                 continue
-
-            normalized.append(
-                {
-                    "content": document,
-                    "metadata": metadata,
-                    "distance": (
-                        distances[index]
-                        if index < len(distances)
-                        else None
-                    ),
-                    "applicant_id": result_applicant_id,
-                    "document_type": result_document_type,
-                    "document_id": metadata.get("document_id"),
-                    "source": metadata.get("source"),
-                    "file_name": (
-                        metadata.get("file_name")
-                        or metadata.get("filename")
-                        or metadata.get("source")
-                    ),
-                    "filename": (
-                        metadata.get("filename")
-                        or metadata.get("file_name")
-                        or metadata.get("source")
-                    ),
-                    "title": (
-                        metadata.get("title")
-                        or metadata.get("filename")
-                        or metadata.get("file_name")
-                        or metadata.get("source")
-                    ),
-                    "evidence_scope": metadata.get(
-                        "evidence_scope",
-                        "applicant",
-                    ),
-                }
-            )
-
-        return normalized
-
-    def group_by_document(
-        self,
-        results: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Convert retrieved chunks into document-level evidence records.
-
-        The UI can use this to show one readable evidence item per source
-        document instead of exposing vector-search chunk boundaries.
-        """
-        groups: dict[str, dict[str, Any]] = {}
-
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-
-            metadata = item.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            document_id = (
-                item.get("document_id")
-                or metadata.get("document_id")
-                or item.get("filename")
-                or item.get("file_name")
-                or item.get("source")
-                or "evidence"
-            )
-            key = str(document_id)
-
-            group = groups.setdefault(
-                key,
-                {
-                    "document_id": item.get("document_id"),
-                    "filename": (
-                        item.get("filename")
-                        or item.get("file_name")
-                        or metadata.get("filename")
-                        or metadata.get("file_name")
-                        or "Evidence document"
-                    ),
-                    "document_type": (
-                        item.get("document_type")
-                        or metadata.get("document_type")
-                    ),
-                    "applicant_id": (
-                        item.get("applicant_id")
-                        or metadata.get("applicant_id")
-                    ),
-                    "source": (
-                        item.get("source")
-                        or metadata.get("source")
-                    ),
-                    "evidence_scope": (
-                        item.get("evidence_scope")
-                        or metadata.get("evidence_scope")
-                        or "applicant"
-                    ),
-                    "contents": [],
-                    "metadata": metadata,
-                },
-            )
-
-            content = item.get("content")
-            if content:
-                group["contents"].append(str(content).strip())
-
-        grouped = []
-        for group in groups.values():
-            seen: set[str] = set()
-            contents = []
-            for content in group["contents"]:
-                if content and content not in seen:
-                    seen.add(content)
-                    contents.append(content)
-
-            retrieved_text = "\n\n".join(contents)
-            human_text = self._load_human_readable_text(group)
-            group["retrieved_content"] = retrieved_text
-            group["human_readable_content"] = human_text or retrieved_text
-            group["content"] = group["human_readable_content"]
-            group["chunk_count"] = len(contents)
-            group.pop("contents", None)
-            grouped.append(group)
-
-        return grouped
-
-    def _resolve_source_path(self, group: dict[str, Any]) -> Path | None:
-        """Resolve the original applicant document path from evidence metadata."""
-        metadata = group.get("metadata") or {}
-
-        path_value = (
-            metadata.get("storage_path")
-            or metadata.get("file_path")
-        )
-
-        if path_value:
             path = Path(str(path_value))
-            if path.exists():
-                return path
-
-        document_id = (
-            group.get("document_id")
-            or metadata.get("document_id")
-        )
-
-        if document_id:
+            if not path.is_file():
+                continue
             try:
-                document = state_store.get_applicant_document(
-                    str(document_id)
-                )
-                state_path = (document or {}).get("file_path")
-                if state_path:
-                    path = Path(str(state_path))
-                    if path.exists():
-                        return path
+                chunks = document_loader.load_file(path)
             except Exception:
-                pass
+                continue
 
-        # Compatibility fallback for older Chroma records that contain only
-        # applicant_id + filename and no document_id/file_path metadata.
-        applicant_id = (
-            group.get("applicant_id")
-            or metadata.get("applicant_id")
-        )
-        filename = (
-            group.get("filename")
-            or group.get("file_name")
-            or metadata.get("filename")
-            or metadata.get("file_name")
-        )
+            identity = {
+                "applicant_id": applicant_id,
+                "document_id": row.get("document_id"),
+                "document_type": doc_type,
+                "filename": row.get("filename") or path.name,
+                "file_name": row.get("filename") or path.name,
+                "file_path": str(path), "storage_path": str(path),
+                "source": row.get("source") or "applicant_file",
+                "evidence_scope": "applicant",
+            }
+            for i, chunk in enumerate(chunks):
+                content = str(chunk.get("text") or "").strip()
+                if not content:
+                    continue
+                overlap = len(query_terms & self._terms(content))
+                if query_terms and overlap == 0:
+                    continue
+                chunk_meta = dict(chunk.get("metadata") or {})
+                chunk_meta.update(identity)
+                chunk_meta["chunk_index"] = i
+                result = {
+                    "content": content, "metadata": chunk_meta,
+                    "distance": None, "applicant_id": applicant_id,
+                    "document_type": doc_type, "document_id": row.get("document_id"),
+                    "source": identity["source"], "file_name": identity["filename"],
+                    "filename": identity["filename"], "title": identity["filename"],
+                    "evidence_scope": "applicant",
+                }
+                candidates.append((overlap if query_terms else 1, result))
 
-        if applicant_id and filename:
-            applicant_root = (
-                self.synthetic_data_path
-                / "applicants"
-                / str(applicant_id)
-            )
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in candidates[:limit]]
 
-            if applicant_root.exists():
-                matches = list(
-                    applicant_root.rglob(str(filename))
-                )
-                if matches:
-                    return matches[0]
+    def search_by_type(self, applicant_id: str, query: str, document_type: str,
+                       top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.search(applicant_id, query, document_type, top_k)
 
-        return None
+    def retrieve_medical_evidence(self, applicant_id: str, query: str = "medical examination diagnosis conditions treatment", top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.search_by_type(applicant_id, query, "medical", top_k)
 
-    def _load_human_readable_text(self, group: dict[str, Any]) -> str:
-        """Load the complete original source for reviewer-facing evidence."""
-        path = self._resolve_source_path(group)
+    def retrieve_claims_evidence(self, applicant_id: str, query: str = "claims hospitalization treatment claim history", top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.search_by_type(applicant_id, query, "claims", top_k)
 
-        if path is None:
-            return ""
+    def retrieve_policy_evidence(self, applicant_id: str, query: str = "existing policy coverage sum insured claims policy status", top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.search_by_type(applicant_id, query, "policy", top_k)
 
-        try:
-            return document_loader.load_full_text(path)
-        except Exception:
-            return ""
+    def retrieve_underwriting_submission(self, applicant_id: str, query: str = "underwriting submission requested product sum insured declarations", top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.search_by_type(applicant_id, query, "underwriting", top_k)
 
-    def retrieve_document_views(
-        self,
-        applicant_id: str,
-        query: str,
-        document_type: str | None = None,
-        top_k: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return document-level readable evidence for UI/review layers."""
-        return self.group_by_document(
-            self.search(
-                applicant_id=applicant_id,
-                query=query,
-                document_type=document_type,
-                top_k=top_k,
-            )
-        )
+    def retrieve_all(self, applicant_id: str, query: str = "applicant underwriting medical claims policy evidence", top_k: int | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "medical": self.retrieve_medical_evidence(applicant_id, query, top_k),
+            "claims": self.retrieve_claims_evidence(applicant_id, query, top_k),
+            "policy": self.retrieve_policy_evidence(applicant_id, query, top_k),
+            "underwriting": self.retrieve_underwriting_submission(applicant_id, query, top_k),
+        }
 
-    def has_evidence(
-        self,
-        applicant_id: str,
-        query: str,
-        document_type: str | None = None,
-    ) -> bool:
-        return bool(
-            self.search(
-                applicant_id,
-                query,
-                document_type,
-                top_k=1,
-            )
-        )
+    def group_by_document(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for item in results:
+            meta = item.get("metadata") or {}
+            doc_id = item.get("document_id") or meta.get("document_id")
+            if not doc_id:
+                continue
+            group = groups.setdefault(str(doc_id), {
+                "document_id": doc_id, "filename": item.get("filename") or "Evidence document",
+                "document_type": item.get("document_type"), "applicant_id": item.get("applicant_id"),
+                "source": item.get("source"), "evidence_scope": "applicant",
+                "contents": [], "metadata": meta,
+            })
+            if item.get("content"):
+                group["contents"].append(str(item["content"]).strip())
+        output = []
+        for group in groups.values():
+            contents = list(dict.fromkeys(x for x in group.pop("contents") if x))
+            text = "\n\n".join(contents)
+            path = (group.get("metadata") or {}).get("file_path")
+            try:
+                full = document_loader.load_full_text(path) if path and Path(path).is_file() else ""
+            except Exception:
+                full = ""
+            group.update({"retrieved_content": text, "human_readable_content": full or text,
+                          "content": full or text, "chunk_count": len(contents)})
+            output.append(group)
+        return output
+
+    def retrieve_document_views(self, applicant_id: str, query: str, document_type: str | None = None,
+                                top_k: int | None = None) -> list[dict[str, Any]]:
+        return self.group_by_document(self.search(applicant_id, query, document_type, top_k))
+
+    def has_evidence(self, applicant_id: str, query: str, document_type: str | None = None) -> bool:
+        return bool(self.search(applicant_id, query, document_type, top_k=1))
 
 
 retriever = ApplicantRetriever()

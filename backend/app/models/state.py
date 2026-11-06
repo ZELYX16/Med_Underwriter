@@ -107,6 +107,10 @@ class UnderwritingState(TypedDict, total=False):
     fraud_flags: list[dict[str, Any]]
     fraud_notes: list[dict[str, Any]]
     mandatory_review_reasons: list[str]
+    compliance_report: dict[str, Any]
+    confidence_layers: dict[str, float]
+    decision_level: str
+    reason_codes: list[dict[str, Any]]
     missing_documents: list[dict[str, Any]]
     document_override: str
     review_notes: list[dict[str, Any]]

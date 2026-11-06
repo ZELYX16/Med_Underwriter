@@ -255,6 +255,18 @@ class Guardrails:
             },
         )
 
+    def sanitize_for_model(self, prompt: str) -> str:
+        """Mask recognised direct identifiers immediately before an LLM call.
+
+        Defence in depth only: agents must still minimise structured facts.
+        Clinical facts are preserved; recognised identifiers are masked.
+        """
+        if not isinstance(prompt, str):
+            raise TypeError("LLM prompt must be a string.")
+        if len(prompt) > self.max_length:
+            raise ValueError("LLM prompt exceeds the configured maximum length.")
+        return self._sanitize(prompt)
+
     def validate_output(
         self,
         output: Any,

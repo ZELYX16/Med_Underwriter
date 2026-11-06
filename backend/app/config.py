@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,7 +15,7 @@ class Settings(BaseSettings):
     app_name: str = "MedUnderwrite AI"
     app_version: str = "1.0.0"
     environment: str = "development"
-    debug: bool = True
+    debug: bool = False
 
     # LLM
     llm_provider: LLMProvider = "ollama"
@@ -64,6 +65,8 @@ class Settings(BaseSettings):
     fraud_review_threshold: float = 60.0
     router_complex_threshold: int = 4  # weighted routing score >= this is complex
     max_upload_mb: int = 20
+    llm_calls_per_case: int = 8  # cost guard: LLM calls per case run
+    llm_calls_per_minute: int = 20  # cost guard: hosted providers only
     max_material_unknowns: int = 2  # this many material unknowns -> verification review
     doc_medical_age_threshold: int = 45  # medical exam required from this age
     doc_medical_sum_insured_threshold: float = 1_000_000
@@ -97,15 +100,13 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "medunderwrite-ai"
 
-    # Langfuse
-    langfuse_enabled: bool = False
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-    langfuse_host: str = "https://cloud.langfuse.com"
-
     # API / Security
     cors_origins: str = "http://localhost:4200,http://localhost:8501"
-    secret_key: str = "development-secret-key"
+    secret_key: str = ""
+    # Privacy/compliance controls; redaction stays enabled by default.
+    pii_redaction_enabled: bool = True
+    compliance_catalogue_version: str = "2026.11"
+    compliance_jurisdiction: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -113,6 +114,19 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_runtime_security(self):
+        environment = self.environment.strip().lower()
+        is_development = environment in {"development", "dev", "local"}
+
+        if not is_development and not self.secret_key.strip():
+            raise ValueError("SECRET_KEY must be configured outside development.")
+        if not is_development and self.debug:
+            raise ValueError("DEBUG must be disabled outside development.")
+        if not is_development and self.secret_key.strip() == "development-secret-key":
+            raise ValueError("The development SECRET_KEY cannot be used outside development.")
+        return self
 
     @property
     def base_path(self) -> Path:

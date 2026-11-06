@@ -6,17 +6,10 @@ from app.store.vector_store import VectorStore
 
 
 class DataIndexer:
-    APPLICANT_COLLECTION = "applicant_documents"
     MEDICAL_COLLECTION = "medical_knowledge"
     REGULATORY_COLLECTION = "regulatory"
     UNDERWRITING_COLLECTION = "underwriting"
 
-    DOCUMENT_TYPE_MAP = {
-        "medical": "medical",
-        "claims": "claims",
-        "policy": "policy",
-        "underwriting": "underwriting",
-    }
 
     def __init__(self):
         self.loader = DocumentLoader()
@@ -29,28 +22,11 @@ class DataIndexer:
 
         return self.loader.load_directory(directory)
 
-    def _infer_document_type(self, source: str) -> str:
-        """
-        Infer applicant document type from its directory structure.
-
-        Example:
-        data/synthetic/applicants/APP-TEST-001/medical/file.pdf
-        -> medical
-        """
-        parts = {part.lower() for part in Path(source).parts}
-
-        for folder_name, document_type in self.DOCUMENT_TYPE_MAP.items():
-            if folder_name in parts:
-                return document_type
-
-        return "unknown"
-
     def _index(
         self,
         collection_name: str,
         documents: list[dict],
         base_metadata: dict | None = None,
-        infer_document_type: bool = False,
     ) -> int:
         if not documents:
             return 0
@@ -72,19 +48,6 @@ class DataIndexer:
                 **source_metadata,
                 **base_metadata,
             }
-
-            if infer_document_type:
-                source = source_metadata.get("source", "")
-                document_type = self._infer_document_type(source)
-
-                if document_type == "unknown":
-                    print(
-                        f"[WARN] Unknown applicant document type: "
-                        f"{source}"
-                    )
-                    continue
-
-                metadata["document_type"] = document_type
 
             texts.append(text)
             metadatas.append(metadata)
@@ -120,65 +83,6 @@ class DataIndexer:
             metadatas=metadatas,
             ids=ids,
         )
-
-    def index_applicants(self) -> int:
-        """
-        Index applicant-specific evidence.
-
-        Expected structure:
-
-        data/synthetic/applicants/
-        ├── APP-TEST-001/
-        │   ├── medical/
-        │   ├── policy/
-        │   └── underwriting/
-        └── APP-TEST-002/
-            ├── medical/
-            ├── claims/
-            ├── policy/
-            └── underwriting/
-        """
-        applicants_root = (
-            settings.synthetic_data_directory / "applicants"
-        )
-
-        if not applicants_root.exists():
-            print(f"[WARN] Applicant directory not found: {applicants_root}")
-            return 0
-
-        total = 0
-
-        applicant_directories = sorted(
-            path
-            for path in applicants_root.iterdir()
-            if path.is_dir()
-        )
-
-        for applicant_directory in applicant_directories:
-            applicant_id = applicant_directory.name
-
-            documents = self._load_directory(applicant_directory)
-
-            count = self._index(
-                collection_name=self.APPLICANT_COLLECTION,
-                documents=documents,
-                base_metadata={
-                    "applicant_id": applicant_id,
-                    "case_id": f"UW-{applicant_id.replace('APP-', '')}",
-                    "evidence_scope": "applicant",
-                    "source_type": "synthetic_applicant_document",
-                },
-                infer_document_type=True,
-            )
-
-            total += count
-
-            print(
-                f"[APPLICANT] {applicant_id}: "
-                f"{count} chunks"
-            )
-
-        return total
 
     def index_medical_knowledge(self) -> int:
         """
@@ -316,18 +220,15 @@ class DataIndexer:
         return total
 
     def run(self) -> None:
+        """Index shared knowledge only; applicant files must never enter ChromaDB."""
         print("=" * 60)
-        print("MedUnderwrite AI - ChromaDB Indexing")
+        print("MedUnderwrite AI - Shared Knowledge Indexing")
         print("=" * 60)
 
         print(
             f"ChromaDB path: "
             f"{settings.chroma_directory}"
         )
-
-        print()
-
-        applicant_count = self.index_applicants()
 
         print()
 
@@ -346,9 +247,6 @@ class DataIndexer:
         print("INDEXING COMPLETE")
         print("=" * 60)
 
-        print(
-            f"Applicant evidence : {applicant_count}"
-        )
         print(
             f"Medical knowledge  : {medical_count}"
         )

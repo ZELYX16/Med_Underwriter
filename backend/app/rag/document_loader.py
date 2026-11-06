@@ -16,6 +16,8 @@ SUPPORTED_EXTENSIONS = {
     ".csv",
 }
 
+EVIDENCE_EXTENSIONS = SUPPORTED_EXTENSIONS | {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
 
 class DocumentLoader:
     def __init__(
@@ -180,6 +182,89 @@ class DocumentLoader:
             previous_blank = False
 
         return "\n".join(cleaned_lines).strip()
+
+    def load_evidence_file(
+        self,
+        file_path: str | Path,
+        *,
+        max_pdf_pages: int = 50,
+    ) -> dict[str, Any]:
+        """Load page-aware text for evidence extraction and vector indexing.
+
+        Text PDFs retain page numbers. Scanned PDF pages and images use local
+        OCR when available. A page is never silently treated as empty evidence.
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Document not found: {path}")
+        extension = path.suffix.lower()
+        if extension not in EVIDENCE_EXTENSIONS:
+            raise ValueError(f"Unsupported file type: {extension}")
+
+        pages: list[dict[str, Any]] = []
+        if extension == ".pdf":
+            reader = PdfReader(str(path))
+            text_pages = []
+            for index, page in enumerate(reader.pages[:max_pdf_pages]):
+                try:
+                    text = (page.extract_text() or "").strip()
+                except Exception:
+                    text = ""
+                text_pages.append({
+                    "page_number": index + 1,
+                    "text": text,
+                    "extraction_method": "pypdf_text" if len(text) >= 30 else "text_layer_empty",
+                })
+            needs_ocr = any(len(item["text"].strip()) < 30 for item in text_pages)
+            if needs_ocr:
+                try:
+                    from app.services.ocr import ocr_pdf_pages
+                    missing_pages = [item["page_number"] for item in text_pages if len(item["text"].strip()) < 30]
+                    ocr_pages = ocr_pdf_pages(path, max_pages=max_pdf_pages, page_numbers=missing_pages)
+                except Exception:
+                    ocr_pages = []
+                ocr_by_number = {int(item["page_number"]): item for item in ocr_pages}
+                for item in text_pages:
+                    if len(item["text"].strip()) < 30:
+                        ocr_item = ocr_by_number.get(item["page_number"])
+                        if ocr_item and str(ocr_item.get("text") or "").strip():
+                            item["text"] = str(ocr_item["text"]).strip()
+                            item["extraction_method"] = ocr_item.get("extraction_method", "ocr")
+            pages = [item for item in text_pages if str(item["text"]).strip()]
+        elif extension in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+            from app.services.ocr import ocr_image
+            result = ocr_image(path)
+            if str(result.get("text") or "").strip():
+                pages = [{"page_number": 1, "text": result["text"].strip(),
+                          "extraction_method": result.get("method", "ocr_image")}]
+        else:
+            if extension == ".txt":
+                text = self._load_text(path)
+            elif extension == ".json":
+                text = self._load_json(path)
+            else:
+                text = self._load_csv(path)
+            if text.strip():
+                pages = [{"page_number": None, "text": self._clean_source_text(text),
+                          "extraction_method": "native_text"}]
+
+        chunks: list[dict[str, Any]] = []
+        for page in pages:
+            page_text = self._clean_source_text(str(page.get("text") or ""))
+            for index, chunk_text in enumerate(self._chunk_text(page_text)):
+                chunks.append({
+                    "text": chunk_text,
+                    "metadata": {
+                        "source": str(path),
+                        "file_name": path.name,
+                        "file_type": extension,
+                        "page_number": page.get("page_number"),
+                        "extraction_method": page.get("extraction_method", "text"),
+                        "page_chunk_index": index,
+                    },
+                })
+        return {"pages": pages, "chunks": chunks,
+                "text": "\n\n".join(str(page["text"]) for page in pages)}
 
     def load_directory(
         self,

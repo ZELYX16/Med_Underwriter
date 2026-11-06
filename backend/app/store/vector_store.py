@@ -290,6 +290,22 @@ class VectorStore:
 
         return collection.get(**kwargs)
 
+    def delete_by_metadata(
+        self,
+        collection_name: str,
+        where: dict[str, Any],
+    ) -> None:
+        """Delete chunks matching a required metadata filter.
+
+        An empty filter is rejected deliberately: Chroma interprets broad
+        deletes as collection-wide data loss.
+        """
+        if not where:
+            raise ValueError("A non-empty metadata filter is required for deletion.")
+
+        collection = self.get_collection(collection_name)
+        collection.delete(where=where)
+
     def count(
         self,
         collection_name: str,

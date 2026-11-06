@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,68 @@ from app.store.state_store import state_store
 
 APPLICANTS_DIR = settings.synthetic_data_directory / "applicants"
 
+
+
+SUPPORTED_APPLICANT_FILES = {".pdf", ".txt", ".json", ".csv"}
+APPLICANT_DOCUMENT_TYPES = {
+    "medical": "medical", "medical_reports": "medical", "medical_documents": "medical",
+    "claims": "claims", "claim": "claims", "claim_documents": "claims",
+    "policy": "policy", "previous_policy": "policy", "policy_documents": "policy",
+    "underwriting": "underwriting", "submission": "underwriting", "underwriting_submission": "underwriting",
+}
+
+def register_applicant_documents(applicant_dir: Path, applicant_id: str) -> int:
+    """Register synthetic applicant file paths in SQLite only; never index them in ChromaDB."""
+    existing = state_store.list_applicant_documents(applicant_id)
+    old_synthetic = {str(x.get("document_id")): x for x in existing if x.get("source") == "synthetic_dataset"}
+    files = sorted(p for p in applicant_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_APPLICANT_FILES)
+    active: set[str] = set()
+    count = 0
+    for path in files:
+        relative = path.relative_to(applicant_dir).as_posix()
+        path_parts = {part.lower() for part in path.relative_to(applicant_dir).parts[:-1]}
+        doc_type = next(
+            (mapped for folder, mapped in APPLICANT_DOCUMENT_TYPES.items() if folder in path_parts),
+            "other",
+        )
+        digest = hashlib.sha256(f"{applicant_id}:{relative}".encode("utf-8")).hexdigest()[:12].upper()
+        doc_id = f"SYN-{digest}"
+        active.add(doc_id)
+        if doc_id in old_synthetic:
+            state_store.delete_applicant_document(doc_id)
+            # The same synthetic file may also have a case-level document row.
+            state_store.delete_case_document(
+                case_id=f"UW-{applicant_id.replace('APP-', '')}",
+                document_id=doc_id,
+            )
+        metadata = {"applicant_id": applicant_id, "document_id": doc_id, "document_type": doc_type,
+                    "filename": path.name, "file_name": path.name, "file_path": str(path.resolve()),
+                    "storage_path": str(path.resolve()), "source": "synthetic_dataset",
+                    "evidence_scope": "applicant", "processing_status": "AVAILABLE",
+                    "extraction_status": "ON_DEMAND", "vector_index_status": "NOT_APPLICABLE",
+                    "relative_path": relative}
+        state_store.add_applicant_document(document_id=doc_id, applicant_id=applicant_id,
+            document_type=doc_type, filename=path.name, file_path=str(path.resolve()),
+            source="synthetic_dataset", evidence_status="PROVIDED", metadata=metadata)
+        state_store.add_case_document(
+            document_id=doc_id,
+            case_id=f"UW-{applicant_id.replace('APP-', '')}",
+            applicant_id=applicant_id,
+            document_type=doc_type,
+            filename=path.name,
+            file_path=str(path.resolve()),
+            source="synthetic_dataset",
+            evidence_status="PROVIDED",
+            metadata=metadata,
+        )
+        count += 1
+    for stale_id in set(old_synthetic) - active:
+        state_store.delete_applicant_document(stale_id)
+        state_store.delete_case_document(
+            case_id=f"UW-{applicant_id.replace('APP-', '')}",
+            document_id=stale_id,
+        )
+    return count
 
 # ============================================================
 # PDF HELPERS
@@ -39,7 +102,7 @@ def find_submission_pdf(
     if not underwriting_dir.exists():
         return None
 
-    files = sorted(underwriting_dir.glob("*.pdf"))
+    files = sorted(underwriting_dir.rglob("*.pdf"))
 
     return files[0] if files else None
 
@@ -934,6 +997,9 @@ def seed_applicant(
         print(
             f"  [CASE CREATED] {case_id}"
         )
+
+    registered_documents = register_applicant_documents(applicant_dir, applicant_id)
+    print(f"  Applicant files registered in SQLite: {registered_documents}")
 
     print(
         f"  Name: {profile.get('name')}"

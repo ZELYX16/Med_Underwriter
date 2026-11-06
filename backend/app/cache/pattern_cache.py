@@ -101,6 +101,8 @@ class PatternCache:
             check_same_thread=False,
             timeout=5,
         )
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
         if not self._ready:
             connection.execute(
                 """

@@ -8,8 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.config import settings
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -93,8 +91,8 @@ def _case_view(
 
 
 class StateStore:
-    def __init__(self, db_path: str | Path | None = None):
-        self.db_path = Path(db_path or settings.sqlite_file).resolve()
+    def __init__(self, db_path: str | Path = "data/medunderwrite.db"):
+        self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -110,6 +108,10 @@ class StateStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # Parallel document jobs write at the same time: WAL lets readers and
+        # one writer coexist, and the timeout waits instead of failing.
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
         return connection
 
     def _initialize(self) -> None:
@@ -810,6 +812,40 @@ class StateStore:
 
         return results
 
+    def update_applicant_document_metadata(
+        self,
+        document_id: str,
+        metadata_patch: dict[str, Any],
+        *,
+        evidence_status: str | None = None,
+        document_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Merge document processing metadata without overwriting provenance."""
+        with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM applicant_documents WHERE document_id = ?",
+                    (document_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                current = self._from_json(row["metadata_json"], {})
+                merged = {**current, **(metadata_patch or {})}
+                fields = ["metadata_json = ?", "updated_at = ?"]
+                values: list[Any] = [self._json(merged), _now()]
+                if evidence_status is not None:
+                    fields.append("evidence_status = ?")
+                    values.append(evidence_status)
+                if document_type is not None:
+                    fields.append("document_type = ?")
+                    values.append(document_type)
+                values.append(document_id)
+                connection.execute(
+                    f"UPDATE applicant_documents SET {', '.join(fields)} WHERE document_id = ?",
+                    values,
+                )
+        return self.get_applicant_document(document_id)
+
     def delete_applicant_document(
         self,
         document_id: str,
@@ -939,6 +975,41 @@ class StateStore:
             results.append(item)
 
         return results
+
+    def update_case_document_metadata(
+        self,
+        case_id: str,
+        document_id: str,
+        metadata_patch: dict[str, Any],
+        *,
+        evidence_status: str | None = None,
+        document_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Keep the case-level evidence snapshot in sync after indexing."""
+        with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM case_documents WHERE case_id = ? AND document_id = ?",
+                    (case_id, document_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                current = self._from_json(row["metadata_json"], {})
+                merged = {**current, **(metadata_patch or {})}
+                fields = ["metadata_json = ?", "updated_at = ?"]
+                values: list[Any] = [self._json(merged), _now()]
+                if evidence_status is not None:
+                    fields.append("evidence_status = ?")
+                    values.append(evidence_status)
+                if document_type is not None:
+                    fields.append("document_type = ?")
+                    values.append(document_type)
+                values.extend([case_id, document_id])
+                connection.execute(
+                    f"UPDATE case_documents SET {', '.join(fields)} WHERE case_id = ? AND document_id = ?",
+                    values,
+                )
+        return self.get_case_document(document_id)
 
     def delete_case_document(
         self,

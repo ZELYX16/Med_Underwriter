@@ -11,6 +11,7 @@ from typing import Any
 
 from app.config import settings
 from app.agents.fraud import assess_fraud
+from app.services import compliance, cost_guard, outcome
 from app.services.evidence_state import completeness, evidence_states, verification_items
 from app.services.medical_groups import text_group
 from app.cache.pattern_cache import note_cache_event, pattern_cache
@@ -141,6 +142,38 @@ class RiskAssessmentAgent:
             risk=risk,
         )
 
+        structured = features.get("structured") or {}
+        compliance_report = compliance.evaluate(
+            {
+                "profile": applicant_profile,
+                "submission": submission,
+                "risk": risk,
+                "flags": fraud["fraud_flags"],
+                "policy": structured.get("policy"),
+                "has_documents": bool(structured.get("documents")),
+                "recommendation": recommendation,
+                "mandatory": bool(mandatory_reasons),
+                "provider": settings.llm_provider,
+            }
+        )
+        confidence_layers = outcome.layered_confidence(
+            evidence=confidence,
+            overall_risk=risk["overall_risk_score"],
+            discrepancy_score=fraud["fraud_risk_score"],
+        )
+
+        decision_package = outcome.build_decision_package(
+            confidence_layers=confidence_layers,
+            mandatory_reasons=mandatory_reasons,
+            security_reasons=[],
+            verification_items=verification,
+            compliance_report=compliance_report,
+            discrepancy_score=fraud.get("fraud_risk_score", 0.0),
+            sum_insured=features.get("sum_insured"),
+            recommendation=recommendation,
+            loading_percentage=pricing.get("loading_percentage", 0.0),
+        )
+
         reasoning = self._reason(
             applicant_profile=applicant_profile,
             submission=submission,
@@ -203,6 +236,15 @@ class RiskAssessmentAgent:
             "fraud_flags": fraud["fraud_flags"],
             "fraud_notes": fraud.get("fraud_notes", []),
             "mandatory_review_reasons": mandatory_reasons,
+            "compliance_report": compliance_report,
+            "confidence_layers": confidence_layers,
+            "decision_level": decision_package["decision_level"],
+            "reason_codes": decision_package["reason_codes"],
+            "blocking_reasons": decision_package["blocking_reasons"],
+            "material_verification_items": decision_package["material_verification_items"],
+            "compliance_attention": decision_package["compliance_attention"],
+            "customer_message": decision_package["customer_message"],
+            "require_human_review": decision_package["requires_human_review"],
             "pricing_result": pricing,
             "base_premium": pricing["base_premium"],
             "loading_percentage": pricing["loading_percentage"],
@@ -974,8 +1016,8 @@ class RiskAssessmentAgent:
             "timing": llm_metrics.get("timing") or {},
         }
 
-    @staticmethod
     def _coverage_notes(
+        self,
         features: dict[str, Any],
         applicant_profile: dict[str, Any],
         submission: dict[str, Any],
@@ -1004,7 +1046,11 @@ class RiskAssessmentAgent:
             applicant_profile.get("medical_conditions") or [],
             (structured.get("submission") or {}).get("questionnaire"),
         )
-        groups |= {d["group"] for d in structured.get("diagnoses", [])}
+        diagnoses = self._as_list(structured.get("diagnoses"))
+        groups |= {
+            d["group"] for d in diagnoses
+            if isinstance(d, dict) and d.get("group")
+        }
 
         # Specific-illness waiting period
         wait = policy.get("specific_illness_months")
@@ -1037,7 +1083,9 @@ class RiskAssessmentAgent:
             )
 
         # Claims the insurer only partly settled show where exclusions bite.
-        for record in structured.get("claim_records", []):
+        for record in self._as_list(structured.get("claim_records")):
+            if not isinstance(record, dict):
+                continue
             status = str(record.get("status", "")).lower()
             if "partial" in status:
                 notes.append(
@@ -1460,6 +1508,16 @@ class RiskAssessmentAgent:
                     "llm_status": "cache hit (rationale reused)",
                 }
                 return cached
+
+            if not cost_guard.allow(cost_guard.current_case_id(), "rationale"):
+                self._last_llm_metrics = {
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                    "llm_latency_sec": 0.0, "token_source": "none", "llm_used": False,
+                    "llm_status": "skipped (call budget used)",
+                }
+                return self._fallback_reasoning(
+                    risk=risk, pricing=pricing, recommendation=recommendation,
+                )
 
             if self.llm is None:
                 self.llm = get_llm(

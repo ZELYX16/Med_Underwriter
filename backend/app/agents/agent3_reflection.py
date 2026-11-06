@@ -15,7 +15,7 @@ from app.agents.reflection.mar_personas import (
 
 
 class ReflectionAgent:
-    MAX_REFLECTION_ROUNDS = 3
+    MAX_REFLECTION_ROUNDS = 2  # Initial MAR pass plus one focused follow-up.
 
     def run(
         self,
@@ -133,7 +133,7 @@ class ReflectionAgent:
             in {"fail", "failed"}
             or preliminary_verdict in {"escalate", "fail"}
             or (
-                reflection_round >= self.MAX_REFLECTION_ROUNDS
+                reflection_round >= max_rounds
                 and not final_mar.get("consensus", False)
             )
         )
@@ -225,7 +225,7 @@ class ReflectionAgent:
             or llm_disagrees
             or mar_failed
             or (
-                reflection_round >= self.MAX_REFLECTION_ROUNDS
+                reflection_round >= max_rounds
                 and not final_mar.get("consensus", False)
             )
             or verdict in {"escalate", "fail"}

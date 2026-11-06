@@ -58,6 +58,9 @@ python -m scripts.create_scenario_data   # needs reportlab; writes where the see
 python -m app.services.seed_database
 python -m app.services.index_data
 ```
+## Live application (customer intake)
+Open **Apply (live)** in the workstation. The applicant fills a plain-language form (common conditions as tick boxes with a few follow-up questions each, or type one that is not listed) and sees a live **Documents we need** list built from their answers (age 45+, cover of 1,000,000+ or any condition requires a recent medical check-up). Uploads are checked in under a second (right kind of document? theirs? readable?) and then read and indexed in the background while the form is still being filled in; a wrong file can be removed and its data is deleted. Reference retrieval for the chosen plan and conditions also starts early. Progress is saved automatically in a session and can be resumed with a code (14 days, no login in this demo). A second tab shows exactly what the customer sees (status, what is still needed, the outcome with a plain-language reason, never scores or internal flags). **Load a sample applicant** fills the form (and attaches the sample documents for the Nikhil bundle) without running anything.
+Underwriting starts at Submit and uses the same checks as every other case. Added alongside: a **compliance report** (10 catalogue rules with source labels, plus policy-exclusion matching), **layered confidence** (evidence, margin to the nearest decision threshold, consistency, extraction) and **graded outcomes** (straight-through, assisted review, full review, senior referral) with reason codes that name an owner and an action, and a per-case **LLM call budget** (`llm_calls_per_case`, `llm_calls_per_minute`) for free tiers. SQLite runs in WAL mode so parallel document jobs do not block each other. Scanned files are accepted and flagged; automatic reading of images needs the optional `pytesseract` + Tesseract install (`services/ocr.py`).
 ## Performance notes
 - Agent 1 makes no LLM call. Agent 2 makes at most one short call. Agent 3's LLM critique runs only for complex or high-risk cases that the rules do not already escalate.
 - `ollama_num_ctx`, `reasoning_max_tokens` and `reflection_max_tokens` keep local calls short. Use one model for all roles to avoid model reloads.
@@ -101,4 +104,4 @@ Scenario applicants (see [Optional: scenario applicants](#optional-scenario-appl
 - `.github/workflows/deploy.yml` and `deployment/` are scaffolds: CI does not yet run tests or deploy.
 - `backend/scripts/load_data.py` is stale; use `app/services/*` for seeding and indexing.
 - The API has no authentication or role checks yet; `SECRET_KEY` defaults to a development value (a warning is logged outside development).
-CV  
+CV

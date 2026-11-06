@@ -502,6 +502,9 @@ class SubmissionIntelligenceAgent:
         if coverage_gaps:
             flags.append("coverage_or_information_gaps_present")
 
+        if applicant_profile.get("clarification_review_required"):
+            flags.append("applicant_clarification_uncertain")
+
         return flags
 
     def _build_scratchpad(
@@ -534,6 +537,12 @@ class SubmissionIntelligenceAgent:
                 "medical_conditions": applicant_profile.get(
                     "medical_conditions",
                     [],
+                ),
+                "applicant_clarifications": applicant_profile.get(
+                    "applicant_clarifications", {}
+                ),
+                "clarification_review_required": applicant_profile.get(
+                    "clarification_review_required", False
                 ),
                 "medications": applicant_profile.get(
                     "medications",
@@ -692,6 +701,9 @@ class SubmissionIntelligenceAgent:
         structured_task = asyncio.to_thread(
             self._load_structured_facts,
             applicant_id,
+            {"name": applicant_profile.get("name"), "dob": applicant_profile.get("date_of_birth")}
+            if applicant_profile.get("source") == "live_session"
+            else None,
         )
 
         (
@@ -741,7 +753,7 @@ class SubmissionIntelligenceAgent:
         }
 
     @staticmethod
-    def _load_structured_facts(applicant_id: str) -> dict[str, Any]:
+    def _load_structured_facts(applicant_id: str, reference: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Read the applicant's PDFs table-aware (diagnoses with ICD codes,
         vitals, claim records, policy terms, the proposal's declarations).
@@ -759,7 +771,7 @@ class SubmissionIntelligenceAgent:
             paths = applicant_files(
                 applicant_id, settings.synthetic_data_directory, db_paths
             )
-            return build_applicant_facts(paths) if paths else {}
+            return build_applicant_facts(paths, reference) if paths else {}
         except Exception:
             return {}
 

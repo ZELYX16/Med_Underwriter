@@ -652,6 +652,49 @@ def inject_css() -> None:
                 font-size: 20px;
             }
         }
+
+        /* =========================================================
+           LIVE INTAKE — PROGRESSIVE CUSTOMER EXPERIENCE
+        ========================================================= */
+
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 8px;
+            border-bottom: 1px solid #dce3eb;
+        }
+
+        [data-testid="stTabs"] button[role="tab"] {
+            border-radius: 8px 8px 0 0;
+            padding: 10px 15px;
+            font-weight: 650;
+            color: #526176;
+        }
+
+        [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            color: #17375e;
+            border-bottom: 3px solid #2f6fae;
+            background: #eef4fb;
+        }
+
+        [data-testid="stExpander"] {
+            border: 1px solid #dce3eb;
+            border-radius: 10px;
+            background: #ffffff;
+        }
+
+        [data-testid="stFileUploader"] {
+            border: 1px dashed #9aacc2;
+            border-radius: 10px;
+            padding: 8px;
+            background: #f8fafc;
+        }
+
+        [data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #dce3eb;
+            border-radius: 9px;
+            padding: 12px 14px;
+        }
+
         </style>
         """,
         unsafe_allow_html=True,

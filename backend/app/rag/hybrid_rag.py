@@ -287,10 +287,10 @@ class HybridRAG:
                 "medical_knowledge",
             ],
             "claims": [
-                "applicant_documents",
+                "applicant_sql_files",
             ],
             "policy": [
-                "applicant_documents",
+                "applicant_sql_files",
             ],
             "regulatory": [
                 "regulatory",

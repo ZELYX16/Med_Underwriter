@@ -130,7 +130,7 @@ class AgenticRAG:
                     applicant_results
                 )
                 sources_used.append(
-                    "applicant_documents"
+                    "applicant_sql_files"
                 )
 
         if intent == "medical":

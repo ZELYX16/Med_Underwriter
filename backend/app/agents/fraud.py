@@ -117,6 +117,21 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+def _as_list(value: Any) -> list[Any]:
+    """Normalize optional collection fields before iterating them.
+
+    Structured extraction can legitimately return None for an absent section.
+    A dict is treated as one record rather than iterated over its keys.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return [value]
+
+
 class _Builder:
     """Collects findings and derives the score / routing reasons."""
 
@@ -218,12 +233,12 @@ def _structured(
 ) -> dict[str, Any]:
     b = _Builder()
     sub = facts.get("submission") or {}
-    questionnaire = sub.get("questionnaire") or []
+    questionnaire = _as_list(sub.get("questionnaire"))
     declared = declared_groups(profile.get("medical_conditions") or [], questionnaire)
 
     # Evidence for every group seen, declared or documented.
     groups: dict[str, dict[str, Any]] = {}
-    for d in facts.get("diagnoses", []):
+    for d in _as_list(facts.get("diagnoses")):
         g = d["group"]
         if g == "other":
             continue
@@ -280,7 +295,7 @@ def _structured(
             )
 
     # Identity: a document that is not this applicant's is held out and flagged.
-    for doc in facts.get("documents", []):
+    for doc in _as_list(facts.get("documents")):
         problems = doc.get("identity_problems") or []
         if problems:
             material = any(p.get("material") for p in problems)
@@ -294,13 +309,17 @@ def _structured(
             )
         elif doc.get("role_note") and "Group" in doc["role_note"]:
             b.note("policy_identity", f"{doc['document_id']}: {doc['role_note']}")
-    for issue in facts.get("age_issues", []):
+    for issue in _as_list(facts.get("age_issues")):
         b.flag("age_inconsistency", _WEIGHTS["age_inconsistency"], issue)
 
     # Claim records against the insurer's schedule and the proposal.
-    records = facts.get("claim_records", [])
+    records = _as_list(facts.get("claim_records"))
     policy = facts.get("policy") or {}
-    schedule = {c["claim_id"]: c for c in policy.get("claims", [])}
+    schedule = {
+        c["claim_id"]: c
+        for c in _as_list(policy.get("claims"))
+        if isinstance(c, dict) and c.get("claim_id")
+    }
     for record in records:
         entry = schedule.get(record["claim_id"])
         if not entry:
@@ -333,14 +352,14 @@ def _structured(
         b.flag("duplicate_claim", _WEIGHTS["duplicate_claim"],
                "Two claim records share the same event date and approved amount.")
 
-    for claim_id in sub.get("claim_ids", []):
+    for claim_id in _as_list(sub.get("claim_ids")):
         if claim_id not in {r["claim_id"] for r in records}:
             b.note("claim_record_missing", f"Declared claim {claim_id} has no claim record on file.")
 
     total = len(schedule) or len(records)
     if total >= 4:
         cutoff = (date.today() - timedelta(days=365 * 3)).isoformat()
-        recent = sum(1 for c in (policy.get("claims") or []) if c.get("start_date") and c["start_date"] >= cutoff)
+        recent = sum(1 for c in _as_list(policy.get("claims")) if isinstance(c, dict) and c.get("start_date") and c["start_date"] >= cutoff)
         recent_text = f"; {recent} in the last 36 months" if schedule else ""
         b.note("claim_pattern", f"{total} claims on record{recent_text}. Declared and consistent with insurer records.")
 

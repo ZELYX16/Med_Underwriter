@@ -49,6 +49,18 @@ class LLMCritic:
         rule_concerns: list[str],
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        from app.services import cost_guard
+
+        if not cost_guard.allow(cost_guard.current_case_id(), "critique"):
+            return {
+                "ok": False,
+                "error": "call budget used",
+                "metrics": {
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                    "llm_latency_sec": 0.0, "latency_sec": 0.0,
+                    "token_source": "none", "llm_used": False,
+                },
+            }
         try:
             if self.llm is None:
                 self.llm = get_llm(
@@ -66,6 +78,7 @@ class LLMCritic:
                 rule_concerns,
             )
             llm_started = time.perf_counter()
+            prompt = guardrails.sanitize_for_model(prompt)
             response = self.llm.invoke(prompt)
             llm_latency = round(time.perf_counter() - llm_started, 4)
 

@@ -49,12 +49,15 @@ def evidence_states(
     states: dict[str, dict[str, str]] = {}
 
     # --- claims -------------------------------------------------------------
+    declarations = profile.get("declarations") or {}
     declared_claims = [c for c in (profile.get("claims") or []) if c]
     records = structured.get("claim_records") or []
     insurance = (sub.get("insurance") or [{}])[0] if sub.get("insurance") else {}
     claims_declared = str(insurance.get("claims_declared", "")).lower()
     if records or declared_claims or evidence.get("claims_evidence"):
         states["claims"] = _state(POSITIVE, "claim records or declared claims are on file")
+    elif declarations.get("no_claims"):
+        states["claims"] = _state(NEGATIVE, "the applicant answered no to earlier claims")
     elif (
         re.search(r"\b(no|nil|none|0)\b[^.]{0,20}claims?", claims_declared)
         or re.search(r"declared claims:\s*(none|nil)|no (prior |previous )?claims", policy_text + " " + claims_text)
@@ -76,6 +79,8 @@ def evidence_states(
     )
     if hospitalizations or discharge_docs or asked_admission:
         states["hospitalizations"] = _state(POSITIVE, "hospital admissions are declared or documented")
+    elif declarations.get("no_hospital_admission"):
+        states["hospitalizations"] = _state(NEGATIVE, "the applicant answered no to a hospital stay in the last 5 years")
     elif questionnaire:
         states["hospitalizations"] = _state(
             NEGATIVE, "the proposal's medical questionnaire lists no admission or surgery"

@@ -672,6 +672,12 @@ def submission_facts(doc: dict[str, Any]) -> dict[str, Any]:
     dob_age = kvget(kv, "Date of birth / age")
     match = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{4})\s*/\s*(\d+)", dob_age)
     term = re.search(r"(\d+)\s*year", kvget(kv, "Policy term"), flags=re.IGNORECASE)
+    requested_cover_text = kvget(kv, "Requested sum insured")
+    deductible_match = re.search(
+        r"deductible\s*(?:INR|Rs\.?|₹)?\s*([\d,]+)",
+        requested_cover_text,
+        flags=re.IGNORECASE,
+    )
 
     conditions = []
     for table in find_tables(doc, "condition", "year diagnosed"):
@@ -785,7 +791,8 @@ def submission_facts(doc: dict[str, Any]) -> dict[str, Any]:
         "submission_date": parse_date(kvget(kv, "Submission date")),
         "product": kvget(kv, "Requested product"),
         "policy_type": kvget(kv, "Policy type"),
-        "sum_insured": parse_amount(kvget(kv, "Requested sum insured")),
+        "sum_insured": parse_amount(requested_cover_text),
+        "deductible": parse_amount(deductible_match.group(1)) if deductible_match else None,
         "term_years": int(term.group(1)) if term else 1,
         "requested_start_date": kvget(kv, "Requested start date"),
         "add_ons": kvget(kv, "Add-ons requested"),
@@ -1126,7 +1133,7 @@ def identity_problems(entry: dict[str, Any], reference: dict[str, Any]) -> list[
     return problems
 
 
-def build_applicant_facts(paths: list[Path]) -> dict[str, Any]:
+def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Parse every readable document and aggregate the facts across them.
 
@@ -1148,10 +1155,12 @@ def build_applicant_facts(paths: list[Path]) -> dict[str, Any]:
         if doc["doc_type"] == "underwriting" and submission is None:
             submission = facts
 
+    # The proposal PDF is the reference; a live application has no proposal
+    # file, so the caller passes the form's identity instead.
     reference = {
-        "name": (submission or {}).get("name"),
-        "dob": (submission or {}).get("dob"),
-        "applicant_id": (submission or {}).get("applicant_id"),
+        "name": (submission or {}).get("name") or (reference or {}).get("name"),
+        "dob": (submission or {}).get("dob") or (reference or {}).get("dob"),
+        "applicant_id": (submission or {}).get("applicant_id") or (reference or {}).get("applicant_id"),
     }
 
     documents: list[dict[str, Any]] = []

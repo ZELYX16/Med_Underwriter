@@ -23,6 +23,7 @@ from components import (
     workflow_timeline,
 )
 from config import settings
+from live_intake import render_live_intake
 from styles import (
     footer,
     inject_css,
@@ -1038,8 +1039,9 @@ def render_sidebar() -> None:
         st.caption("WORKSPACE")
 
         navigation = [
-            ("Dashboard", "dashboard"),
-            ("All Cases", "cases"),
+            ("Overview", "dashboard"),
+            ("New Application", "live"),
+            ("Assessments", "cases"),
             ("Human Review", "review"),
         ]
 
@@ -1052,20 +1054,10 @@ def render_sidebar() -> None:
                 st.session_state.page = page
                 st.rerun()
 
-        st.caption("REFERENCE")
+        st.caption("OPERATIONS")
 
         if st.button(
-            "Applicants",
-            key="nav_applicants",
-            use_container_width=True,
-        ):
-            st.session_state.page = "applicants"
-            st.rerun()
-
-        st.caption("SYSTEM")
-
-        if st.button(
-            "System Status",
+            "Performance & Audit",
             key="nav_system",
             use_container_width=True,
         ):
@@ -2415,18 +2407,14 @@ def render_case_header(
 # CASE WORKSPACE NAVIGATION
 # ============================================================
 
+# Primary navigation is organized around underwriter tasks. Detailed agent traces,
+# workflow telemetry, and cache diagnostics remain available inside expandable areas.
 WORKSPACE_SECTIONS = [
     "Overview",
-    "Applicant",
-    "Submission",
     "Evidence",
-    "Agent 1",
-    "Agent 2",
-    "Agent 3",
+    "Assessment",
     "Decision",
-    "Workflow",
-    "Cache",
-    "Human Review",
+    "Review & Audit",
 ]
 
 
@@ -2438,16 +2426,14 @@ def render_workspace_navigation() -> None:
     selected = st.session_state.workspace_section
 
     columns = st.columns(
-        4
+        len(WORKSPACE_SECTIONS)
     )
 
     for index, section in enumerate(
         WORKSPACE_SECTIONS
     ):
 
-        column = columns[
-            index % 4
-        ]
+        column = columns[index]
 
         with column:
 
@@ -2513,45 +2499,46 @@ def render_case_workspace() -> None:
     render_workspace_navigation()
 
     section = st.session_state.workspace_section
+    if section not in WORKSPACE_SECTIONS:
+        section = "Overview"
+        st.session_state.workspace_section = section
 
     if section == "Overview":
         render_case_overview(case)
-
-    elif section == "Applicant":
-        render_case_applicant(case)
-
-    elif section == "Submission":
-        render_case_submission(case)
+        with st.expander("Applicant profile", expanded=False):
+            render_case_applicant(case)
+        with st.expander("Submission details", expanded=False):
+            render_case_submission(case)
 
     elif section == "Evidence":
         render_case_evidence(case)
 
-    elif section == "Agent 1":
-        render_agent_section(
-            case,
-            1,
+    elif section == "Assessment":
+        section_title(
+            "Underwriting Assessment",
+            "Review the evidence-led findings from each assessment stage.",
         )
-
-    elif section == "Agent 2":
-        render_agent_section(
-            case,
-            2,
-        )
-
-    elif section == "Agent 3":
-        render_agent3_section(case)
+        with st.expander("Stage 1 · Submission and evidence assessment", expanded=True):
+            render_agent_section(case, 1)
+        with st.expander("Stage 2 · Risk assessment", expanded=False):
+            render_agent_section(case, 2)
+        with st.expander("Stage 3 · Reflection and quality checks", expanded=False):
+            render_agent3_section(case)
 
     elif section == "Decision":
         render_decision_section(case)
 
-    elif section == "Workflow":
-        render_workflow_section(case)
-
-    elif section == "Cache":
-        render_case_cache(case)
-
-    elif section == "Human Review":
-        render_human_review(case)
+    elif section == "Review & Audit":
+        section_title(
+            "Review & Audit",
+            "Human review actions, workflow history, and technical diagnostics.",
+        )
+        with st.expander("Human review", expanded=True):
+            render_human_review(case)
+        with st.expander("Workflow trace", expanded=False):
+            render_workflow_section(case)
+        with st.expander("Cache diagnostics", expanded=False):
+            render_case_cache(case)
 
 
 # ============================================================
@@ -3863,10 +3850,17 @@ def render_agent_section(
         case,
         number,
     ):
-
-        st.info(
-            f"Agent {number} has not produced a result yet."
-        )
+        status = status_key(case.get("final_status") or case.get("status") or "")
+        errors = case.get("errors") or []
+        if status in {"failed", "awaiting-human-review", "human-review", "escalated"} and errors:
+            last_error = errors[-1] if isinstance(errors[-1], dict) else {}
+            st.error(
+                f"Agent {number} did not complete because the workflow stopped. "
+                f"Failure: {last_error.get('type', 'Workflow error')} — "
+                f"{last_error.get('message', 'See Review & Audit for diagnostics.')}"
+            )
+        else:
+            st.info(f"Agent {number} has not started or has not produced a result yet.")
         return
 
     if number == 1:
@@ -4906,6 +4900,18 @@ def render_workflow_section(
             trace
         )
 
+    errors = case.get("errors") or []
+    if errors:
+        st.divider()
+        st.markdown("#### Workflow failures and diagnostics")
+        for index, error in enumerate(errors, 1):
+            if not isinstance(error, dict):
+                continue
+            label = error.get("stage") or error.get("node") or error.get("type") or "Workflow error"
+            st.error(f"{index}. {humanize(str(label))}: {error.get('user_message') or error.get('message') or 'No diagnostic message was recorded.'}")
+            with st.expander(f"Technical details · {label}", expanded=False):
+                st.code(str(error.get("traceback") or error.get("message") or error), language="text")
+
     if events:
 
         st.divider()
@@ -5280,6 +5286,9 @@ def main() -> None:
 
     elif page == "case":
         render_case_workspace()
+
+    elif page == "live":
+        render_live_intake()
 
     elif page == "system":
         render_system_status()

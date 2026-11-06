@@ -28,3 +28,6 @@ ragas
 deepeval
 pytest
 langfuse
+# Add this dependency to the project's existing backend requirements.
+# It provides LangGraph's persistent SQLite checkpoint saver.
+langgraph-checkpoint-sqlite>=2.0.0,<3.0.0

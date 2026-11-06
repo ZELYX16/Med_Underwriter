@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import time
 from typing import Any
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.agent1_submission import submission_agent
@@ -14,15 +14,10 @@ from app.agents.routing.complexity_router import complexity_router
 from app.cache.pattern_cache import cache_scope
 from app.config import settings
 from app.models.state import UnderwritingState
-from app.observability.langfuse_tracer import (
-    flush_traces,
-    get_langfuse_callback,
-    observe_span,
-    trace_context,
-)
+from app.services import outcome
 
 
-MAX_REFLECTION_ROUNDS = 3
+MAX_REFLECTION_ROUNDS = 2  # Initial review plus at most one follow-up pass.
 HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD = 80.0
 HUMAN_REVIEW_OVERALL_RISK_THRESHOLD = 70.0
 HUMAN_REVIEW_CONFIDENCE_THRESHOLD = 0.70
@@ -338,7 +333,6 @@ def _append_error(
     return errors
 
 
-@observe_span(name="intake", as_type="span")
 def intake_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -365,7 +359,6 @@ def intake_node(
     }
 
 
-@observe_span(name="agent1_submission", as_type="span")
 async def agent1_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -560,7 +553,6 @@ async def agent1_node(
         }
 
 
-@observe_span(name="complexity_router", as_type="span")
 def complexity_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -654,7 +646,6 @@ def complexity_node(
         }
 
 
-@observe_span(name="agent2_risk", as_type="span")
 def agent2_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -772,10 +763,12 @@ def agent2_node(
             "fraud_notes": result.get("fraud_notes", []),
             # Sticky within a run: later nodes (and a rescore) can add reasons
             # but nothing removes one.
+            "compliance_report": result.get("compliance_report", {}),
+            "confidence_layers": result.get("confidence_layers", {}),
             "mandatory_review_reasons": list(
                 dict.fromkeys(
-                    list(state.get("mandatory_review_reasons") or [])
-                    + list(result.get("mandatory_review_reasons") or [])
+                    (state.get("mandatory_review_reasons") or [])
+                    + (result.get("mandatory_review_reasons") or [])
                 )
             ),
             "agent2_recommendation": recommendation,
@@ -853,7 +846,6 @@ def agent2_node(
         }
 
 
-@observe_span(name="confidence_gate", as_type="span")
 def confidence_gate_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -945,7 +937,6 @@ def confidence_gate_node(
     }
 
 
-@observe_span(name="agent3_reflection", as_type="span")
 def reflection_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1367,6 +1358,24 @@ def _review_notes(state: UnderwritingState) -> list[dict[str, Any]]:
     return [n for n in notes if n.get("text")]
 
 
+def _outcome_fields(state: UnderwritingState) -> dict[str, Any]:
+    """Graded outcome and reason codes (owner + action) for the reviewer."""
+    blocking = _business_review_reasons(state)
+    mandatory = [
+        r for r in state.get("mandatory_review_reasons") or []
+        if str(r).startswith("Mandatory review")
+    ]
+    level = outcome.grade(
+        blocking=blocking,
+        mandatory=mandatory,
+        security=list(state.get("security_review_reasons") or []),
+        discrepancy_score=float(state.get("fraud_risk_score", 0.0) or 0.0),
+        layers=state.get("confidence_layers") or {},
+        sum_insured=(state.get("submission") or {}).get("sum_insured"),
+    )
+    return {"decision_level": level, "reason_codes": outcome.reason_codes(blocking)}
+
+
 def post_reflection_router(
     state: UnderwritingState,
 ) -> str:
@@ -1413,7 +1422,6 @@ def post_reflection_router(
     return "finalize"
 
 
-@observe_span(name="human_review", as_type="span")
 def human_review_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1436,6 +1444,7 @@ def human_review_node(
         "final_status": "awaiting_human_review",
         "human_review_status": "awaiting_review",
         "review_notes": _review_notes(state),
+        **_outcome_fields(state),
         "require_human_escalation": True,
         "workflow_trace": _trace(
             state,
@@ -1455,7 +1464,6 @@ def human_review_node(
     }
 
 
-@observe_span(name="finalize", as_type="span")
 def finalize_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
@@ -1525,7 +1533,22 @@ def finalize_node(
         )
         status = "completed"
 
+    fields = _outcome_fields(state)
+    extra: dict[str, Any] = {}
+    if fields["decision_level"] == "assisted_review" and status == "completed":
+        decision, status = "human_review_required", "awaiting_human_review"
+        recommendation = "human_review"
+        extra["human_review_reason"] = (
+            "Close to a pricing band edge on a high cover or thin evidence: one-look confirmation."
+        )
+        fields["reason_codes"] = [{
+            "code": "ASSISTED", "text": extra["human_review_reason"],
+            "owner": "Underwriter", "action": "Confirm the band and the loading.",
+        }]
+
     return {
+        **extra,
+        **fields,
         "updated_at": _now(),
         "final_decision": decision,
         "final_status": status,
@@ -1557,6 +1580,13 @@ def finalize_node(
             "finalize",
         ),
     }
+
+
+def route_after_agent2(state: UnderwritingState) -> str:
+    """Never run risk gates/reflection on an incomplete Agent 2 result."""
+    if state.get("final_status") == "failed" or not state.get("agent2_completed"):
+        return "human_review"
+    return "confidence_gate"
 
 
 def build_graph() -> StateGraph:
@@ -1624,9 +1654,13 @@ def build_graph() -> StateGraph:
         "agent2_risk",
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "agent2_risk",
-        "confidence_gate_node",
+        route_after_agent2,
+        {
+            "confidence_gate": "confidence_gate_node",
+            "human_review": "human_review",
+        },
     )
 
     graph.add_conditional_edges(
@@ -1661,56 +1695,31 @@ def build_graph() -> StateGraph:
     return graph
 
 
-memory_saver = MemorySaver()
+# LangGraph is executed asynchronously below, so its checkpointer must also
+# support async operations. Checkpoints remain in the existing application
+# SQLite database; this does not change the application data schema.
+
+def create_async_graph(checkpointer):
+    """Compile the underwriting graph with an async-compatible checkpointer."""
+    return build_graph().compile(checkpointer=checkpointer)
 
 
-workflow = build_graph().compile(
-    checkpointer=memory_saver,
-)
-
-
-def create_async_graph():
-    return workflow
-
-
-@observe_span(name="underwriting_case_pipeline")
 async def run_workflow(
     initial_state: UnderwritingState,
     thread_id: str | None = None,
     on_update=None,
 ) -> dict[str, Any]:
-    case_id = initial_state.get(
-        "case_id",
-        "unknown",
-    )
-    applicant_id = (
-        initial_state.get("applicant_profile", {}).get("applicant_id")
-        or initial_state.get("applicant_id")
-        or "unknown"
-    )
-
-    config = {
-        "configurable": {
-            "thread_id": (
-                thread_id
-                or case_id
-            ),
-        }
-    }
-
-    langfuse_cb = get_langfuse_callback()
-    if langfuse_cb is not None:
-        config["callbacks"] = [langfuse_cb]
-
+    case_id = initial_state.get("case_id", "unknown")
+    config = {"configurable": {"thread_id": thread_id or case_id}}
     started = time.perf_counter()
     result = dict(initial_state)
 
-    trace_meta = {
-        "case_id": case_id,
-        "product": initial_state.get("submission", {}).get("product_name", ""),
-    }
+    # Keep the async SQLite connection alive for the complete graph run.
+    # Using the same SQLite file preserves existing checkpoint/application DBs.
+    async with AsyncSqliteSaver.from_conn_string(str(settings.sqlite_file)) as checkpointer:
+        await checkpointer.setup()
+        workflow = create_async_graph(checkpointer)
 
-    with trace_context(case_id=case_id, applicant_id=applicant_id, metadata=trace_meta):
         # Stream completed node states so the API can persist progress while
         # the asynchronous workflow is still running.
         async for update in workflow.astream(
@@ -1723,8 +1732,6 @@ async def run_workflow(
                 callback_result = on_update(result)
                 if hasattr(callback_result, "__await__"):
                     await callback_result
-
-    flush_traces()
 
     agent_metrics = result.get(
         "agent_metrics",

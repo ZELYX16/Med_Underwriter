@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.live_routes import router as live_router
 from app.api.routes import router
 from app.config import settings
 from app.store.state_store import state_store
@@ -45,13 +46,10 @@ async def lifespan(app: FastAPI):
 
     state_store.health_check()
 
-    if (
-        settings.secret_key == "development-secret-key"
-        and settings.environment.lower() != "development"
-    ):
+    if not settings.secret_key.strip():
         logger.warning(
-            "SECRET_KEY is still the development default; set a real "
-            "value outside development."
+            "SECRET_KEY is not configured. This is acceptable only for local development; "
+            "configure it before exposing the service."
         )
 
     try:
@@ -103,6 +101,10 @@ app.add_middleware(
 
 app.include_router(
     router,
+    prefix="/api",
+)
+app.include_router(
+    live_router,
     prefix="/api",
 )
 
