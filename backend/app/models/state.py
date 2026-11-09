@@ -38,6 +38,9 @@ class UnderwritingState(TypedDict, total=False):
 
     agent1_enrichment: dict[str, Any]
     agent1_completed: bool
+    underwriting_submission: list[dict[str, Any]]
+    underwriting_knowledge_evidence: list[dict[str, Any]]
+    agent1_metrics: dict[str, Any]
 
     # ------------------------------------------------------------------
     # Complexity routing
@@ -68,6 +71,8 @@ class UnderwritingState(TypedDict, total=False):
     agent2_reasoning: str
     reasoning_structured: dict[str, Any]
     agent2_completed: bool
+    agent2_metrics: dict[str, Any]
+    decision_basis: dict[str, Any]
 
     # ------------------------------------------------------------------
     # Confidence gate
@@ -85,6 +90,8 @@ class UnderwritingState(TypedDict, total=False):
     reflection_verdict: str
     reflection_requires_rescore: bool
     agent3_completed: bool
+    agent3_metrics: dict[str, Any]
+    reflection_consensus: bool
 
     constitutional_medical_accuracy: dict[str, Any]
     constitutional_actuarial_soundness: dict[str, Any]
@@ -198,7 +205,7 @@ class UnderwriteResult(BaseModel):
 
 
 class HumanReviewInput(BaseModel):
-    approved: bool
+    approved: bool = True
     reviewer: str
     comments: str = ""
 

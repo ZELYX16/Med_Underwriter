@@ -680,6 +680,8 @@ def agent2_node(
                     {},
                 ),
                 routing_result=routing_result,
+                reflection_findings=state.get("reflection_findings") or [],
+                reflection_round=int(state.get("reflection_round") or 0),
             )
 
         risk_assessment = result.get(
@@ -1399,7 +1401,9 @@ def post_reflection_router(
     )
 
     if reflection_round >= MAX_REFLECTION_ROUNDS:
-        return "human_review"
+        if state.get("reflection_requires_rescore", False) or not state.get("reflection_consensus", False) or state.get("reflection_verdict", "pass") in {"review", "escalate", "fail"}:
+            return "human_review"
+        return "finalize"
 
     if state.get(
         "reflection_requires_rescore",
@@ -1582,6 +1586,20 @@ def finalize_node(
     }
 
 
+def route_after_agent1(state: UnderwritingState) -> str:
+    """Route to human_review if agent1 failed, otherwise continue."""
+    if state.get("final_status") == "failed" or not state.get("agent1_completed"):
+        return "human_review"
+    return "complexity_router"
+
+
+def route_after_complexity(state: UnderwritingState) -> str:
+    """Route to human_review if complexity router failed, otherwise continue."""
+    if state.get("final_status") == "failed" or not state.get("routing_completed"):
+        return "human_review"
+    return "agent2_risk"
+
+
 def route_after_agent2(state: UnderwritingState) -> str:
     """Never run risk gates/reflection on an incomplete Agent 2 result."""
     if state.get("final_status") == "failed" or not state.get("agent2_completed"):
@@ -1644,14 +1662,22 @@ def build_graph() -> StateGraph:
         "agent1_submission",
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "agent1_submission",
-        "complexity_router",
+        route_after_agent1,
+        {
+            "complexity_router": "complexity_router",
+            "human_review": "human_review",
+        },
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "complexity_router",
-        "agent2_risk",
+        route_after_complexity,
+        {
+            "agent2_risk": "agent2_risk",
+            "human_review": "human_review",
+        },
     )
 
     graph.add_conditional_edges(

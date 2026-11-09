@@ -84,12 +84,20 @@ class HybridRAG:
             else None
         )
 
-        return self._search(
+        results = self._search(
             collection_name=self.UNDERWRITING_COLLECTION,
             query=query,
             top_k=top_k,
             where=where,
         )
+        if not results and where:
+            results = self._search(
+                collection_name=self.UNDERWRITING_COLLECTION,
+                query=query,
+                top_k=top_k,
+                where=None,
+            )
+        return results
 
     async def retrieve(
         self,
@@ -134,12 +142,13 @@ class HybridRAG:
         if use_crag:
             from app.rag.crag import crag
 
+            scope = "applicant" if intent in {"claims", "policy"} else "knowledge"
             crag_result = await crag.retrieve(
                 query=query,
                 intent=intent,
                 context=context,
                 top_k=limit,
-                source_scope="knowledge",
+                source_scope=scope,
             )
 
             return {
@@ -155,12 +164,14 @@ class HybridRAG:
                     "total_results",
                     0,
                 ),
-                "quality": crag_result.get(
-                    "quality",
-                    {},
-                ),
+                "quality": {
+                    "score": crag_result.get("quality_score", 0.0),
+                    "band": crag_result.get("quality_band", "unknown"),
+                    "initial_score": crag_result.get("initial_quality_score", 0.0),
+                    "initial_band": crag_result.get("initial_quality_band", "unknown"),
+                },
                 "corrected": crag_result.get(
-                    "corrected",
+                    "corrective_retrieval",
                     False,
                 ),
                 "sources_used": self._sources_for_intent(
@@ -420,16 +431,22 @@ class HybridRAG:
             ):
                 metadata = {}
 
-            key = (
-                result.get("document_id")
-                or metadata.get("document_id")
-                or result.get("file_name")
-                or metadata.get("file_name")
-                or result.get(
-                    "content",
-                    "",
-                )[:150]
+            chunk_id = (
+                result.get("chunk_id")
+                or metadata.get("chunk_id")
+                or (
+                    f"{result.get('document_id') or metadata.get('document_id')}_{metadata.get('chunk_index')}"
+                    if metadata.get("chunk_index") is not None
+                    else None
+                )
+                or (
+                    f"{result.get('file_name') or metadata.get('file_name')}_{metadata.get('chunk_index')}"
+                    if metadata.get("chunk_index") is not None
+                    else None
+                )
+                or (result.get("content") or "")[:150]
             )
+            key = chunk_id
 
             if not key:
                 key = str(

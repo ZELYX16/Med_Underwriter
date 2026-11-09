@@ -59,7 +59,7 @@ _ENRICHMENT_DUPLICATES = {
     "underwriting_review_evidence",
     "scratchpad",
 }
-_STATE_DUPLICATES = {"scratchpad", "actuarial_guidance", "underwriting_submission"}
+_STATE_DUPLICATES = {"scratchpad"}
 
 
 def slim_state(state: dict[str, Any]) -> dict[str, Any]:

@@ -254,6 +254,7 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "medical_conditions": [
             {
                 "condition": c["clinical"],
+                "group": c.get("group"),
                 "year_diagnosed": _year(c.get("answers", {}).get("since")),
                 "status": "; ".join(
                     f"{k.replace('_', ' ')}: {v}"

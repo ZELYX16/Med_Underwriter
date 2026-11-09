@@ -325,6 +325,12 @@ async def load_scenario(token: str, scenario_id: str, background: BackgroundTask
 @router.post("/sessions/{token}/submit")
 async def submit(token: str, background: BackgroundTasks, proceed: bool = False):
     session = _session(token)
+    if session.get("status") in {"submitted", "processing"}:
+        raise HTTPException(status_code=409, detail="This application is already being processed. Please wait.")
+    case_status_info = state_store.get_case_status(session["case_id"])
+    if case_status_info and str(case_status_info.get("status", "")).lower() in {"processing", "agent1", "agent2", "agent3"}:
+        raise HTTPException(status_code=409, detail="This application is already being processed. Please wait.")
+
     blocking = [i for i in intake.open_items(session["form"], session["documents"]) if i["blocking"]]
     if blocking:
         return _ok({"status": "incomplete", "open_items": blocking})
@@ -339,11 +345,21 @@ async def submit(token: str, background: BackgroundTasks, proceed: bool = False)
                  final_status="draft", final_decision="", final_recommendation="")
     state_store.save_case(case_id, state, status="draft")
     cost_guard.reset(case_id)
+
+    # Set processing status atomically before launching background task
+    state_store.update_case_status(case_id, "processing")
+    get_store().update(token, status="processing")
+
     try:
         prepared = await asyncio.to_thread(_prepare_case_for_run, case_id, proceed)
     except AwaitingDocuments as waiting:
         get_store().update(token, status="collecting")
+        state_store.update_case_status(case_id, "awaiting_documents")
         return _ok({"status": "awaiting_documents", "missing": waiting.missing})
+    except Exception:
+        get_store().update(token, status="draft")
+        state_store.update_case_status(case_id, "draft")
+        raise
     background.add_task(_run_case, case_id, prepared)
     get_store().update(token, status="submitted")
     return _ok({"status": "submitted", "case_id": case_id})

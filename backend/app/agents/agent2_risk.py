@@ -44,6 +44,8 @@ class RiskAssessmentAgent:
         submission: dict[str, Any],
         enrichment_results: dict[str, Any],
         routing_result: dict[str, Any],
+        reflection_findings: list[dict[str, Any]] | None = None,
+        reflection_round: int = 0,
     ) -> dict[str, Any]:
         agent_started = time.perf_counter()
         self._last_llm_metrics = {}
@@ -54,6 +56,8 @@ class RiskAssessmentAgent:
             submission,
             enrichment_results,
         )
+        features["reflection_findings"] = reflection_findings or []
+        features["reflection_round"] = reflection_round
 
         # Rule-based fraud indicators: no LLM call, no extra retrieval.
         # Run first so conditions found in documents but not declared are
@@ -255,6 +259,8 @@ class RiskAssessmentAgent:
             "reasoning_structured": reasoning_structured,
             "reasoning_cache_key": self._last_cache_key,
             "decision_basis": decision_basis,
+            "reflection_findings": reflection_findings or [],
+            "reflection_round": reflection_round,
             "metrics": metrics,
             "agent2_metrics": metrics,
             "agent2_completed": True,
@@ -628,6 +634,19 @@ class RiskAssessmentAgent:
             "arthritis": 5,
             "thyroid": 4,
             "hypothyroidism": 4,
+            "respiratory": 12,
+            "cerebrovascular": 20,
+            "stroke": 20,
+            "neurological": 10,
+            "mental_health": 8,
+            "substance": 10,
+            "autoimmune": 10,
+            "obesity": 8,
+            "lipids": 5,
+            "cholesterol": 5,
+            "urinary_calculi": 6,
+            "spine": 6,
+            "musculoskeletal": 6,
         }
 
         for condition in conditions:
@@ -641,14 +660,15 @@ class RiskAssessmentAgent:
             text = condition_text.lower()
             matched = False
 
+            group_from_cond = condition.get("group") if isinstance(condition, dict) else None
+            resolved_group = group_from_cond or text_group(condition_text)
+            assessment = (features.get("tier_by_group") or {}).get(resolved_group)
+
             for keyword, weight in condition_weights.items():
                 if keyword in text:
-                    assessment = (features.get("tier_by_group") or {}).get(
-                        text_group(condition_text)
-                    )
                     # A controlled, routine condition counts for less; a
                     # serious one for more.
-                    if assessment and assessment["tier"] == "routine" and assessment["control"] == "controlled":
+                    if assessment and assessment.get("tier") == "routine" and assessment.get("control") == "controlled":
                         medical_score += weight * 0.5
                     else:
                         medical_score += weight
@@ -656,17 +676,42 @@ class RiskAssessmentAgent:
                         "Medical condition requiring assessment: "
                         + condition_text
                     )
-                    if assessment and assessment["tier"] == "serious":
+                    if assessment and assessment.get("tier") == "serious":
                         medical_score += 10
                         risk_factors.append(
                             f"Serious condition: {assessment['label']} ("
-                            + "; ".join(assessment["reasons"]) + ")"
+                            + "; ".join(assessment.get("reasons", [])) + ")"
                         )
                     matched = True
                     break
 
+            if not matched and resolved_group:
+                weight = condition_weights.get(resolved_group, 3)
+                if assessment and assessment.get("tier") == "routine" and assessment.get("control") == "controlled":
+                    medical_score += weight * 0.5
+                else:
+                    medical_score += weight
+                risk_factors.append(
+                    "Medical condition requiring assessment: "
+                    + condition_text
+                )
+                if assessment and assessment.get("tier") == "serious":
+                    medical_score += 10
+                    risk_factors.append(
+                        f"Serious condition: {assessment['label']} ("
+                        + "; ".join(assessment.get("reasons", [])) + ")"
+                    )
+                matched = True
+
             if not matched:
-                medical_score += 3
+                tier = assessment.get("tier", "routine") if assessment else "routine"
+                medical_score += 3 * (0.5 if tier == "routine" else 1.0)
+                if assessment and assessment.get("tier") == "serious":
+                    medical_score += 10
+                    risk_factors.append(
+                        f"Serious condition: {assessment.get('label', condition_text)} ("
+                        + "; ".join(assessment.get("reasons", [])) + ")"
+                    )
 
         # Conditions found in the applicant's documents but not declared
         # still carry their medical risk.

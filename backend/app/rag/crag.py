@@ -573,30 +573,24 @@ class CRAG:
             ):
                 metadata = {}
 
-            key = (
-                result.get(
-                    "document_id"
+            chunk_id = (
+                result.get("chunk_id")
+                or metadata.get("chunk_id")
+                or (
+                    f"{result.get('document_id') or metadata.get('document_id')}_{metadata.get('chunk_index')}"
+                    if metadata.get("chunk_index") is not None
+                    else None
                 )
-                or metadata.get(
-                    "document_id"
+                or (
+                    f"{result.get('file_name') or metadata.get('file_name')}_{metadata.get('chunk_index')}"
+                    if metadata.get("chunk_index") is not None
+                    else None
                 )
-                or result.get(
-                    "file_name"
-                )
-                or metadata.get(
-                    "file_name"
-                )
-                or result.get(
-                    "id"
-                )
-                or metadata.get(
-                    "id"
-                )
-                or result.get(
-                    "content",
-                    ""
-                )[:150]
+                or result.get("id")
+                or metadata.get("id")
+                or (result.get("content") or "")[:150]
             )
+            key = chunk_id
 
             if not key:
                 key = str(

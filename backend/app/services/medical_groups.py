@@ -104,8 +104,8 @@ _HISTORY_CODES = {
 
 # (regex, group) for free text, most specific first.
 _TEXT_PATTERNS: list[tuple[str, str]] = [
-    (r"chronic kidney|ckd\b|renal failure|renal insufficiency|nephropath|nephritis|dialysis", "renal"),
-    (r"kidney stone|urinary (tract )?calcul|calculus|calculi|lithotrips|ureter|renal colic|hydronephro|urolith", "urinary_calculi"),
+    (r"kidney stone|urinary (tract )?calcul|calculus|calculi|lithotrips|ureter|renal colic|hydronephro|urolith|kidney.*calcul", "urinary_calculi"),
+    (r"chronic kidney|ckd\b|renal failure|renal insufficiency|nephropath|nephritis|dialysis|kidney.*(condition|problem|disease|disorder)|urinary.*(condition|problem|disorder)", "renal"),
     (r"diabet|hba1c|insulin|metformin", "diabetes"),
     (r"hypothyroid|hyperthyroid|thyroid", "thyroid"),
     (r"hypertens|high blood pressure", "hypertension"),
@@ -113,19 +113,19 @@ _TEXT_PATTERNS: list[tuple[str, str]] = [
     (r"stroke|cerebrovascular|transient ischaemic|transient ischemic", "cerebrovascular"),
     (r"cancer|carcinoma|malignan|lymphoma|leukaemia|leukemia|tumou?r|oncolog", "cancer"),
     (r"cirrhosis|hepatitis|fatty liver|liver (disease|disorder)|hepatic", "liver"),
-    (r"copd|chronic obstructive|asthma|bronchiectasis", "respiratory"),
+    (r"copd|chronic obstructive|asthma|bronchiectasis|respiratory|chronic respiratory", "respiratory"),
     (r"rheumatoid|lupus|ankylosing|psoria|autoimmune|rheumatolog", "autoimmune"),
-    (r"epilep|seizure|parkinson|multiple sclerosis|migraine", "neurological"),
-    (r"depress|anxiety|bipolar|schizophren|psychiat|mental health", "mental_health"),
+    (r"epilep|seizure|parkinson|multiple sclerosis|migraine|neurolog", "neurological"),
+    (r"depress|anxiety|bipolar|schizophren|psychiat|mental[- ]health", "mental_health"),
     (r"alcohol (use )?disorder|substance|drug (abuse|dependence)", "substance"),
     (r"\bhiv\b|\baids\b", "hiv"),
-    (r"disc (herniation|prolapse|displacement)|radiculopath|lumbar|spondyl|sciatica|low back|back pain|spine|spinal", "spine"),
+    (r"disc (herniation|prolapse|displacement)|radiculopath|lumbar|spondyl|sciatica|low back|back pain|spine|spinal|joint disorder|spine disorder", "spine"),
     (r"osteoarthritis|knee|joint|arthritis|osteopor", "musculoskeletal"),
     (r"gall(bladder|stone)|cholecyst", "gallbladder"),
     (r"\bhernia\b", "hernia"),
     (r"cataract", "eye"),
     (r"prostat|\bbph\b", "prostate"),
-    (r"gerd|reflux|oesophag|esophag|gastritis|ulcer|irritable bowel|crohn|colitis", "gi"),
+    (r"gerd|reflux|oesophag|esophag|gastritis|ulcer|irritable bowel|crohn|colitis|digestive", "gi"),
     (r"dyslipid|cholesterol|hyperlipid", "lipids"),
     (r"obes", "obesity"),
 ]
@@ -198,6 +198,9 @@ def declared_groups(
     """Every group the applicant has declared, by condition or by a Yes answer."""
     groups: set[str] = set()
     for condition in conditions or []:
+        if isinstance(condition, dict) and condition.get("group"):
+            groups.add(condition["group"])
+            continue
         text = (
             " ".join(str(v) for v in condition.values() if v)
             if isinstance(condition, dict)
@@ -208,7 +211,7 @@ def declared_groups(
             groups.add(group)
     for item in questionnaire or []:
         answer = str(item.get("answer", "")).strip().lower()
-        if answer not in {"yes", "y", "true"}:
+        if not (answer in {"yes", "y", "true", "1"} or answer.startswith("yes")):
             continue
         # The answer's own details say which condition it is (stones are not
         # chronic kidney disease); only an answer without details falls back

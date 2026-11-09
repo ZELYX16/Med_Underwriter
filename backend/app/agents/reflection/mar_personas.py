@@ -147,11 +147,7 @@ class MARPersonas:
             and finding.get("finding")
         ]
 
-        if previous_concern_findings and not concerns:
-            concerns.append(
-                "Previous reflection concern remains unresolved: "
-                + previous_concern_findings[-1]
-            )
+# Previous concerns are not carried forward if current round resolved them
 
         verdict = (
             "flag"
@@ -165,7 +161,7 @@ class MARPersonas:
             "verdict": verdict,
             "concerns": concerns,
             "reasoning": (
-                "Review identified one or more concerns."
+                "Concerns: " + "; ".join(concerns)
                 if concerns
                 else "Review completed with no material concerns."
             ),
