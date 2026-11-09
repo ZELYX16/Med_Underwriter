@@ -65,7 +65,7 @@ def _customer(session: dict[str, Any]) -> dict[str, Any]:
         names = [m.get("document", "") for m in case.get("missing_documents", []) if m.get("blocking")]
         return {"stage": "Waiting for you", "headline": "We need a document to continue",
                 "reason": "Please add the item below and press Submit again.", "next_steps": [f"Please send: {n}" for n in names]}
-    level = case.get("decision_level") or ("straight_through" if status == "completed" else "full_review")
+    level = "straight_through" if status == "completed" else (case.get("decision_level") or "full_review")
     pricing = case.get("pricing_result") or {}
     message = outcome.customer_message(level, str(case.get("agent2_recommendation", "")),
                                        float(pricing.get("loading_percentage", 0) or 0), missing_docs)

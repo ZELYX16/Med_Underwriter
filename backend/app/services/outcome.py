@@ -92,6 +92,14 @@ def customer_message(level: str, recommendation: str, loading: float, missing: l
     ask = [f"Please send: {m}" for m in missing]
     rec = str(recommendation or "").strip().lower()
 
+    if level in {"assisted_review", "full_review", "senior_referral"}:
+        headline = "Our underwriting team is reviewing your application"
+        reason = ("A member of our team will look at your application personally. This is normal when "
+                  "health details need a closer look and does not mean it has been declined.")
+        if level == "assisted_review":
+            reason = "A member of our team is confirming a final check before we send your decision."
+        return {"headline": headline, "reason": reason, "next_steps": ask or ["Nothing is needed from you right now."]}
+
     if rec == "decline":
         headline = "Application Declined"
         reason = "Based on our underwriting assessment and medical guidelines, we are unable to offer coverage at this time."
@@ -101,7 +109,7 @@ def customer_message(level: str, recommendation: str, loading: float, missing: l
     elif rec == "accept_with_exclusion":
         headline = "Application Approved with Specific Exclusions"
         reason = "Your application has been approved subject to specific policy exclusions based on your medical history."
-    elif level == "straight_through" or rec in {"standard_acceptance", "accept_with_loading"}:
+    elif level == "straight_through" or rec in {"standard_acceptance", "accept_with_loading", "human_approved"}:
         if (loading and loading > 0) or rec == "accept_with_loading":
             headline = "Your application is approved with an additional charge"
             reason = (f"Based on the health details you gave us, your premium includes an additional "
@@ -113,8 +121,6 @@ def customer_message(level: str, recommendation: str, loading: float, missing: l
         headline = "Our underwriting team is reviewing your application"
         reason = ("A member of our team will look at your application personally. This is normal when "
                   "health details need a closer look and does not mean it has been declined.")
-        if level == "assisted_review":
-            reason = "A member of our team is confirming a final check before we send your decision."
 
     return {"headline": headline, "reason": reason, "next_steps": ask or ["Nothing is needed from you right now."]}
 

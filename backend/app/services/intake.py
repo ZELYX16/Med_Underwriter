@@ -181,11 +181,36 @@ def open_items(form: dict[str, Any], documents: list[dict[str, Any]],
     has_exam = "medical_exam" in detected_types
     for need in required_documents(form):
         medical_types = {"medical_exam", "lab", "specialist", "prescription", "discharge"}
+        cond_match = False
+        c_prefix = need["id"].split("_")[0] if "_" in need["id"] else ""
+        if c_prefix and c_prefix in BY_KEY:
+            synonyms = {k for k, v in _SYNONYMS.items() if v == c_prefix} | {c_prefix}
+            doc_desc = (need.get("document") or "").lower()
+            for d in live:
+                fname = (d.get("filename") or d.get("name") or "").lower()
+                dtype = (d.get("detected_type") or "").lower()
+                dfolder = (d.get("folder") or "").lower()
+                matches_synonym = any(s in fname for s in synonyms)
+                matches_doc_kw = (
+                    ("discharge" in doc_desc and ("discharge" in fname or dtype == "discharge"))
+                    or ("cardio" in doc_desc and ("cardio" in fname or "heart" in fname or "nstemi" in fname or dtype == "specialist"))
+                    or ("lab" in doc_desc and ("lab" in fname or "hba1c" in fname or "sugar" in fname or dtype == "lab"))
+                    or ("kidney" in doc_desc and ("kidney" in fname or "renal" in fname or "kft" in fname))
+                    or ("liver" in doc_desc and ("liver" in fname or "lft" in fname or "hepatic" in fname))
+                    or ("oncology" in doc_desc and ("onco" in fname or "cancer" in fname or "biopsy" in fname or dtype == "specialist"))
+                    or ("neurology" in doc_desc and ("neuro" in fname or "stroke" in fname or dtype == "specialist"))
+                )
+                if (matches_synonym or matches_doc_kw) and (dfolder == "medical" or dtype in medical_types or not dfolder):
+                    cond_match = True
+                    break
+                if c_prefix == "bp" and (dtype in medical_types or dfolder == "medical"):
+                    cond_match = True
+                    break
+
         inferred_match = (
-            (need["id"] == "policy" and ("policy" in detected_folders or "policy" in detected_types))
-            or (need["id"] == "claims" and ("claims" in detected_folders or "claim" in detected_types))
-            or (need["id"].startswith("bp_") and bool(detected_types & medical_types))
-            or (need["id"].startswith("diabetes_") and bool(detected_types & {"lab", "medical_exam", "specialist"}))
+            (need["id"] == "policy" and ("policy" in detected_folders or "policy" in detected_types or any("policy" in (d.get("filename") or "").lower() for d in live)))
+            or (need["id"] == "claims" and ("claims" in detected_folders or "claim" in detected_types or any("claim" in (d.get("filename") or "").lower() for d in live)))
+            or cond_match
         )
         if need["id"] in attached or inferred_match or (need["id"] == "medical_exam" and has_exam):
             continue
