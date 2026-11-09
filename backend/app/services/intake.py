@@ -202,6 +202,8 @@ def open_items(form: dict[str, Any], documents: list[dict[str, Any]],
         from app.services.clarification_engine import build_clarifications
         clarifications = build_clarifications(form, documents)
     for question in clarifications:
+        if question.get("answered") and not question.get("needs_human_review"):
+            continue
         items.append({
             **question,
             "kind": "clarification",

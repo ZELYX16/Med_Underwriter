@@ -216,3 +216,66 @@ def test_cleanup_config_sync_and_tracer():
     with pytest.raises(ValueError):
         with trace_context("case-123"):
             raise ValueError("Test error inside context")
+
+
+def test_clarifications_retention_and_prefill_suppression():
+    from app.services.clarification_engine import build_clarifications
+    from app.services import intake
+
+    # Prefilled form with existing previous insurer and policy details
+    form = {
+        "has_other_insurance": "yes",
+        "previous_insurer": "Northgate Life & Health",
+        "previous_policy_number": "POL-007",
+        "hospital_stay": "yes",
+        "hospital_details": "NSTEMI; stent placed on 06-Oct-2022",
+        "conditions": [
+            {
+                "key": "heart",
+                "label": "Heart problem",
+                "answers": {"since": "2022", "status": "Post-procedure; stable on medication"},
+            },
+            {
+                "key": "bp",
+                "label": "High blood pressure",
+                "answers": {"since": "2012", "status": "Ongoing; on treatment"},
+            },
+        ],
+    }
+    docs = [{"id": "d1", "status": "accepted", "detected_type": "policy", "filename": "POL-007.pdf"}]
+
+    clarifications = build_clarifications(form, docs)
+    ids = {q["id"] for q in clarifications}
+    # Redundant previous policy and heart event questions are suppressed
+    assert "history:previous_policy" not in ids
+    assert "condition:heart:event_details" not in ids
+    assert "condition:heart:current_status" not in ids
+
+    # When a clarification is answered, it is RETAINED in clarifications so user can amend it,
+    # but marked answered=True and blocking=False so it does not block submission.
+    form["clarification_answers"] = {"condition:bp:complications": "No"}
+    clarifications_after = build_clarifications(form, docs)
+    bp_q = next((q for q in clarifications_after if q["id"] == "condition:bp:complications"), None)
+    assert bp_q is not None
+    assert bp_q["answered"] is True
+    assert bp_q["answer"] == "No"
+    assert bp_q["blocking"] is False
+
+    open_items = intake.open_items(form, docs, clarifications_after)
+    # Answered non-review item must not be in open items
+    assert not any(i.get("id") == "condition:bp:complications" for i in open_items)
+
+
+def test_checkpointer_aiosqlite_compatibility():
+    import aiosqlite
+    from app.orchestrator.graph import run_workflow
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from app.config import settings
+    import asyncio
+
+    # Verify aiosqlite connection has is_alive method
+    assert hasattr(aiosqlite.Connection, "is_alive")
+    async def check():
+        async with AsyncSqliteSaver.from_conn_string(str(settings.sqlite_file)) as cp:
+            await cp.setup()
+    asyncio.run(check())

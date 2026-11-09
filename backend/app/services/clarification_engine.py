@@ -96,6 +96,9 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "cancer_type": ("cancer_type", "kind", "type", "stage"),
     "hba1c": ("hba1c", "reading", "value", "latest_hba1c"),
     "complications": ("complications", "any_complications", "complication"),
+    "current_status": ("current_status", "status", "treatment", "treatment_status", "medication", "medicines", "followup", "follow_up"),
+    "treatment_status": ("treatment_status", "status", "treatment", "current_status", "medication"),
+    "diagnosis_and_treatment": ("diagnosis_and_treatment", "status", "treatment", "since", "year", "medication"),
 }
 
 
@@ -195,6 +198,8 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
                 )
                 if not _has_answer(answers.get(correction_id)):
                     output.append(correction)
+            item["blocking"] = False
+            output.append(item)
             return
         item["answered"] = False
         output.append(item)
@@ -237,8 +242,16 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
                 continue
             if field == "kidney_type" and re.search(r"kidney stone|renal calcul|chronic kidney disease|\bckd\b", facts_text):
                 continue
-            if field == "event_details" and re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", facts_text):
-                continue
+            if field == "event_details":
+                has_event_in_docs = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", facts_text))
+                has_event_in_hospital = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", str(form.get("hospital_details") or ""), re.I))
+                has_event_doc = any(
+                    str(d.get("detected_type", "")).lower() in {"discharge", "specialist"}
+                    or "discharge" in str(d.get("filename", "")).lower()
+                    for d in (documents or [])
+                )
+                if has_event_in_docs or has_event_in_hospital or has_event_doc:
+                    continue
             if field == "cancer_type" and re.search(r"carcinoma|lymphoma|leukaemia|leukemia|sarcoma|melanoma|myeloma", facts_text):
                 continue
             if field == "event_date" and any(f.get("fact_type") in {"admission_date", "discharge_date"} for f in relevant):
@@ -272,7 +285,19 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
         add(_question(question_id="history:claims_details", category="claims_history",
                       question="Please briefly describe the claim (approximate year, reason and outcome, if known).",
                       input_type="text", reason="You declared a previous claim, but its basic details are missing."))
-    if str(form.get("has_other_insurance", "")).lower() == "yes" and not str(form.get("previous_insurance_details") or "").strip():
+    has_policy_doc = any(
+        str(d.get("detected_type", "")).lower() in {"policy", "existing_policy"}
+        or d.get("folder") == "policy"
+        or "policy" in str(d.get("filename", "")).lower()
+        for d in (documents or [])
+    )
+    has_policy_info = bool(
+        str(form.get("previous_insurance_details") or "").strip()
+        or str(form.get("previous_insurer") or "").strip()
+        or str(form.get("previous_policy_number") or "").strip()
+        or has_policy_doc
+    )
+    if str(form.get("has_other_insurance", "")).lower() == "yes" and not has_policy_info:
         add(_question(question_id="history:previous_policy", category="policy_history",
                       question="Please provide the previous insurer and policy details, if known.",
                       input_type="text", reason="You declared another policy, but its details are missing."))

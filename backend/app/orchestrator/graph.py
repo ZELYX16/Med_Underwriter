@@ -4,8 +4,13 @@ from datetime import datetime, timezone
 import time
 from typing import Any
 
+import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
+
+# Compatibility patch: aiosqlite >= 0.22 removed is_alive() from Connection
+if not hasattr(aiosqlite.Connection, "is_alive"):
+    aiosqlite.Connection.is_alive = lambda self: getattr(self, "_thread", None) is not None and self._thread.is_alive()
 
 from app.agents.agent1_submission import submission_agent
 from app.agents.agent2_risk import risk_agent
