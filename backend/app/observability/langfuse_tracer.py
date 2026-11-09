@@ -27,8 +27,11 @@ def _init_env() -> None:
 
 def is_langfuse_enabled() -> bool:
     """Return True only if Langfuse is enabled AND public & secret keys are configured."""
-    has_keys = bool(settings.langfuse_public_key and settings.langfuse_secret_key)
-    return bool(settings.langfuse_enabled and has_keys)
+    enabled = getattr(settings, "langfuse_enabled", False)
+    pk = getattr(settings, "langfuse_public_key", "")
+    sk = getattr(settings, "langfuse_secret_key", "")
+    has_keys = bool(pk and sk)
+    return bool(enabled and has_keys)
 
 
 def get_langfuse_callback() -> Any | None:
@@ -78,23 +81,27 @@ def trace_context(
         yield
         return
 
+    merged_metadata = dict(metadata or {})
+    merged_metadata["case_id"] = case_id
+    merged_metadata["environment"] = settings.environment
+
+    ctx = None
     try:
         _init_env()
         from langfuse import propagate_attributes
-
-        merged_metadata = dict(metadata or {})
-        merged_metadata["case_id"] = case_id
-        merged_metadata["environment"] = settings.environment
-
-        with propagate_attributes(
+        ctx = propagate_attributes(
             session_id=case_id,
             user_id=applicant_id or "unknown",
             metadata=merged_metadata,
             tags=tags or [settings.environment, "underwriting"],
-        ):
-            yield
+        )
     except Exception as exc:
         logger.debug("Failed to propagate Langfuse attributes: %s", exc)
+
+    if ctx is not None:
+        with ctx:
+            yield
+    else:
         yield
 
 

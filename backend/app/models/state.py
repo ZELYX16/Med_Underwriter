@@ -214,6 +214,7 @@ class HumanOverrideInput(BaseModel):
     decision: str
     reviewer: str
     comments: str = ""
+    loading_percentage: float | None = None
 
 
 class HumanSendBackInput(BaseModel):

@@ -42,8 +42,10 @@ class ComplexityRouter:
         from app.config import settings
 
         submission = submission or {}
-        conditions = self._extract_conditions(
+        from app.services.extraction import extract_conditions, extract_sum_insured
+        conditions = extract_conditions(
             applicant_profile,
+            submission,
             enrichment_results,
         )
         condition_count = len(conditions)
@@ -122,10 +124,7 @@ class ComplexityRouter:
             "Declared smoker",
         )
 
-        sum_insured = self._number(
-            submission.get("sum_insured")
-            or submission.get("requested_sum_insured")
-        )
+        sum_insured = extract_sum_insured(submission)
         add(
             "sum_insured",
             1 if sum_insured >= 2_500_000 and condition_count else 0,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Deterministic consistency checks: *potential discrepancies*, not confirmed fraud.
 
@@ -26,12 +28,13 @@ Two paths:
   legacy      only free text exists; a condition counts only when it is
               stated as a diagnosis (not a family history, test or negation).
 """
-from __future__ import annotations
 
 import re
 from collections import Counter
 from datetime import date, timedelta
 from typing import Any
+
+from app.services.text_match import has_term, has_affirmed_term
 
 from app.services.medical_groups import (
     STRONG_GROUPS,
@@ -239,8 +242,10 @@ def _structured(
     # Evidence for every group seen, declared or documented.
     groups: dict[str, dict[str, Any]] = {}
     for d in _as_list(facts.get("diagnoses")):
-        g = d["group"]
-        if g == "other":
+        if not isinstance(d, dict):
+            continue
+        g = d.get("group")
+        if not g or g == "other":
             continue
         info = groups.setdefault(g, {"text": "", "icd": [], "declared": g in declared,
                                      "sources": [], "onset_known": False})
@@ -296,6 +301,9 @@ def _structured(
 
     # Identity: a document that is not this applicant's is held out and flagged.
     for doc in _as_list(facts.get("documents")):
+        if not isinstance(doc, dict):
+            continue
+        doc_id = doc.get("document_id") or "Document"
         problems = doc.get("identity_problems") or []
         if problems:
             material = any(p.get("material") for p in problems)
@@ -305,7 +313,7 @@ def _structured(
                 _WEIGHTS["identity_mismatch"] if material else _WEIGHTS["identity_name_only"],
                 f"{doc['document_id']} does not match the proposal: {text}. Its content was not "
                 "used for this applicant until identity is confirmed.",
-                mandatory=material, requires_review=True, source=doc["document_id"],
+                mandatory=material, requires_review=True, source=doc_id,
             )
         elif doc.get("role_note") and "Group" in doc["role_note"]:
             b.note("policy_identity", f"{doc['document_id']}: {doc['role_note']}")
@@ -344,9 +352,11 @@ def _structured(
         b.flag("claim_count_mismatch", _WEIGHTS["claim_count_mismatch"],
                f"The proposal declares {declared_match.group(1)} claim(s); the insurer's schedule lists {len(schedule)}.")
 
+    # Key duplicate claims by claim_id, or by provider+event_date+approved when claim_id is missing or same
     keyed = Counter(
-        (r.get("event_date"), r.get("approved"))
-        for r in records if r.get("event_date") and r.get("approved")
+        (r.get("claim_id") or f"{r.get('provider')}_{r.get('event_date')}_{r.get('approved')}")
+        for r in records
+        if r.get("claim_id") or (r.get("event_date") and r.get("approved"))
     )
     if any(count > 1 for count in keyed.values()):
         b.flag("duplicate_claim", _WEIGHTS["duplicate_claim"],
@@ -374,7 +384,7 @@ def _structured(
 
 def _mentions(text: str, term: str) -> str | None:
     """Window of text where `term` is stated as the applicant's diagnosis."""
-    for match in re.finditer(re.escape(term), text, re.IGNORECASE):
+    for match in re.finditer(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE):
         before = text[max(0, match.start() - 60): match.start()]
         window = text[max(0, match.start() - 120): match.end() + 120]
         sentence_start = max(
@@ -433,7 +443,7 @@ def _legacy(
             continue
         window = _mentions(evidence_text, term)
         if window is None:
-            if re.search(re.escape(term), evidence_text, re.IGNORECASE):
+            if has_term(evidence_text, term):
                 handled.add(group)
                 b.note("keyword_mention", f"Documents mention {label}; not stated as a diagnosis, so not treated as non-disclosure.")
             continue
@@ -449,12 +459,13 @@ def _legacy(
 
     smoker = profile.get("smoker")
     declared_non_smoker = smoker in (False, "False", "false", "no", "No", 0)
-    if declared_non_smoker and re.search(
-        r"\b(current smoker|smokes|tobacco use|cigarette)\b", evidence_text, re.IGNORECASE
+    if declared_non_smoker and has_affirmed_term(
+        evidence_text,
+        ["current smoker", "smoker", "smokes", "tobacco use", "cigarette"],
+        negations=["non-smoker", "nonsmoker", "never smoked", "quit", "denies", "no history of smoking"],
     ):
-        if not re.search(r"\b(non[- ]?smoker|never smoked|quit)\b", evidence_text, re.IGNORECASE):
-            b.flag("undeclared_smoker", _WEIGHTS["undeclared_smoker"],
-                   "Applicant declared non-smoker but documents indicate tobacco use.", requires_review=True)
+        b.flag("undeclared_smoker", _WEIGHTS["undeclared_smoker"],
+               "Applicant declared non-smoker but documents indicate tobacco use.", requires_review=True)
 
     claims = [c for c in (features.get("claims") or []) if isinstance(c, dict)]
     claim_count = int(features.get("claim_count", len(claims)) or 0)

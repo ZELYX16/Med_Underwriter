@@ -197,18 +197,20 @@ RULE-BASED CONCERNS: {json.dumps(rule_concerns[:5], default=str)}
         if not verdict:
             raise ValueError("critique JSON unreadable (no verdict)")
         concerns = []
-        for item in re.finditer(
-            r'"persona"\s*:\s*"([^"]*)"\s*,\s*"issue"\s*:\s*"([^"]*)"'
-            r'(?:\s*,\s*"action"\s*:\s*"([^"]*)")?',
-            text,
-        ):
-            concerns.append(
-                {
-                    "persona": item.group(1),
-                    "issue": item.group(2),
-                    "action": item.group(3) or "",
-                }
-            )
+        # Match objects in concerns array or anywhere in text regardless of key order
+        for obj in re.finditer(r'\{([^{}]+)\}', text):
+            content = obj.group(1)
+            i_match = re.search(r'"issue"\s*:\s*"([^"]*)"', content)
+            if i_match:
+                p_match = re.search(r'"persona"\s*:\s*"([^"]*)"', content)
+                a_match = re.search(r'"action"\s*:\s*"([^"]*)"', content)
+                concerns.append(
+                    {
+                        "persona": p_match.group(1) if p_match else "medical_expert",
+                        "issue": i_match.group(1),
+                        "action": a_match.group(1) if a_match else "",
+                    }
+                )
         return {"verdict": verdict.group(1), "concerns": concerns}
 
     @classmethod
@@ -229,8 +231,15 @@ RULE-BASED CONCERNS: {json.dumps(rule_concerns[:5], default=str)}
                     "action": str(item.get("action", ""))[:300],
                 }
             )
-        if verdict == "concerns" and not concerns:
-            verdict = "agree"
+        if verdict in {"concerns", "disagree"} and not concerns:
+            # Do not downgrade to agree; insert a placeholder concern
+            concerns.append(
+                {
+                    "persona": "medical_expert",
+                    "issue": "Critique flagged concerns with decision/pricing rationale.",
+                    "action": "Manual review recommended.",
+                }
+            )
         return {"verdict": verdict, "concerns": concerns}
 
     @staticmethod

@@ -76,14 +76,10 @@ def _is_header(cs: list[tuple[int, str]]) -> bool:
 
 
 def parse_amount(value: Any) -> float | None:
-    """'1,05,900' / 'INR 5,00,000' / '6,400 - Non-medical' -> number."""
-    match = re.search(r"\d[\d,]*(?:\.\d+)?", str(value or ""))
-    if not match:
-        return None
-    try:
-        return float(match.group().replace(",", ""))
-    except ValueError:
-        return None
+    """'1,05,900' / 'INR 5,00,000' / '5 Lakh' -> number."""
+    from app.services.extraction import parse_number
+    num = parse_number(value)
+    return num if num > 0 else None
 
 
 def parse_date(value: Any) -> str | None:
@@ -166,6 +162,8 @@ def _lab_rows(doc: dict[str, Any], document_id: str, document_date: str | None) 
             number = _NUM.search(result)
             if not name or not number:
                 continue
+            op_match = re.search(r"([<>]=?)", result[:number.start()])
+            operator = op_match.group(1) if op_match else ""
             value = float(number.group())
             unit = _field(row, "unit") or result[number.end():].strip(" ()")
             reference = _field(row, "reference", "normal range", "range")
@@ -174,6 +172,8 @@ def _lab_rows(doc: dict[str, Any], document_id: str, document_date: str | None) 
                 {
                     "name": name,
                     "value": value,
+                    "operator": operator,
+                    "raw_value": result.strip(),
                     "unit": unit,
                     "reference": reference,
                     "flag": _lab_flag(value, low, high, _field(row, "flag", "interpretation")),
@@ -889,6 +889,14 @@ def medical_facts(doc: dict[str, Any]) -> dict[str, Any]:
         for sentence in re.split(r"(?<=[.;])\s+", item)
         if _FAMILY.search(sentence)
     ]
+    # Filter out sentences discussing family members so applicant lifestyle is not confused with relatives
+    applicant_sentences = [
+        sentence.strip()
+        for item in narrative
+        for sentence in re.split(r"(?<=[.;])\s+", item)
+        if not _FAMILY.search(sentence)
+    ]
+    applicant_lifestyle_text = " ".join(applicant_sentences)
 
     document_date = parse_date(kvget(kv, "Document date"))
     dob_iso = parse_date(dob_text)
@@ -925,8 +933,8 @@ def medical_facts(doc: dict[str, Any]) -> dict[str, Any]:
             "weight_kg": weight,
             "height_cm": height,
         },
-        "smoking": _smoking_status(joined),
-        "alcohol": _alcohol_status(joined),
+        "smoking": _smoking_status(applicant_lifestyle_text),
+        "alcohol": _alcohol_status(applicant_lifestyle_text),
         "family_history": family,
         "diagnoses": diagnoses,
         "medications": medications,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -103,12 +104,12 @@ class QueryClassifier:
     }
 
     PRIORITY = (
+        "medical",
         "coverage",
         "claims",
         "policy",
         "regulatory",
         "underwriting",
-        "medical",
     )
 
     def classify(
@@ -137,13 +138,22 @@ class QueryClassifier:
             for intent in scores
         }
 
+        from app.services.text_match import has_term
         for intent, keywords in self.KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text:
-                    scores[intent] += self._keyword_weight(
-                        keyword
-                    )
-                    matched[intent].append(keyword)
+            # Sort by length descending to match longer specific phrases first
+            sorted_kws = sorted(keywords, key=len, reverse=True)
+            matched_spans: list[tuple[int, int]] = []
+            for keyword in sorted_kws:
+                pattern = rf"(?<!\w){re.escape(keyword)}(?!\w)"
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    start, end = m.span()
+                    # Skip if this match is contained within an already-matched longer keyword
+                    if any(s <= start and end <= e for s, e in matched_spans):
+                        continue
+                    matched_spans.append((start, end))
+                    scores[intent] += self._keyword_weight(keyword)
+                    if keyword not in matched[intent]:
+                        matched[intent].append(keyword)
 
         best_intent = self._select_intent(
             scores

@@ -361,17 +361,26 @@ class ReflectionAgent:
         claim is confirmed by the case data (non-disclosure flags, a
         loading that contradicts the risk band, claim-record mismatches).
         """
-        if flag_count > 0 or any(
-            f.get("verdict") not in (None, "pass") for f in rule_findings
-        ):
-            return True
-
+        rule_texts = " ".join(
+            f"{f.get('persona', '')} {f.get('finding', '')} {f.get('action', '')}".lower()
+            for f in rule_findings
+            if f.get("verdict") not in (None, "pass")
+        )
         codes = {f.get("code") for f in fraud_flags}
         needs_review = any(f.get("requires_review") for f in fraud_flags)
         overall = float(risk_assessment.get("overall_risk_score", 0) or 0)
         loading = float(pricing_result.get("loading_percentage", 0) or 0)
+
         for concern in concerns:
             text = f"{concern.get('issue', '')} {concern.get('action', '')}".lower()
+            # If a rule finding flagged an overlapping topic, it is corroborated
+            if rule_texts:
+                concern_words = [
+                    w for w in re.findall(r"[a-z]{4,}", text)
+                    if w not in {"issue", "action", "should", "could", "would", "underwriting", "applicant"}
+                ]
+                if any(w in rule_texts for w in concern_words):
+                    return True
             if re.search(r"undeclared|undisclosed|not declared|non-disclos|disclos", text) and needs_review:
                 return True
             if re.search(r"loading|premium|pric", text) and (
@@ -411,21 +420,20 @@ class ReflectionAgent:
             [],
         )
 
+        from app.services.text_match import has_affirmed_term
+        high_risk_keywords = [
+            "myocardial infarction",
+            "heart attack",
+            "coronary artery disease",
+            "cad",
+            "major cardiac",
+            "cancer",
+            "malignancy",
+            "organ failure",
+            "transplant",
+        ]
         high_risk_factor = any(
-            any(
-                keyword in str(factor).lower()
-                for keyword in (
-                    "myocardial infarction",
-                    "heart attack",
-                    "coronary artery disease",
-                    "cad",
-                    "major cardiac",
-                    "cancer",
-                    "malignancy",
-                    "organ failure",
-                    "transplant",
-                )
-            )
+            has_affirmed_term(str(factor), high_risk_keywords)
             for factor in risk_factors
         )
 
@@ -648,60 +656,6 @@ class ReflectionAgent:
 
         return checks
 
-    @staticmethod
-    def _lightweight_result(
-        recommendation: str,
-        confidence: float,
-        constitutional: dict[str, Any],
-    ) -> dict[str, Any]:
-        flag_count = sum(
-            1
-            for result in constitutional.values()
-            if result.get("status") == "flag"
-        )
-
-        verdict = "review" if flag_count else "pass"
-
-        return {
-            "reflection_required": True,
-            "reflection_type": "lightweight",
-            "reflection_personas": [],
-            "reflection_round": 1,
-            "reflection_findings": [],
-            "medical_accuracy_check": constitutional.get(
-                "medical_accuracy",
-                {},
-            ),
-            "actuarial_soundness_check": constitutional.get(
-                "actuarial_soundness",
-                {},
-            ),
-            "regulatory_compliance_check": constitutional.get(
-                "regulatory_compliance",
-                {},
-            ),
-            "fairness_check": constitutional.get(
-                "fairness",
-                {},
-            ),
-            "explainability_check": constitutional.get(
-                "explainability",
-                {},
-            ),
-            "reflection_verdict": verdict,
-            "require_human_review": False,
-            "require_human_escalation": False,
-            "human_review_reason": "",
-            "requires_rescore": False,
-            "advisory": {
-                "verdict": verdict,
-                "consensus": flag_count == 0,
-                "disagreements": [],
-                "recommended_actions": [],
-                "original_recommendation": recommendation,
-                "original_confidence": confidence,
-            },
-        }
     @staticmethod
     def _no_reflection_result(
         recommendation: str,

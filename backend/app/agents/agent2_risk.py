@@ -120,6 +120,13 @@ class RiskAssessmentAgent:
         ] + [
             f"Verification required: {r}" for r in fraud.get("verification_reasons", [])
         ]
+        if features.get("sum_insured_unparsed"):
+            verification.append({
+                "domain": "submission",
+                "action": "Verify sum insured",
+                "why": "Sum insured was not provided or could not be parsed; defaulted to 1,000,000 for pricing",
+                "material": True,
+            })
         material_unknown = [v for v in verification if v.get("material")]
         if len(material_unknown) >= settings.max_material_unknowns:
             mandatory_reasons.append(
@@ -272,18 +279,18 @@ class RiskAssessmentAgent:
         submission: dict[str, Any],
         enrichment_results: dict[str, Any],
     ) -> dict[str, Any]:
+        from app.services.extraction import extract_conditions, extract_sum_insured, parse_term_years
+
         medical = self._first_dict(
             submission.get("medical"),
             applicant_profile.get("medical"),
         )
 
-        conditions = self._as_list(
-            medical.get("conditions")
-            or applicant_profile.get("medical_conditions")
-            or applicant_profile.get("conditions")
+        conditions = extract_conditions(
+            applicant_profile=applicant_profile,
+            submission=submission,
+            enrichment_results=enrichment_results,
         )
-
-        conditions = self._deduplicate_values(conditions)
 
         medications = self._as_list(
             medical.get("medications")
@@ -314,10 +321,14 @@ class RiskAssessmentAgent:
             or applicant_profile.get("claims")
         )
 
-        if not claims and claims_evidence:
-            claims = self._extract_claims_from_evidence(
-                claims_evidence
-            )
+        structured_facts = self._first_dict(
+            enrichment_results.get("structured_facts"),
+            applicant_profile.get("structured_facts"),
+        )
+        claim_records = self._as_list(structured_facts.get("claim_records"))
+
+        if not claims and claim_records:
+            claims = claim_records
 
         claims = self._deduplicate_claims(claims)
 
@@ -379,9 +390,13 @@ class RiskAssessmentAgent:
                 for r in records
             ]
 
-        sum_insured = self._extract_sum_insured(submission)
+        sum_insured = extract_sum_insured(submission)
+        sum_insured_unparsed = False
+        if sum_insured <= 0:
+            sum_insured = 1_000_000.0
+            sum_insured_unparsed = True
 
-        term_years = self._number(
+        term_years = parse_term_years(
             submission.get("term_years")
             or submission.get("policy_term")
             or 1
@@ -403,6 +418,7 @@ class RiskAssessmentAgent:
             "coverage_gaps": coverage_gaps,
             "evidence_gaps": self._unique_gap_dicts(evidence_gaps),
             "sum_insured": sum_insured,
+            "sum_insured_unparsed": sum_insured_unparsed,
             "term_years": max(term_years, 1),
             "condition_count": len(conditions),
             "medication_count": len(medications),
@@ -594,7 +610,10 @@ class RiskAssessmentAgent:
         coverage_gaps = features["coverage_gaps"]
         evidence_gaps = features.get("evidence_gaps", [])
 
-        if age >= 60:
+        if age <= 0:
+            medical_score += 3
+            risk_factors.append("Data missing: applicant age is unknown")
+        elif age >= 60:
             medical_score += 20
             risk_factors.append("Age 60 or above")
         elif age >= 50:
@@ -607,7 +626,9 @@ class RiskAssessmentAgent:
         else:
             medical_score += 3
 
-        if bmi >= 30:
+        if bmi is None or bmi <= 0:
+            risk_factors.append("Data missing: applicant BMI is unknown")
+        elif bmi >= 30:
             medical_score += 10
             risk_factors.append("BMI indicates obesity")
         elif bmi >= 25:
@@ -617,6 +638,9 @@ class RiskAssessmentAgent:
             protective_factors.append(
                 "BMI within normal range"
             )
+        else:
+            medical_score += 5
+            risk_factors.append("BMI indicates underweight range (<18.5)")
 
         condition_weights = {
             "diabetes": 15,
@@ -807,7 +831,7 @@ class RiskAssessmentAgent:
         overall = max(overall, 3.0)  # never show a zero overall risk
 
         evidence_domains = {
-            domain: states.get(domain, {}).get("state") != "unknown"
+            domain: states.get(domain, {}).get("state") not in (None, "unknown")
             for domain in ("medical", "claims", "hospitalizations", "policy", "regulatory")
         }
 
@@ -869,6 +893,8 @@ class RiskAssessmentAgent:
         elif risk_score >= 45:
             loading = 20.0
         elif risk_score >= 30:
+            loading = 10.0
+        elif features.get("condition_count", 0) >= 3:
             loading = 10.0
         else:
             loading = 0.0
@@ -960,12 +986,15 @@ class RiskAssessmentAgent:
         if risk["overall_risk_score"] >= 70:
             confidence -= 0.05
 
+        # Single penalty path for discrepancy flags to avoid double-penalizing:
+        # Deduct 0.15 per material flag requiring review (capped at 0.30).
+        # Non-review advisory flags contribute only via overall discrepancy points if any.
         flags = risk.get("fraud_flags") or []
         needs_review = [f for f in flags if f.get("requires_review")]
+        non_review_flags = [f for f in flags if not f.get("requires_review")]
         confidence -= min(0.30, 0.15 * len(needs_review))
-        confidence -= min(
-            0.15, sum(float(f.get("points", 0) or 0) for f in flags) / 400
-        )
+        if non_review_flags:
+            confidence -= min(0.10, sum(float(f.get("points", 0) or 0) for f in non_review_flags) / 400)
 
         material_unknown = [
             v for v in risk.get("verification_items") or [] if v.get("material")
@@ -1072,93 +1101,101 @@ class RiskAssessmentAgent:
         existing policy's waiting periods and exclusions (structured policy
         terms only; nothing is inferred when the schedule can't be read).
         """
-        from app.services.medical_groups import declared_groups, group_label, text_group
-
-        structured = features.get("structured") or {}
-        policy = structured.get("policy") or {}
-        if not policy:
-            return []
-
         notes: list[dict[str, Any]] = []
-        today = date.today()
-        inception = policy.get("inception_date")
-        months_in_force = None
-        if inception:
-            y, m, d = (int(x) for x in inception.split("-"))
-            months_in_force = (today.year - y) * 12 + (today.month - m)
+        try:
+            from app.services.medical_groups import declared_groups, group_label, text_group
 
-        groups = declared_groups(
-            applicant_profile.get("medical_conditions") or [],
-            (structured.get("submission") or {}).get("questionnaire"),
-        )
-        diagnoses = self._as_list(structured.get("diagnoses"))
-        groups |= {
-            d["group"] for d in diagnoses
-            if isinstance(d, dict) and d.get("group")
-        }
+            structured = features.get("structured") or {}
+            policy = structured.get("policy") or {}
+            if not policy:
+                return []
 
-        # Specific-illness waiting period
-        wait = policy.get("specific_illness_months")
-        for listed in policy.get("specific_illness_conditions") or []:
-            group = text_group(listed)
-            if group and group in groups and wait and months_in_force is not None:
-                satisfied = months_in_force >= wait
+            today = date.today()
+            inception = str(policy.get("inception_date") or "")
+            months_in_force = None
+            if inception:
+                match = re.search(r"(\d{4})[-/](\d{1,2})", inception)
+                if match:
+                    y, m = int(match.group(1)), int(match.group(2))
+                    months_in_force = (today.year - y) * 12 + (today.month - m)
+
+            groups = declared_groups(
+                applicant_profile.get("medical_conditions") or [],
+                (structured.get("submission") or {}).get("questionnaire"),
+            )
+            diagnoses = self._as_list(structured.get("diagnoses"))
+            groups |= {
+                d["group"] for d in diagnoses
+                if isinstance(d, dict) and d.get("group")
+            }
+
+            # Specific-illness waiting period
+            wait = policy.get("specific_illness_months")
+            for listed in policy.get("specific_illness_conditions") or []:
+                group = text_group(listed)
+                if group and group in groups and wait and months_in_force is not None:
+                    satisfied = months_in_force >= wait
+                    notes.append(
+                        {
+                            "type": "waiting_period",
+                            "status": "satisfied" if satisfied else "pending",
+                            "detail": (
+                                f"{group_label(group).capitalize()}: the existing policy has a "
+                                f"{wait}-month specific-illness waiting period for '{listed}'; "
+                                f"in force {months_in_force} months (since {inception}) - "
+                                + ("waiting period satisfied." if satisfied else "waiting period not yet complete.")
+                            ),
+                        }
+                    )
+
+            # Pre-existing disease period
+            pre = policy.get("pre_existing_months")
+            if pre and months_in_force is not None and months_in_force < pre:
                 notes.append(
                     {
-                        "type": "waiting_period",
-                        "status": "satisfied" if satisfied else "pending",
-                        "detail": (
-                            f"{group_label(group).capitalize()}: the existing policy has a "
-                            f"{wait}-month specific-illness waiting period for '{listed}'; "
-                            f"in force {months_in_force} months (since {inception}) - "
-                            + ("waiting period satisfied." if satisfied else "waiting period not yet complete.")
-                        ),
+                        "type": "pre_existing",
+                        "status": "pending",
+                        "detail": f"Pre-existing conditions are covered after {pre} months of continuous cover; {months_in_force} completed.",
                     }
                 )
 
-        # Pre-existing disease period
-        pre = policy.get("pre_existing_months")
-        if pre and months_in_force is not None and months_in_force < pre:
-            notes.append(
-                {
-                    "type": "pre_existing",
-                    "status": "pending",
-                    "detail": f"Pre-existing conditions are covered after {pre} months of continuous cover; {months_in_force} completed.",
-                }
-            )
+            # Claims the insurer only partly settled show where exclusions bite.
+            for record in self._as_list(structured.get("claim_records")):
+                if not isinstance(record, dict):
+                    continue
+                status = str(record.get("status", "")).lower()
+                if "partial" in status:
+                    claim_id = record.get("claim_id") or "Claim"
+                    notes.append(
+                        {
+                            "type": "partly_settled_claim",
+                            "status": "info",
+                            "detail": (
+                                f"{claim_id} ({record.get('reason') or 'claim'}) was only "
+                                f"partly settled: {record.get('coverage_applicability') or 'see claim record'}."
+                            ),
+                        }
+                    )
 
-        # Claims the insurer only partly settled show where exclusions bite.
-        for record in self._as_list(structured.get("claim_records")):
-            if not isinstance(record, dict):
-                continue
-            status = str(record.get("status", "")).lower()
-            if "partial" in status:
+            # A higher sum insured than the existing cover.
+            requested = submission.get("sum_insured") or (structured.get("submission") or {}).get("sum_insured")
+            existing = policy.get("sum_insured")
+            req_num = self._number(requested)
+            exist_num = self._number(existing)
+            if req_num > 0 and exist_num > 0 and req_num > exist_num:
                 notes.append(
                     {
-                        "type": "partly_settled_claim",
-                        "status": "info",
+                        "type": "sum_insured_increase",
+                        "status": "confirm",
                         "detail": (
-                            f"{record['claim_id']} ({record.get('reason') or 'claim'}) was only "
-                            f"partly settled: {record.get('coverage_applicability') or 'see claim record'}."
+                            f"Requested sum insured {req_num:,.0f} is above the existing "
+                            f"{exist_num:,.0f}. Confirm whether the policy's waiting periods "
+                            "apply afresh to the increase."
                         ),
                     }
                 )
-
-        # A higher sum insured than the existing cover.
-        requested = submission.get("sum_insured") or (structured.get("submission") or {}).get("sum_insured")
-        existing = policy.get("sum_insured")
-        if requested and existing and requested > existing:
-            notes.append(
-                {
-                    "type": "sum_insured_increase",
-                    "status": "confirm",
-                    "detail": (
-                        f"Requested sum insured {float(requested):,.0f} is above the existing "
-                        f"{float(existing):,.0f}. Confirm whether the policy's waiting periods "
-                        "apply afresh to the increase."
-                    ),
-                }
-            )
+        except Exception as exc:
+            logger.warning("Error computing coverage notes: %s", exc)
         return notes
 
     def _structured_reasoning(
@@ -1347,6 +1384,8 @@ class RiskAssessmentAgent:
             rule = "45 <= risk < 60"
         elif overall >= 30:
             rule = "30 <= risk < 45"
+        elif pricing.get("loading_percentage", 0) > 0:
+            rule = "risk < 30 (loading applied: 3+ conditions)"
         else:
             rule = "risk < 30"
 
@@ -1966,39 +2005,8 @@ RECOMMENDATION: {recommendation}{fraud_line}
     def _number(
         value: Any,
     ) -> float:
-        if value is None:
-            return 0.0
-
-        if isinstance(value, bool):
-            return float(value)
-
-        try:
-            text = (
-                str(value)
-                .replace(",", "")
-                .strip()
-            )
-
-            digits = ""
-            decimal_found = False
-
-            for char in text:
-                if char.isdigit():
-                    digits += char
-                elif char == "." and not decimal_found:
-                    digits += char
-                    decimal_found = True
-                elif digits:
-                    break
-
-            return (
-                float(digits)
-                if digits
-                else 0.0
-            )
-
-        except (TypeError, ValueError):
-            return 0.0
+        from app.services.extraction import parse_number
+        return parse_number(value)
 
     @staticmethod
     def _text(

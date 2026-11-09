@@ -49,8 +49,8 @@ _BLOOD_PRESSURE = re.compile(
 _LAB_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("hba1c", re.compile(r"\b(?:hba1c|glycated haemoglobin|glycated hemoglobin)\b[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(%|mmol/mol)?", re.I), "%"),
     ("glucose", re.compile(r"\b(?:fasting blood sugar|fasting glucose|blood glucose|glucose)\b[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(mg/dl|mmol/l)?", re.I), "mg/dL"),
-    ("creatinine", re.compile(r"\bcreatinine\b[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(mg/dl|umol/l)?", re.I), "mg/dL"),
-    ("haemoglobin", re.compile(r"\b(?:haemoglobin|hemoglobin|hb)\b[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(g/dl)?", re.I), "g/dL"),
+    ("creatinine", re.compile(r"\bcreatinine\b(?![^\n]{0,25}\bratio\b)[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(mg/dl|umol/l|µmol/l)?", re.I), "mg/dL"),
+    ("haemoglobin", re.compile(r"(?<!glycated\s)(?<!glycated)\b(?:haemoglobin|hemoglobin|hb)\b(?!\s*a1c|\s*a1)[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(g/dl)?", re.I), "g/dL"),
     ("total_cholesterol", re.compile(r"\btotal cholesterol\b[^\d\n]{0,30}(\d+(?:\.\d+)?)\s*(mg/dl)?", re.I), "mg/dL"),
 )
 
@@ -74,9 +74,14 @@ def classify_document(filename: str, pages: list[dict[str, Any]]) -> dict[str, A
     sample = text[:30000].lower()
     name = re.sub(r"[_\-.]+", " ", filename.lower())
 
-    matched = [kind for kind, pattern in _TYPE_RULES if re.search(pattern, sample)]
-    filename_matches = [kind for kind, pattern in _TYPE_RULES if re.search(pattern, name)]
-    matched.extend(kind for kind in filename_matches if kind not in matched)
+    type_scores: dict[str, int] = defaultdict(int)
+    for kind, pattern in _TYPE_RULES:
+        body_count = len(re.findall(pattern, sample))
+        name_count = len(re.findall(pattern, name))
+        if body_count > 0 or name_count > 0:
+            type_scores[kind] = body_count + name_count * 3
+
+    matched = sorted(type_scores.keys(), key=lambda k: type_scores[k], reverse=True)
 
     evidence_types = [
         kind for kind, pattern in _EVIDENCE_RULES
@@ -154,11 +159,17 @@ def extract_facts(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for line in lines:
             bp_match = _BLOOD_PRESSURE.search(line)
             if bp_match:
-                add(
-                    "blood_pressure",
-                    f"{bp_match.group(1)}/{bp_match.group(2)} mmHg",
-                    page, line, 0.92, extraction_method,
-                )
+                try:
+                    sys_val = int(bp_match.group(1))
+                    dia_val = int(bp_match.group(2))
+                    if 70 <= sys_val <= 260 and 40 <= dia_val <= 150:
+                        add(
+                            "blood_pressure",
+                            f"{sys_val}/{dia_val} mmHg",
+                            page, line, 0.92, extraction_method,
+                        )
+                except (ValueError, TypeError):
+                    pass
 
             if re.search(r"(?i)\b(?:patient|applicant|insured member)\s+name\b", line):
                 match = re.search(
@@ -224,6 +235,13 @@ def extract_facts(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # "Blood pressure (mean\nof 2 readings)\n128/80 mmHg".
         page_text = str(page_item.get("text") or "")
         for bp_match in _BLOOD_PRESSURE.finditer(page_text):
+            try:
+                sys_val = int(bp_match.group(1))
+                dia_val = int(bp_match.group(2))
+                if not (70 <= sys_val <= 260 and 40 <= dia_val <= 150):
+                    continue
+            except (ValueError, TypeError):
+                continue
             start = max(0, bp_match.start() - 70)
             end = min(len(page_text), bp_match.end() + 35)
             excerpt = page_text[start:end]

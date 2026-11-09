@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     ollama_keep_alive: str = "30m"
     ollama_num_ctx: int = 4096  # explicit, smaller context = less prefill/memory
 
+    # Observability
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com" 
+
     # Token / latency controls
     reasoning_max_tokens: int = 250  # short assessment; structure comes from code
     reasoning_cache_size: int = 256

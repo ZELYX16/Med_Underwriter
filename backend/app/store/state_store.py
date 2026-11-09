@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import json
 import sqlite3
 import threading
@@ -101,7 +103,8 @@ class StateStore:
     # Connection / initialization
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         connection = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
@@ -112,7 +115,11 @@ class StateStore:
         # one writer coexist, and the timeout waits instead of failing.
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=5000")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._lock:
@@ -701,7 +708,10 @@ class StateStore:
                     ),
                 )
 
-                return cursor.rowcount > 0
+                if cursor.rowcount <= 0:
+                    logger.warning("update_case_status: unknown case_id %s (0 rows updated)", case_id)
+                    return False
+                return True
 
     # ------------------------------------------------------------------
     # Applicant documents

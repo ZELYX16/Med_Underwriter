@@ -60,7 +60,7 @@ class Guardrails:
         r"ghp_[A-Za-z0-9]{20,}",
         r"AIza[A-Za-z0-9_-]{20,}",
         r"AKIA[0-9A-Z]{16}",
-        r"-----BEGIN\s+(RSA|OPENSSH|EC|PRIVATE)\s+KEY-----",
+        r"-----BEGIN\s+(?:[A-Z0-9_-]+\s+)?(?:PRIVATE\s+)?KEY-----",
     ]
 
     PII_PATTERNS = {
@@ -245,7 +245,20 @@ class Guardrails:
                 checks={"submission": False},
             )
 
-        serialized = f"{applicant_profile}\n{submission}"
+        strings: list[str] = []
+        def _walk(obj: Any) -> None:
+            if isinstance(obj, str):
+                strings.append(obj)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, (list, tuple, set)):
+                for item in obj:
+                    _walk(item)
+
+        _walk(applicant_profile)
+        _walk(submission)
+        serialized = "\n".join(strings)
 
         return self.validate_prompt(
             serialized,
@@ -288,16 +301,20 @@ class Guardrails:
 
         normalized = self._normalize(text)
 
-        forbidden = [
-            r"guaranteed\s+approval",
-            r"guaranteed\s+coverage",
-            r"guaranteed\s+acceptance",
-        ]
-
-        matches = self._find_matches(
-            normalized,
-            forbidden,
+        guarantee_pattern = re.compile(
+            r"\bguaranteed\s+(?:approval|coverage|acceptance)\b", re.IGNORECASE
         )
+        negation_window = re.compile(
+            r"\b(?:no|not|never|without|n't|does not|cannot)\b[^.;\n]{0,50}$",
+            re.IGNORECASE,
+        )
+
+        matches: list[str] = []
+        for m in guarantee_pattern.finditer(normalized):
+            window_start = max(0, m.start() - 60)
+            prefix = normalized[window_start : m.start()]
+            if not negation_window.search(prefix):
+                matches.append(m.group(0))
 
         return GuardrailResult(
             allowed=not bool(matches),

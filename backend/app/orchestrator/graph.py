@@ -17,7 +17,7 @@ from app.models.state import UnderwritingState
 from app.services import outcome
 
 
-MAX_REFLECTION_ROUNDS = 2  # Initial review plus at most one follow-up pass.
+MAX_REFLECTION_ROUNDS = settings.max_reflection_rounds
 HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD = 80.0
 HUMAN_REVIEW_OVERALL_RISK_THRESHOLD = 70.0
 HUMAN_REVIEW_CONFIDENCE_THRESHOLD = 0.70
@@ -960,45 +960,46 @@ def reflection_node(
 
         started = time.perf_counter()
 
-        result = reflection_agent.run(
-            applicant_profile=state.get(
-                "applicant_profile",
-                {},
-            ),
-            submission=state.get(
-                "submission",
-                {},
-            ),
-            enrichment_results=state.get(
-                "agent1_enrichment",
-                {},
-            ),
-            risk_result={
-                "risk_assessment": state.get(
-                    "risk_assessment",
+        with cache_scope(state.get("case_id")):
+            result = reflection_agent.run(
+                applicant_profile=state.get(
+                    "applicant_profile",
                     {},
                 ),
-                "pricing_result": state.get(
-                    "pricing_result",
+                submission=state.get(
+                    "submission",
                     {},
                 ),
-                "agent2_recommendation": state.get(
-                    "agent2_recommendation",
-                    "",
+                enrichment_results=state.get(
+                    "agent1_enrichment",
+                    {},
                 ),
-                "agent2_confidence": state.get(
-                    "agent2_confidence",
-                    0.0,
-                ),
-                "agent2_reasoning": state.get(
-                    "agent2_reasoning",
-                    "",
-                ),
-                "fraud_flags": state.get("fraud_flags", []),
-            },
-            previous_findings=previous_findings,
-            complexity_level=str(state.get("complexity_level", "")),
-        )
+                risk_result={
+                    "risk_assessment": state.get(
+                        "risk_assessment",
+                        {},
+                    ),
+                    "pricing_result": state.get(
+                        "pricing_result",
+                        {},
+                    ),
+                    "agent2_recommendation": state.get(
+                        "agent2_recommendation",
+                        "",
+                    ),
+                    "agent2_confidence": state.get(
+                        "agent2_confidence",
+                        0.0,
+                    ),
+                    "agent2_reasoning": state.get(
+                        "agent2_reasoning",
+                        "",
+                    ),
+                    "fraud_flags": state.get("fraud_flags", []),
+                },
+                previous_findings=previous_findings,
+                complexity_level=str(state.get("complexity_level", "")),
+            )
 
         agent3_metrics = _agent_metrics(
             result,
@@ -1374,6 +1375,7 @@ def _outcome_fields(state: UnderwritingState) -> dict[str, Any]:
         discrepancy_score=float(state.get("fraud_risk_score", 0.0) or 0.0),
         layers=state.get("confidence_layers") or {},
         sum_insured=(state.get("submission") or {}).get("sum_insured"),
+        recommendation=state.get("recommendation") or "",
     )
     return {"decision_level": level, "reason_codes": outcome.reason_codes(blocking)}
 

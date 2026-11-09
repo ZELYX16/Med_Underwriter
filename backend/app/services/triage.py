@@ -15,7 +15,7 @@ from typing import Any
 
 _TYPE_RULES = [
     ("discharge", "medical", r"discharge summary"),
-    ("medical_exam", "medical", r"medical examination|health check|pre-policy"),
+    ("medical_exam", "medical", r"medical examination|health check|pre[- ]?policy"),
     ("lab", "medical", r"laborator|lab report|hba1c|haemoglobin|hemoglobin|creatinine|investigation report"),
     ("specialist", "medical", r"specialist report|consultation|cardiolog|orthopaedic|urolog|gastroenterolog|radiolog|mri"),
     ("prescription", "medical", r"prescription|\brx\b"),

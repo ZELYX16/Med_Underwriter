@@ -54,15 +54,18 @@ def evidence_states(
     records = structured.get("claim_records") or []
     insurance = (sub.get("insurance") or [{}])[0] if sub.get("insurance") else {}
     claims_declared = str(insurance.get("claims_declared", "")).lower()
-    if records or declared_claims or evidence.get("claims_evidence"):
+    has_negative_claims = (
+        re.search(r"\b(no|nil|none|0)\b[^.]{0,20}claims?", claims_declared)
+        or re.search(r"declared claims:\s*(none|nil)|no (prior |previous )?claims", policy_text + " " + claims_text)
+    )
+    if records or declared_claims:
         states["claims"] = _state(POSITIVE, "claim records or declared claims are on file")
     elif declarations.get("no_claims"):
         states["claims"] = _state(NEGATIVE, "the applicant answered no to earlier claims")
-    elif (
-        re.search(r"\b(no|nil|none|0)\b[^.]{0,20}claims?", claims_declared)
-        or re.search(r"declared claims:\s*(none|nil)|no (prior |previous )?claims", policy_text + " " + claims_text)
-    ):
+    elif has_negative_claims:
         states["claims"] = _state(NEGATIVE, "the proposal or policy explicitly states no claims")
+    elif evidence.get("claims_evidence"):
+        states["claims"] = _state(UNKNOWN, "claims documents retrieved but no verified claim records found")
     else:
         states["claims"] = _state(UNKNOWN, "no claims evidence was retrieved; this is not treated as zero claims")
 
@@ -71,10 +74,20 @@ def evidence_states(
     discharge_docs = [
         d for d in structured.get("documents", [])
         if "discharge" in str(d.get("title", "")).lower()
+        and d.get("identity_verified", True) is not False
     ]
     asked_admission = any(
         re.search(r"hospital|admission|surgery", str(q.get("question", "")), re.I)
-        and str(q.get("answer", "")).strip().lower() == "yes"
+        and str(q.get("answer", "")).strip().lower().startswith("yes")
+        for q in questionnaire
+    )
+    has_hospital_question = any(
+        re.search(r"hospital|admission|surgery", str(q.get("question", "")), re.I)
+        for q in questionnaire
+    )
+    asked_admission_no = any(
+        re.search(r"hospital|admission|surgery", str(q.get("question", "")), re.I)
+        and str(q.get("answer", "")).strip().lower().startswith("no")
         for q in questionnaire
     )
     if hospitalizations or discharge_docs or asked_admission:
@@ -94,14 +107,25 @@ def evidence_states(
 
     # --- policy -------------------------------------------------------------------------------
     existing = (profile.get("existing_policy") or {}).get("policy_id")
+    submission_insurance = sub.get("insurance") or []
+    submission_has_policy = any(
+        isinstance(ins, dict) and (ins.get("policy_number") or ins.get("insurer") or ins.get("previous_policy_number"))
+        for ins in submission_insurance
+    ) or bool((profile.get("submission") or {}).get("previous_insurance_details"))
     if structured.get("policy") or evidence.get("policy_evidence"):
         states["policy"] = _state(POSITIVE, "an existing policy document is on file")
-    elif not existing:
-        states["policy"] = _state(NEGATIVE, "no existing policy was declared")
-    else:
+    elif existing:
         states["policy"] = _state(
             UNKNOWN, f"policy {existing} is declared but its schedule was not retrieved; coverage was not assessed"
         )
+    elif submission_has_policy:
+        states["policy"] = _state(
+            UNKNOWN, "previous insurance is mentioned in proposal but policy document was not retrieved; coverage was not assessed"
+        )
+    elif declarations.get("no_other_insurance") or str(profile.get("has_other_insurance", "")).lower().startswith("no"):
+        states["policy"] = _state(NEGATIVE, "no existing policy was declared")
+    else:
+        states["policy"] = _state(UNKNOWN, "existing policy status is unknown")
 
     # --- medical ---------------------------------------------------------------------------------------
     if structured.get("diagnoses") or structured.get("vitals") or evidence.get("medical_evidence"):

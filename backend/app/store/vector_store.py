@@ -81,7 +81,7 @@ class VectorStore:
             cached = self._query_embeddings.get(key)
             if cached is not None:
                 self._query_embeddings.move_to_end(key)
-                return cached
+                return list(cached)
 
         embedding = self.embedding_model.encode(
             [query_text],

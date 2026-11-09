@@ -255,12 +255,10 @@ async def _persist_workflow_update(
     node_status = str(latest.get("status") or "completed")
     message = latest.get("message") or ""
 
-    final_status = str(
-        current.get("final_status")
-        or current.get("status")
-        or "processing"
-    )
-    db_status = final_status.replace("_", "-")
+    # During intermediate streaming updates, do not prematurely persist terminal status;
+    # keep database status as "processing" until the workflow run finishes.
+    # Also preserve standard underscores in status names.
+    status_to_save = "processing"
 
     # SQLite is synchronous: keep it off the event loop so status polling
     # and /health stay responsive while a case runs.
@@ -268,7 +266,7 @@ async def _persist_workflow_update(
         state_store.save_case(
             case_id=case_id,
             state=current,
-            status=db_status,
+            status=status_to_save,
             return_case=False,
         )
 
@@ -293,6 +291,9 @@ async def _run_case(
     state: UnderwritingState,
 ) -> None:
     try:
+        from app.services import cost_guard
+        cost_guard.reset(case_id)
+
         current = dict(state)
 
         current["final_status"] = "processing"
@@ -462,7 +463,7 @@ async def _run_case(
         _save_state(
             case_id,
             current,
-            status="awaiting-human-review",
+            status="awaiting_human_review",
         )
 
         state_store.add_workflow_event(
@@ -814,6 +815,7 @@ def _prepare_case_for_run(case_id: str, proceed: bool = False) -> dict[str, Any]
     state["final_status"] = "processing"
     state["final_decision"] = ""
     state["final_recommendation"] = ""
+    state["reflection_round"] = 0
     state["updated_at"] = _now()
 
     _save_state(
@@ -1521,6 +1523,10 @@ async def override_case(
         "human_override"
     )
     state["final_status"] = "completed"
+    if getattr(body, "loading_percentage", None) is not None:
+        pricing = dict(state.get("pricing") or {})
+        pricing["loading_percentage"] = float(body.loading_percentage)
+        state["pricing"] = pricing
 
     state.setdefault(
         "audit_trail",
@@ -1626,6 +1632,7 @@ async def sendback_case(
     state["require_human_review"] = False
 
     state["reflection_requires_rescore"] = True
+    state["reflection_round"] = 0
     state["final_status"] = "processing"
     state["final_decision"] = ""
     state["final_recommendation"] = ""
@@ -1706,6 +1713,13 @@ async def escalate_case(
             detail=(
                 f"Case {case_id} not found."
             ),
+        )
+
+    curr_status = str(state.get("final_status") or state.get("status") or "").strip().lower()
+    if curr_status in {"escalated", "completed"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Case is already in status '{curr_status}'.",
         )
 
     state["require_human_escalation"] = True

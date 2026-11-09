@@ -161,7 +161,7 @@ def _form_from_records(applicant: dict[str, Any], case: dict[str, Any] | None) -
         "product": submission.get("product") or "MedShield Comprehensive",
         "policy_type": submission.get("policy_type") or "Individual",
         "term_years": submission.get("term_years") or 1,
-        "sum_insured": submission.get("sum_insured") or policy.get("sum_insured") or 0,
+        "sum_insured": submission.get("sum_insured") or 0,
         "smoker": _yes(profile.get("smoker")),
         "alcohol_consumption": profile.get("alcohol_consumption") or profile.get("alcohol_use") or "",
         "hospital_stay": "yes" if hospitals else "no",
@@ -254,10 +254,11 @@ def _merge_submission_pdf(form: dict[str, Any], applicant_id: str, root: Path | 
                 condition.setdefault("answers", {})["medicines"] = "; ".join(x for x in related if x)
 
         hospitals = submission.get("hospitalizations") or []
-        form["hospital_stay"] = "yes" if hospitals else "no"
-        form["hospital_details"] = "; ".join(
-            str(h.get("details") or h.get("reason") or "") for h in hospitals if isinstance(h, dict)
-        )
+        if hospitals:
+            form["hospital_stay"] = "yes"
+            form["hospital_details"] = "; ".join(
+                str(h.get("details") or h.get("reason") or "") for h in hospitals if isinstance(h, dict)
+            )
 
         insurance = submission.get("insurance") or []
         if insurance:

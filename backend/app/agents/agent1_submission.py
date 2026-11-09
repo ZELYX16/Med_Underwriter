@@ -420,7 +420,7 @@ class SubmissionIntelligenceAgent:
                 or metadata.get("document_id")
                 or item.get("file_name")
                 or metadata.get("file_name")
-                or item.get("content", "")[:120]
+                or (item.get("content") or "")[:120]
             )
 
             if not document_id:
@@ -726,8 +726,19 @@ class SubmissionIntelligenceAgent:
             structured_task,
         )
 
-        # Coverage analysis reuses the applicant evidence fetched above
-        # (it used to re-run those four queries).
+        # Quarantine security-flagged applicant chunks BEFORE coverage analysis
+        enrichment_pre = {
+            "medical_evidence": medical_evidence,
+            "claims_evidence": claims_evidence,
+            "policy_evidence": policy_evidence,
+            "underwriting_submission": underwriting_submission,
+        }
+        quarantine = self._quarantine_flagged(enrichment_pre)
+        medical_evidence = enrichment_pre["medical_evidence"]
+        claims_evidence = enrichment_pre["claims_evidence"]
+        policy_evidence = enrichment_pre["policy_evidence"]
+        underwriting_submission = enrichment_pre["underwriting_submission"]
+
         coverage_gaps = await self._retrieve_coverage_gaps(
             applicant_id=applicant_id,
             applicant_profile=applicant_profile,
@@ -750,6 +761,7 @@ class SubmissionIntelligenceAgent:
             "policy_evidence": policy_evidence,
             "underwriting_submission": underwriting_submission,
             "structured_facts": structured_facts,
+            "security_quarantine": quarantine,
         }
 
     @staticmethod
@@ -772,8 +784,9 @@ class SubmissionIntelligenceAgent:
                 applicant_id, settings.synthetic_data_directory, db_paths
             )
             return build_applicant_facts(paths, reference) if paths else {}
-        except Exception:
-            return {}
+        except Exception as exc:
+            logger.warning("Failed loading structured facts for applicant %s: %s", applicant_id, exc)
+            return {"unparsed_files": [{"applicant_id": applicant_id, "error": str(exc)}]}
 
     @staticmethod
     def _summarise_facts(
@@ -882,7 +895,7 @@ class SubmissionIntelligenceAgent:
 
         # Chunks flagged at index time (embedded instructions, secrets) are
         # excluded from analysis; the case is routed to human review.
-        security_quarantine = self._quarantine_flagged(enrichment)
+        security_quarantine = enrichment.get("security_quarantine") or self._quarantine_flagged(enrichment)
 
         workflow_trace.append(
             {

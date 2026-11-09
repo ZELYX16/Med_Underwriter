@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Compliance catalogue: explicit, versioned checks with a per-case report.
 
@@ -9,10 +11,11 @@ each rule comes from the catalogue, never from free-text retrieval.
 The source labels are internal references to be confirmed with the compliance
 function; they are not legal citations.
 """
-from __future__ import annotations
 
 import re
 from typing import Any
+
+from app.services.text_match import has_term
 
 CATALOGUE_VERSION = "2026.11"
 _PROTECTED = ("gender", "sex", "religion", "race", "ethnicity", "caste", "marital", "nationality")
@@ -27,9 +30,9 @@ def exclusion_matches(policy: dict[str, Any] | None, texts: list[str]) -> list[d
     found = []
     for exclusion in policy.get("exclusions", []):
         words = [w for w in re.findall(r"[a-z]{5,}", exclusion.lower())
-                 if w not in {"unless", "medically", "indicated", "routine", "hospitalised", "non-accidental"}]
-        hit = next((w for w in words if w in haystack), None)
-        if hit and hit not in _GENERIC_EXCLUSIONS:
+                 if w not in {"unless", "medically", "indicated", "routine", "hospitalised", "non-accidental", "treatment", "disease", "condition"}]
+        hit = next((w for w in words if has_term(haystack, w) and w not in _GENERIC_EXCLUSIONS), None)
+        if hit:
             found.append({"exclusion": exclusion, "applies_to": hit})
     return found
 
@@ -55,6 +58,9 @@ def evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
     elif states.get("medical", {}).get("state") == "unknown" and profile.get("medical_conditions"):
         add("C01", "Declarations are consistent with the documents", "Duty of disclosure (internal policy)", "needs_info",
             "No medical document was available to compare with the declaration.")
+    elif not profile.get("medical_conditions") and not ctx.get("has_documents"):
+        add("C01", "Declarations are consistent with the documents", "Duty of disclosure (internal policy)", "na",
+            "No declared medical conditions and no medical documents to compare.")
     else:
         add("C01", "Declarations are consistent with the documents", "Duty of disclosure (internal policy)", "pass",
             "No serious undeclared condition found.")
@@ -67,7 +73,7 @@ def evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
 
     # C03 protected attributes
     text = " ".join(str(f) for f in risk.get("risk_factors", [])).lower()
-    used = [a for a in _PROTECTED if a in text]
+    used = [a for a in _PROTECTED if has_term(text, a)]
     add("C03", "Protected attributes are not risk factors", "Fair-treatment principle (internal policy)",
         "fail" if used else "pass", ("Used as a factor: " + ", ".join(used)) if used else "None used.")
 
@@ -98,7 +104,7 @@ def evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
         else ("No exclusion touches the declared conditions or add-ons." if policy else "No policy schedule to check."))
 
     # C07 adverse outcomes
-    rec = str(ctx.get("recommendation", ""))
+    rec = str(ctx.get("recommendation", "")).strip().lower()
     adverse = rec in {"decline", "postpone"}
     add("C07", "Adverse outcomes are decided by a person", "Fair-treatment principle (internal policy)",
         "pass" if (not adverse or ctx.get("mandatory")) else "fail",

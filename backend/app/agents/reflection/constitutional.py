@@ -40,6 +40,7 @@ class ConstitutionalChecker:
             "actuarial_soundness": self._actuarial_soundness(
                 risk_assessment,
                 pricing_result,
+                recommendation=recommendation,
             ),
             "regulatory_compliance": self._regulatory_compliance(
                 evidence,
@@ -246,25 +247,28 @@ class ConstitutionalChecker:
             "infection",
         )
 
+        from app.services.text_match import has_term
         return [
             term
             for term in medical_terms
-            if term in text
+            if has_term(text, term)
         ]
 
     @staticmethod
     def _stringify_evidence(value: Any) -> str:
+        if value is None or value == "" or value == 0:
+            return ""
         if isinstance(value, dict):
-            return " ".join(
-                f"{key} "
-                f"{ConstitutionalChecker._stringify_evidence(item)}"
-                for key, item in value.items()
-            )
+            parts = []
+            for key, item in value.items():
+                s = ConstitutionalChecker._stringify_evidence(item)
+                if s:
+                    parts.append(f"{key} {s}")
+            return " ".join(parts)
 
         if isinstance(value, (list, tuple, set)):
             return " ".join(
-                ConstitutionalChecker._stringify_evidence(item)
-                for item in value
+                s for s in (ConstitutionalChecker._stringify_evidence(item) for item in value) if s
             )
 
         return str(value)
@@ -273,6 +277,7 @@ class ConstitutionalChecker:
         self,
         risk_assessment: dict[str, Any],
         pricing_result: dict[str, Any],
+        recommendation: str = "",
     ) -> dict[str, Any]:
         overall_risk = self._safe_float(
             risk_assessment.get("overall_risk_score")
@@ -336,10 +341,12 @@ class ConstitutionalChecker:
                 "base premium cannot be negative"
             )
 
+        # Skip premium comparison if outcome is decline or postpone
         if (
-            base_premium is not None
+            recommendation.lower() not in ("decline", "postpone")
+            and base_premium is not None
             and final_premium is not None
-            and final_premium < base_premium
+            and (base_premium - final_premium) > 0.50
         ):
             problems.append(
                 "final premium is lower than the base premium"
@@ -436,10 +443,11 @@ class ConstitutionalChecker:
             for factor in risk_factors
         )
 
+        from app.services.text_match import has_term
         protected_used = sorted(
             attribute
             for attribute in self.PROTECTED_ATTRIBUTES
-            if attribute in risk_factor_text
+            if has_term(risk_factor_text, attribute) or has_term(risk_factor_text, attribute.replace("_", " "))
         )
 
         if protected_used:

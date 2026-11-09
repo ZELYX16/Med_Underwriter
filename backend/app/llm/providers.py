@@ -26,22 +26,23 @@ class OllamaProvider(LLMProvider):
     ) -> Any:
         from langchain_ollama import ChatOllama
 
-        return ChatOllama(
-            model=model,
-            base_url=settings.ollama_base_url,
-            temperature=(
+        ollama_kwargs: dict[str, Any] = {
+            "model": model,
+            "base_url": settings.ollama_base_url,
+            "temperature": (
                 settings.temperature
                 if temperature is None
                 else temperature
             ),
-            num_predict=max_tokens or settings.max_tokens,
-            keep_alive=settings.ollama_keep_alive,
-            num_ctx=settings.ollama_num_ctx,
-            # Constrains output to valid JSON when the caller asks for it.
-            **({"format": "json"} if json_mode else {}),
-            timeout=settings.llm_timeout_sec,
-            max_retries=settings.llm_max_retries,
-        )
+            "num_predict": max_tokens or settings.max_tokens,
+            "keep_alive": settings.ollama_keep_alive,
+            "num_ctx": settings.ollama_num_ctx,
+            "client_kwargs": {"timeout": settings.llm_timeout_sec},
+            "max_retries": settings.llm_max_retries,
+        }
+        if json_mode:
+            ollama_kwargs["format"] = "json"
+        return ChatOllama(**ollama_kwargs)
 
 
 class GroqProvider(LLMProvider):
@@ -60,17 +61,20 @@ class GroqProvider(LLMProvider):
                 "LLM_PROVIDER=groq."
             )
 
-        return ChatGroq(
-            model=model,
-            api_key=settings.groq_api_key,
-            temperature=(
+        groq_kwargs: dict[str, Any] = {
+            "model": model,
+            "api_key": settings.groq_api_key,
+            "temperature": (
                 settings.temperature
                 if temperature is None
                 else temperature
             ),
-            max_tokens=max_tokens or settings.max_tokens,
-            max_retries=settings.llm_max_retries,
-        )
+            "max_tokens": max_tokens or settings.max_tokens,
+            "max_retries": settings.llm_max_retries,
+        }
+        if json_mode:
+            groq_kwargs["response_format"] = {"type": "json_object"}
+        return ChatGroq(**groq_kwargs)
 
 
 class GeminiProvider(LLMProvider):
@@ -91,17 +95,20 @@ class GeminiProvider(LLMProvider):
                 "LLM_PROVIDER=gemini."
             )
 
-        return ChatGoogleGenerativeAI(
-            model=model,
-            google_api_key=settings.gemini_api_key,
-            temperature=(
+        gemini_kwargs: dict[str, Any] = {
+            "model": model,
+            "google_api_key": settings.gemini_api_key,
+            "temperature": (
                 settings.temperature
                 if temperature is None
                 else temperature
             ),
-            max_output_tokens=max_tokens or settings.max_tokens,
-            max_retries=settings.llm_max_retries,
-        )
+            "max_output_tokens": max_tokens or settings.max_tokens,
+            "max_retries": settings.llm_max_retries,
+        }
+        if json_mode:
+            gemini_kwargs["response_mime_type"] = "application/json"
+        return ChatGoogleGenerativeAI(**gemini_kwargs)
 
 
 def get_provider() -> LLMProvider:

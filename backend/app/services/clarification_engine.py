@@ -88,6 +88,26 @@ def _has_answer(value: Any) -> bool:
     normalized = str(value).strip().casefold()
     return normalized not in {"", "— select an answer —", "select an answer", "please select"}
 
+FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "diagnosis_year": ("diagnosis_year", "since", "year", "year_diagnosed"),
+    "bp_reading": ("bp_reading", "reading", "bp", "blood_pressure"),
+    "kidney_type": ("kidney_type", "kind", "type", "condition_type"),
+    "event_details": ("event_details", "event", "details", "procedure"),
+    "cancer_type": ("cancer_type", "kind", "type", "stage"),
+    "hba1c": ("hba1c", "reading", "value", "latest_hba1c"),
+    "complications": ("complications", "any_complications", "complication"),
+}
+
+
+def _get_condition_answer(answers_dict: dict[str, Any], field: str) -> Any:
+    aliases = FIELD_ALIASES.get(field, (field,))
+    for alias in aliases:
+        val = answers_dict.get(alias)
+        if _has_answer(val):
+            return val
+    return None
+
+
 
 def _question(
     *, question_id: str, category: str, question: str, input_type: str,
@@ -229,7 +249,7 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
             # diagnosis-year questions unless the date is still missing.
             if field == "diagnosis_year" and relevant and re.search(r"\b(19|20)\d{2}\b", facts_text):
                 continue
-            if _has_answer(answers_for_condition.get(field)):
+            if _get_condition_answer(answers_for_condition, field) is not None:
                 continue
             qid = f"condition:{key}:{field}"
             add(_question(
@@ -286,6 +306,8 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
     # Conflicting same-date values must be explicitly reconciled or sent to a
     # human reviewer. We never choose one value automatically.
     for doc in documents or []:
+        if doc.get("status") in {"rejected", "failed", "deleting", "delete_failed"}:
+            continue
         for conflict in doc.get("conflicts") or []:
             stable = hashlib.sha1(
                 f"{conflict.get('fact_type')}|{conflict.get('date')}|{conflict.get('current_value')}|{conflict.get('previous_value')}".encode("utf-8")

@@ -31,6 +31,10 @@ def allow(case_id: str | None, kind: str = "llm") -> bool:
     now = time.monotonic()
     with _lock:
         key = case_id or "_"
+        # Bound _per_case memory growth
+        if len(_per_case) > 1000:
+            for old_key in list(_per_case.keys())[:200]:
+                _per_case.pop(old_key, None)
         if _per_case[key] >= per_case:
             return False
         if provider != "ollama":

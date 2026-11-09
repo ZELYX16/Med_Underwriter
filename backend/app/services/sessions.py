@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any
 
 TTL_DAYS = 14
@@ -45,12 +46,17 @@ class SessionStore:
         with self._conn() as c:
             c.execute(_SCHEMA)
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _conn(self):
         c = sqlite3.connect(self.path, check_same_thread=False, timeout=5)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA busy_timeout=5000")
-        return c
+        try:
+            with c:
+                yield c
+        finally:
+            c.close()
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -108,9 +114,11 @@ class SessionStore:
     def mutate_documents(self, token: str, fn) -> list[dict[str, Any]]:
         """Read-modify-write the document list under the lock (parallel jobs)."""
         with self._lock, self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             row = c.execute("SELECT documents_json FROM application_sessions WHERE token=?", (token,)).fetchone()
             docs = json.loads(row["documents_json"]) if row else []
-            docs = fn(docs) or docs
+            new_docs = fn(docs)
+            docs = new_docs if new_docs is not None else docs
             c.execute("UPDATE application_sessions SET documents_json=?, updated_at=? WHERE token=?",
                       (json.dumps(docs, default=str), _now(), token))
         return docs

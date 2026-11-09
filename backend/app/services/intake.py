@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 
 """
 Live intake: what to ask, what is still needed, and how the form becomes a case.
@@ -7,12 +9,12 @@ everyday words; the clinical term is only used internally. An LLM is used (by
 the caller, behind the cost guard) only to map a typed condition that the
 lookup could not recognise.
 """
-from __future__ import annotations
 
 import re
 from datetime import date
 from typing import Any
 
+from app.services.extraction import parse_number
 from app.services.medical_groups import text_group
 
 
@@ -78,16 +80,19 @@ MEDICAL_EXAM_SUM = 1_000_000
 
 def lookup_condition(text: str) -> dict[str, Any]:
     """Map a typed condition to the catalogue without any LLM call."""
-    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
-    for word in words:
-        if word in _SYNONYMS:
-            c = BY_KEY[_SYNONYMS[word]]
-            return {"key": c["key"], "label": c["label"], "group": c["group"], "matched": True}
-    group = text_group(text)
+    clean_text = str(text or "").lower().strip()
+    # Check text_group first (catches multi-word medical patterns like "high blood pressure")
+    group = text_group(clean_text)
     if group:
         c = next((c for c in CONDITIONS if c["group"] == group), None)
         if c:
             return {"key": c["key"], "label": c["label"], "group": group, "matched": True}
+    # Check synonyms with longest keys first
+    for syn in sorted(_SYNONYMS.keys(), key=len, reverse=True):
+        pattern = rf"(?<!\w){re.escape(syn)}(?!\w)"
+        if re.search(pattern, clean_text):
+            c = BY_KEY[_SYNONYMS[syn]]
+            return {"key": c["key"], "label": c["label"], "group": c["group"], "matched": True}
     return {"key": None, "label": str(text).strip().title(), "group": None, "matched": False}
 
 
@@ -168,7 +173,7 @@ def open_items(form: dict[str, Any], documents: list[dict[str, Any]],
     if not form.get("consent"):
         items.append({"id": "consent", "kind": "confirmation", "blocking": True,
                       "text": "Please confirm that the details are true and that we may use them to assess your application"})
-    later = set(form.get("docs_later", []))
+    later = set(form.get("docs_later") or [])
     live = [d for d in documents if d.get("status") not in {"rejected", "failed", "deleting", "delete_failed"}]
     attached = {d.get("requirement") for d in live}
     detected_folders = {d.get("folder") for d in live}
@@ -219,7 +224,7 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
     if str(form.get("hospital_details") or "").strip():
         hospitals.append({"details": form["hospital_details"].strip(), "reason": "Declared hospital stay"})
     height, weight = form.get("height_cm"), form.get("weight_kg")
-    bmi = round(weight / ((height / 100) ** 2), 1) if height and weight else None
+    bmi = round(weight / ((height / 100) ** 2), 1) if height and weight else form.get("bmi")
     alcohol_value = str(form.get("alcohol_consumption") or "").strip().lower()
     alcohol_normalized = {
         "never": "none",
@@ -292,8 +297,8 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
     submission = {
         "product": form.get("product"),
         "policy_type": form.get("policy_type") or "Individual",
-        "sum_insured": int(form["sum_insured"]) if form.get("sum_insured") else None,
-        "deductible": int(form["deductible"]) if form.get("deductible") else None,
+        "sum_insured": int(parse_number(form.get("sum_insured"))) if parse_number(form.get("sum_insured")) > 0 else None,
+        "deductible": int(parse_number(form.get("deductible"))) if parse_number(form.get("deductible")) > 0 else None,
         "term_years": int(form.get("term_years") or 1),
         "family_members": form.get("family_members", []) or [],
         "previous_insurance_details": form.get("previous_insurance_details") or "",

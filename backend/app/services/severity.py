@@ -71,7 +71,7 @@ def parse_bp(value: Any) -> tuple[int, int] | None:
 
 
 def lab_value(labs: list[dict[str, Any]], key: str) -> float | None:
-    """Latest numeric value of a lab by canonical name (hba1c, egfr, ...)."""
+    """Latest numeric value of a lab by canonical name (hba1c, egfr, ...), converted to standard units."""
     pattern = re.compile(_LAB_PATTERNS[key], re.IGNORECASE)
     found = [
         lab for lab in labs or []
@@ -80,7 +80,29 @@ def lab_value(labs: list[dict[str, Any]], key: str) -> float | None:
     if not found:
         return None
     found.sort(key=lambda lab: lab.get("document_date") or "", reverse=True)
-    return float(found[0]["value"])
+    raw_val = found[0]["value"]
+    unit = str(found[0].get("unit", "")).strip().lower()
+    
+    val_str = str(raw_val).lstrip("<>=").strip()
+    try:
+        val = float(val_str)
+    except (ValueError, TypeError):
+        return None
+
+    if key == "hba1c":
+        # Convert mmol/mol to %
+        if "mmol/mol" in unit or val > 20.0:
+            val = round((val * 0.09148) + 2.152, 2)
+    elif key in {"fasting_glucose", "glucose"}:
+        # Convert mmol/L to mg/dL
+        if "mmol" in unit or val < 30.0:
+            val = round(val * 18.0182, 1)
+    elif key == "creatinine":
+        # Convert umol/L to mg/dL
+        if "umol" in unit or "µmol" in unit or val > 30.0:
+            val = round(val / 88.4, 2)
+
+    return val
 
 
 def _entry(
@@ -167,7 +189,7 @@ def assess_group(
         return _entry(group, "serious", "unknown", [f"{group_label(group)} is always treated as serious"])
 
     if group == "renal":
-        stage = re.search(r"stage\s*([3-5])|\bn18\.[3-9]|dialysis|end[- ]stage", text, re.IGNORECASE) or any(
+        stage = _affirmed(text, r"stage\s*([3-5])|\bn18\.[3-9]|dialysis|end[- ]stage") or any(
             re.match(r"N18\.[3-9]|N17", c, re.IGNORECASE) for c in icd_codes
         )
         if stage or (egfr is not None and egfr < 60):
@@ -267,7 +289,7 @@ def assess_group(
     if group == "autoimmune":
         return _entry("autoimmune", "moderate", "unknown", ["autoimmune / rheumatological condition"])
 
-    if group == "obesity" or (bmi is not None and bmi >= 35):
+    if group == "obesity":
         return _entry("obesity", "moderate" if (bmi or 0) >= 35 else "routine", "unknown",
                       [f"BMI {bmi:g}" if bmi else "obesity"])
 
