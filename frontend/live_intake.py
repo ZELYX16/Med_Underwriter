@@ -456,9 +456,13 @@ def _clarifications_block(
     )
 
     answers = dict(form.get("clarification_answers") or {})
+    seen_qids = set()
 
     for index, item in enumerate(questions):
         qid = item["id"]
+        if qid in seen_qids:
+            continue
+        seen_qids.add(qid)
         saved = answers.get(qid, item.get("answer", ""))
 
         with st.container(border=True):

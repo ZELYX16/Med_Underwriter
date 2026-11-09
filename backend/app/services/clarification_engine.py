@@ -181,13 +181,12 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
         if _has_answer(answer):
             item["answer"] = answer
             item["answered"] = True
+            item["blocking"] = False
             normalized_answer = str(answer).strip().lower()
             if ("not sure" in normalized_answer or "reviewer" in normalized_answer
                     or normalized_answer in {"not_sure", "unsure"}):
-                item["blocking"] = False
                 item["needs_human_review"] = True
                 item["status"] = "needs_review"
-                output.append(item)
             elif str(answer).strip().lower() in {"no, correct it", "incorrect"}:
                 correction_id = item["id"] + "_correction"
                 correction = _question(
@@ -198,11 +197,38 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
                 )
                 if not _has_answer(answers.get(correction_id)):
                     output.append(correction)
-            item["blocking"] = False
             output.append(item)
             return
         item["answered"] = False
         output.append(item)
+
+    # Generic document availability flags across all categories
+    has_medical_docs = any(
+        str(doc.get("status", "")).lower() not in {"rejected", "failed", "deleting", "delete_failed"}
+        and (
+            str(doc.get("detected_type", "")).lower() in {"medical_exam", "lab", "specialist", "prescription", "discharge", "medical"}
+            or doc.get("folder") == "medical"
+            or any(k in str(doc.get("filename", "")).lower() for k in ("medical", "lab", "report", "consultation", "discharge", "mr-", "prescription", "exam"))
+        )
+        for doc in (documents or [])
+    )
+    has_discharge_doc = any(
+        str(doc.get("status", "")).lower() not in {"rejected", "failed", "deleting", "delete_failed"}
+        and (
+            str(doc.get("detected_type", "")).lower() in {"discharge", "hospital"}
+            or "discharge" in str(doc.get("filename", "")).lower()
+        )
+        for doc in (documents or [])
+    )
+    has_claim_doc = any(
+        str(doc.get("status", "")).lower() not in {"rejected", "failed", "deleting", "delete_failed"}
+        and (
+            str(doc.get("detected_type", "")).lower() in {"claim", "claims"}
+            or doc.get("folder") == "claims"
+            or any(k in str(doc.get("filename", "")).lower() for k in ("claim", "clm-"))
+        )
+        for doc in (documents or [])
+    )
 
     # Applicant-declared medical conditions: ask only for material fields not
     # already found in uploaded evidence or explicitly answered.
@@ -220,50 +246,59 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
 
         for spec in questions:
             field, prompt, input_type, reason, *extra = spec
-            # Skip a field when its explicit evidence is already available.
-            if field == "hba1c" and any(f.get("fact_type") == "hba1c" for f in facts):
-                continue
-            if field == "bp_reading":
-                if any(f.get("fact_type") == "blood_pressure" for f in facts):
-                    continue
-                # Intake stores applicant PDFs first and extracts them when
-                # underwriting starts. Do not ask for a duplicate BP report
-                # while a relevant uploaded medical document is still pending.
-                pending_medical_evidence = any(
-                    str(doc.get("status", "")).lower() in {"accepted", "indexing", "indexed", "needs_review"}
-                    and str(doc.get("detected_type", "")).lower() in {
-                        "medical_exam", "lab", "specialist", "prescription", "discharge"
-                    }
-                    for doc in (documents or [])
-                )
-                if pending_medical_evidence:
-                    continue
-            if field == "kidney_status" and any(f.get("fact_type") in {"creatinine", "egfr"} for f in facts):
-                continue
-            if field == "kidney_type" and re.search(r"kidney stone|renal calcul|chronic kidney disease|\bckd\b", facts_text):
-                continue
-            if field == "event_details":
-                has_event_in_docs = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", facts_text))
-                has_event_in_hospital = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", str(form.get("hospital_details") or ""), re.I))
-                has_event_doc = any(
-                    str(d.get("detected_type", "")).lower() in {"discharge", "specialist"}
-                    or "discharge" in str(d.get("filename", "")).lower()
-                    for d in (documents or [])
-                )
-                if has_event_in_docs or has_event_in_hospital or has_event_doc:
-                    continue
-            if field == "cancer_type" and re.search(r"carcinoma|lymphoma|leukaemia|leukemia|sarcoma|melanoma|myeloma", facts_text):
-                continue
-            if field == "event_date" and any(f.get("fact_type") in {"admission_date", "discharge_date"} for f in relevant):
-                continue
-            if field == "complications" and re.search(r"no (known )?complication|without complication|complications? (nil|none|absent)|retinopathy|nephropathy|neuropathy|end[- ]organ damage", facts_text):
-                continue
-            # If the diagnosis itself is in a document, avoid asking generic
-            # diagnosis-year questions unless the date is still missing.
-            if field == "diagnosis_year" and relevant and re.search(r"\b(19|20)\d{2}\b", facts_text):
-                continue
+
+            # 1. Skip if already answered in condition declaration
             if _get_condition_answer(answers_for_condition, field) is not None:
                 continue
+
+            # 2. Lab readings: skip if explicit fact exists or medical documents are attached
+            if field in {"hba1c", "bp_reading", "kidney_status"}:
+                if field == "hba1c" and any(f.get("fact_type") == "hba1c" for f in facts):
+                    continue
+                if field == "bp_reading" and any(f.get("fact_type") == "blood_pressure" for f in facts):
+                    continue
+                if field == "kidney_status" and any(f.get("fact_type") in {"creatinine", "egfr"} for f in facts):
+                    continue
+                if has_medical_docs:
+                    continue
+
+            # 3. Clinical details, procedures, and disease types: skip if documented or declared
+            if field in {"event_details", "kidney_type", "cancer_type"}:
+                if field == "kidney_type" and re.search(r"kidney stone|renal calcul|chronic kidney disease|\bckd\b", facts_text):
+                    continue
+                if field == "cancer_type" and re.search(r"carcinoma|lymphoma|leukaemia|leukemia|sarcoma|melanoma|myeloma", facts_text):
+                    continue
+                if field == "event_details":
+                    has_event_in_docs = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", facts_text))
+                    has_event_in_hospital = bool(re.search(r"stent|bypass|myocardial infarction|heart attack|angioplasty|\bcabg\b", str(form.get("hospital_details") or ""), re.I))
+                    if has_event_in_docs or has_event_in_hospital or has_discharge_doc or has_medical_docs:
+                        continue
+                if has_medical_docs:
+                    continue
+
+            # 4. Current status, treatment, and ongoing care: skip if status is declared or medical docs on file
+            if field in {"current_status", "treatment_status", "residual_effects", "diagnosis_and_treatment"}:
+                if any(k in answers_for_condition for k in ("status", "treatment", "medicines", "medication")):
+                    continue
+                if has_medical_docs:
+                    continue
+
+            # 5. Complications: skip if facts show no complications or full medical report on file
+            if field == "complications":
+                if re.search(r"no (known )?complication|without complication|complications? (nil|none|absent)|retinopathy|nephropathy|neuropathy|end[- ]organ damage", facts_text):
+                    continue
+                if has_medical_docs:
+                    continue
+
+            # 6. Dates and timelines: skip if year is declared or medical docs on file
+            if field in {"diagnosis_year", "event_date"}:
+                if any(k in answers_for_condition for k in ("since", "year", "year_diagnosed", "date")):
+                    continue
+                if re.search(r"\b(19|20)\d{2}\b", facts_text):
+                    continue
+                if has_medical_docs:
+                    continue
+
             qid = f"condition:{key}:{field}"
             add(_question(
                 question_id=qid, category="medical_condition", condition_key=key,
@@ -276,12 +311,15 @@ def build_clarifications(form: dict[str, Any], documents: list[dict[str, Any]]) 
             ))
 
     # Yes declarations need a minimal description; do not ask if the applicant
-    # has already supplied it in the form.
-    if str(form.get("hospital_stay", "")).lower() == "yes" and not str(form.get("hospital_details") or "").strip():
+    # has already supplied it in the form or uploaded relevant documents.
+    has_hospital_info = bool(str(form.get("hospital_details") or "").strip() or has_discharge_doc)
+    if str(form.get("hospital_stay", "")).lower() == "yes" and not has_hospital_info:
         add(_question(question_id="history:hospital_details", category="hospital_history",
                       question="Please tell us the approximate year and reason for your hospital stay.",
                       input_type="text", reason="You declared a hospital stay, but its basic details are missing."))
-    if str(form.get("had_claims", "")).lower() == "yes" and not str(form.get("claims_details") or "").strip():
+
+    has_claims_info = bool(str(form.get("claims_details") or "").strip() or has_claim_doc)
+    if str(form.get("had_claims", "")).lower() == "yes" and not has_claims_info:
         add(_question(question_id="history:claims_details", category="claims_history",
                       question="Please briefly describe the claim (approximate year, reason and outcome, if known).",
                       input_type="text", reason="You declared a previous claim, but its basic details are missing."))
