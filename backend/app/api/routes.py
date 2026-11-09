@@ -258,6 +258,11 @@ async def _persist_workflow_update(
     # During intermediate streaming updates, do not prematurely persist terminal status;
     # keep database status as "processing" until the workflow run finishes.
     # Also preserve standard underscores in status names.
+    final_status = str(
+        current.get("final_status")
+        or current.get("status")
+        or "processing"
+    )
     status_to_save = "processing"
 
     # SQLite is synchronous: keep it off the event loop so status polling
