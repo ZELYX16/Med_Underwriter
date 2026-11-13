@@ -91,7 +91,17 @@ def evaluate_review_gate(state: dict[str, Any]) -> dict[str, Any]:
         if msg not in reasons:
             reasons.append(msg)
 
-    # 6. Explicit human review requests from upstream agents
+    # 6. Document defects & unparsed files
+    defects = state.get("document_defects") or []
+    unparsed = state.get("unparsed_files") or []
+    if defects or unparsed:
+        defect_names = [d["file_name"] if isinstance(d, dict) else str(d) for d in defects] or [str(u) for u in unparsed]
+        msg = f"Document defect: Unreadable or scanned document detected ({', '.join(defect_names)}). Manual verification required."
+        if msg not in reasons:
+            reasons.append(msg)
+            blocking_reasons.append(msg)
+
+    # 7. Explicit human review requests from upstream agents
     if state.get("require_human_escalation") or state.get("require_human_review"):
         for r in state.get("human_review_reasons") or []:
             r_str = str(r)

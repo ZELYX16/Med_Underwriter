@@ -38,6 +38,8 @@ class UnderwritingState(TypedDict, total=False):
 
     agent1_enrichment: dict[str, Any]
     agent1_completed: bool
+    document_defects: list[dict[str, Any]]
+    unparsed_files: list[str]
     underwriting_submission: list[dict[str, Any]]
     underwriting_knowledge_evidence: list[dict[str, Any]]
     agent1_metrics: dict[str, Any]

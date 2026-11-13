@@ -476,6 +476,46 @@ def parse_pdf(path: str | Path) -> dict[str, Any] | None:
         return _PARSE_CACHE[key]
 
     try:
+        # Pre-flight with PyMuPDF for encryption & vector text density (Completeness Gate)
+        try:
+            import pymupdf
+            fitz_doc = pymupdf.open(str(path))
+            if fitz_doc.is_encrypted:
+                logger.warning("PDF %s is encrypted / password-protected", path.name)
+                result = {
+                    "path": str(path),
+                    "file_name": path.name,
+                    "title": "",
+                    "header": {},
+                    "sections": [],
+                    "doc_id": path.stem.split("_")[0],
+                    "doc_type": doc_type_of(path.stem.split("_")[0], path),
+                    "document_defect": "encrypted_password_protected",
+                }
+                _PARSE_CACHE[key] = result
+                return result
+            total_chars = sum(len(p.get_text("text").strip()) for p in fitz_doc)
+            total_tables = sum(len(p.find_tables().tables) for p in fitz_doc)
+            if total_chars < 50 and total_tables == 0:
+                logger.warning(
+                    "PDF %s has insufficient vector text (<50 chars, 0 tables); scanned image detected",
+                    path.name,
+                )
+                result = {
+                    "path": str(path),
+                    "file_name": path.name,
+                    "title": "",
+                    "header": {},
+                    "sections": [],
+                    "doc_id": path.stem.split("_")[0],
+                    "doc_type": doc_type_of(path.stem.split("_")[0], path),
+                    "document_defect": "scanned_or_insufficient_text",
+                }
+                _PARSE_CACHE[key] = result
+                return result
+        except Exception as fitz_exc:
+            logger.debug("PyMuPDF pre-flight error for %s: %s", path.name, fitz_exc)
+
         lines = layout_lines(path)
         sections = _split_sections(lines)
         preamble = sections[0]
@@ -1151,12 +1191,15 @@ def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = 
     """
     parsed: list[tuple[dict[str, Any], dict[str, Any]]] = []
     unparsed: list[str] = []
+    defective_docs: list[dict[str, str]] = []
     submission: dict[str, Any] | None = None
 
     for path in paths:
         doc = parse_pdf(path)
-        if not doc or not doc["sections"]:
+        if not doc or not doc.get("sections"):
             unparsed.append(path.name)
+            defect_type = doc.get("document_defect", "unreadable_or_empty") if doc else "corrupt_or_unreadable"
+            defective_docs.append({"file_name": path.name, "defect": defect_type})
             continue
         facts = document_facts(doc)
         parsed.append((doc, facts))
@@ -1272,6 +1315,8 @@ def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = 
         "claim_records": claims,
         "policy": policies[0] if policies else None,
         "has_medical_examination": any(m.get("is_examination") for m in medical),
+        "unparsed_files": unparsed,
+        "document_defects": defective_docs,
     }
 
 

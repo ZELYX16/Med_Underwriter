@@ -428,6 +428,13 @@ async def agent1_node(
             ),
         )
 
+        unparsed = enrichment.get("structured_facts", {}).get("unparsed_files") or result.get("unparsed_files") or []
+        defects = enrichment.get("structured_facts", {}).get("document_defects") or result.get("document_defects") or []
+        mandatory = list(state.get("mandatory_review_reasons") or [])
+        if defects or unparsed:
+            names = [d["file_name"] if isinstance(d, dict) else str(d) for d in defects] or [str(u) for u in unparsed]
+            mandatory.append(f"Document defect: unreadable or scanned document detected ({', '.join(names)})")
+
         return {
             "updated_at": _now(),
             "final_status": "agent1",
@@ -476,6 +483,9 @@ async def agent1_node(
                 "agent1": agent1_metrics,
             },
             "agent1_completed": True,
+            "document_defects": defects,
+            "unparsed_files": unparsed,
+            "mandatory_review_reasons": mandatory,
             "workflow_trace": _trace(
                 state,
                 "agent1_submission",
@@ -657,7 +667,7 @@ def complexity_node(
         }
 
 
-def agent2_node(
+async def agent2_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
     try:
@@ -676,24 +686,28 @@ def agent2_node(
             ),
         }
 
-        with cache_scope(state.get("case_id")) as cache_trace:
-            result = risk_agent.run(
-                applicant_profile=state.get(
-                    "applicant_profile",
-                    {},
-                ),
-                submission=state.get(
-                    "submission",
-                    {},
-                ),
-                enrichment_results=state.get(
-                    "agent1_enrichment",
-                    {},
-                ),
-                routing_result=routing_result,
-                reflection_findings=state.get("reflection_findings") or [],
-                reflection_round=int(state.get("reflection_round") or 0),
-            )
+        def _run_risk():
+            with cache_scope(state.get("case_id")) as cache_trace:
+                res = risk_agent.run(
+                    applicant_profile=state.get(
+                        "applicant_profile",
+                        {},
+                    ),
+                    submission=state.get(
+                        "submission",
+                        {},
+                    ),
+                    enrichment_results=state.get(
+                        "agent1_enrichment",
+                        {},
+                    ),
+                    routing_result=routing_result,
+                    reflection_findings=state.get("reflection_findings") or [],
+                    reflection_round=int(state.get("reflection_round") or 0),
+                )
+                return res, cache_trace.events
+
+        result, cache_events = await asyncio.to_thread(_run_risk)
 
         risk_assessment = result.get(
             "risk_assessment",
@@ -716,7 +730,7 @@ def agent2_node(
             },
             result,
         )
-        agent2_metrics["cache_events"] = cache_trace.events
+        agent2_metrics["cache_events"] = cache_events
 
         pricing = result.get(
             "pricing_result",
@@ -950,7 +964,7 @@ def confidence_gate_node(
     }
 
 
-def reflection_node(
+async def reflection_node(
     state: UnderwritingState,
 ) -> dict[str, Any]:
     try:
@@ -971,46 +985,49 @@ def reflection_node(
 
         started = time.perf_counter()
 
-        with cache_scope(state.get("case_id")):
-            result = reflection_agent.run(
-                applicant_profile=state.get(
-                    "applicant_profile",
-                    {},
-                ),
-                submission=state.get(
-                    "submission",
-                    {},
-                ),
-                enrichment_results=state.get(
-                    "agent1_enrichment",
-                    {},
-                ),
-                risk_result={
-                    "risk_assessment": state.get(
-                        "risk_assessment",
+        def _run_reflection():
+            with cache_scope(state.get("case_id")):
+                return reflection_agent.run(
+                    applicant_profile=state.get(
+                        "applicant_profile",
                         {},
                     ),
-                    "pricing_result": state.get(
-                        "pricing_result",
+                    submission=state.get(
+                        "submission",
                         {},
                     ),
-                    "agent2_recommendation": state.get(
-                        "agent2_recommendation",
-                        "",
+                    enrichment_results=state.get(
+                        "agent1_enrichment",
+                        {},
                     ),
-                    "agent2_confidence": state.get(
-                        "agent2_confidence",
-                        0.0,
-                    ),
-                    "agent2_reasoning": state.get(
-                        "agent2_reasoning",
-                        "",
-                    ),
-                    "fraud_flags": state.get("fraud_flags", []),
-                },
-                previous_findings=previous_findings,
-                complexity_level=str(state.get("complexity_level", "")),
-            )
+                    risk_result={
+                        "risk_assessment": state.get(
+                            "risk_assessment",
+                            {},
+                        ),
+                        "pricing_result": state.get(
+                            "pricing_result",
+                            {},
+                        ),
+                        "agent2_recommendation": state.get(
+                            "agent2_recommendation",
+                            "",
+                        ),
+                        "agent2_confidence": state.get(
+                            "agent2_confidence",
+                            0.0,
+                        ),
+                        "agent2_reasoning": state.get(
+                            "agent2_reasoning",
+                            "",
+                        ),
+                        "fraud_flags": state.get("fraud_flags", []),
+                    },
+                    previous_findings=previous_findings,
+                    complexity_level=str(state.get("complexity_level", "")),
+                )
+
+        result = await asyncio.to_thread(_run_reflection)
 
         agent3_metrics = _agent_metrics(
             result,
@@ -1662,13 +1679,18 @@ async def run_workflow(
 
     # Keep the async SQLite connection alive for the complete graph run.
     # Using the same SQLite file preserves existing checkpoint/application DBs.
-    async with AsyncSqliteSaver.from_conn_string(str(settings.sqlite_file)) as checkpointer:
+    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoints_sqlite_file)) as checkpointer:
         global _CHECKPOINTER_INITIALIZED
         if not _CHECKPOINTER_INITIALIZED:
             with _CHECKPOINTER_SETUP_LOCK:
                 if not _CHECKPOINTER_INITIALIZED:
                     await checkpointer.setup()
                     _CHECKPOINTER_INITIALIZED = True
+        try:
+            await checkpointer.conn.execute("PRAGMA journal_mode = WAL")
+            await checkpointer.conn.execute("PRAGMA busy_timeout = 5000")
+        except Exception:
+            pass
         workflow = create_async_graph(checkpointer)
 
         # Stream completed node states so the API can persist progress while

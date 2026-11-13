@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Storage
     sqlite_path: str = "data/medunderwrite.db"
+    checkpoints_sqlite_path: str = "data/checkpoints.db"
 
     data_root: str = "data"
     raw_data_path: str = "data/raw"
@@ -141,6 +142,12 @@ class Settings(BaseSettings):
     @property
     def sqlite_file(self) -> Path:
         path = self.base_path / self.sqlite_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def checkpoints_sqlite_file(self) -> Path:
+        path = self.base_path / self.checkpoints_sqlite_path
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
