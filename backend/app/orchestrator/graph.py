@@ -4,8 +4,13 @@ from datetime import datetime, timezone
 import time
 from typing import Any
 
+import asyncio
+import threading
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+_CHECKPOINTER_INITIALIZED: bool = False
+_CHECKPOINTER_SETUP_LOCK = threading.Lock()
 from langgraph.graph import END, START, StateGraph
 
 # Compatibility patch: aiosqlite >= 0.22 removed is_alive() from Connection
@@ -20,6 +25,7 @@ from app.cache.pattern_cache import cache_scope
 from app.config import settings
 from app.models.state import UnderwritingState
 from app.services import outcome
+from app.services.review_gate import evaluate_review_gate
 
 
 MAX_REFLECTION_ROUNDS = settings.max_reflection_rounds
@@ -1260,61 +1266,7 @@ def reflection_router(
 def _business_review_reasons(
     state: UnderwritingState,
 ) -> list[str]:
-    reasons: list[str] = []
-
-    medical_risk = float(state.get("medical_risk_score", 0.0) or 0.0)
-    overall_risk = float(state.get("overall_risk_score", 0.0) or 0.0)
-    confidence = float(state.get("agent2_confidence", 0.0) or 0.0)
-
-    if medical_risk >= HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD:
-        reasons.append(
-            f"Medical risk score {medical_risk:.2f} is at or above {HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD:.0f}."
-        )
-
-    if overall_risk >= HUMAN_REVIEW_OVERALL_RISK_THRESHOLD:
-        reasons.append(
-            f"Overall risk score {overall_risk:.2f} is at or above {HUMAN_REVIEW_OVERALL_RISK_THRESHOLD:.0f}."
-        )
-
-    if confidence < HUMAN_REVIEW_CONFIDENCE_THRESHOLD:
-        reasons.append(
-            f"Agent 2 confidence {confidence:.2f} is below {HUMAN_REVIEW_CONFIDENCE_THRESHOLD:.2f}."
-        )
-
-    fraud_score = float(state.get("fraud_risk_score", 0.0) or 0.0)
-    if fraud_score >= settings.fraud_review_threshold:
-        reasons.append(
-            f"Discrepancy score {fraud_score:.0f} is at or above "
-            f"{settings.fraud_review_threshold:.0f}; verify the flagged items."
-        )
-
-    # Mandatory / verification reasons decided by Agent 2's deterministic
-    # checks. They are not Agent 3's to clear: reflection and finalization
-    # read them and cannot override them.
-    for reason in state.get("mandatory_review_reasons") or []:
-        reasons.append(str(reason))
-
-    for reason in state.get("security_review_reasons") or []:
-        reasons.append(f"Security review: {reason}")
-
-    constitutional_flag = False
-    for key, value in state.items():
-        if key.startswith("constitutional_") and isinstance(value, dict):
-            if str(value.get("status", "")).lower() == "flag":
-                constitutional_flag = True
-                break
-
-    if constitutional_flag:
-        reasons.append("A constitutional/fairness/compliance check was flagged.")
-
-    verdict = str(state.get("reflection_verdict", "")).strip().lower()
-    if verdict in {"fail", "failed"}:
-        reasons.append("Agent 3 reflection failed.")
-
-    if state.get("reflection_round", 0) >= MAX_REFLECTION_ROUNDS and not state.get("reflection_consensus", False):
-        reasons.append("Agent 3 did not reach consensus within the maximum reflection rounds.")
-
-    return reasons
+    return evaluate_review_gate(state)["reasons"]
 
 
 def _review_notes(state: UnderwritingState) -> list[dict[str, Any]]:
@@ -1388,48 +1340,9 @@ def _outcome_fields(state: UnderwritingState) -> dict[str, Any]:
 def post_reflection_router(
     state: UnderwritingState,
 ) -> str:
-    business_reasons = _business_review_reasons(state)
-
-    if business_reasons:
+    gate = evaluate_review_gate(state)
+    if gate["requires_human_review"]:
         return "human_review"
-
-    if state.get(
-        "require_human_escalation",
-        False,
-    ):
-        return "human_review"
-
-    reflection_round = int(
-        state.get(
-            "reflection_round",
-            0,
-        )
-        or 0
-    )
-
-    if reflection_round >= MAX_REFLECTION_ROUNDS:
-        if state.get("reflection_requires_rescore", False) or not state.get("reflection_consensus", False) or state.get("reflection_verdict", "pass") in {"review", "escalate", "fail"}:
-            return "human_review"
-        return "finalize"
-
-    if state.get(
-        "reflection_requires_rescore",
-        False,
-    ):
-        return "rescore"
-
-    verdict = state.get(
-        "reflection_verdict",
-        "pass",
-    )
-
-    if verdict in {
-        "review",
-        "escalate",
-        "fail",
-    }:
-        return "human_review"
-
     return "finalize"
 
 
@@ -1750,7 +1663,12 @@ async def run_workflow(
     # Keep the async SQLite connection alive for the complete graph run.
     # Using the same SQLite file preserves existing checkpoint/application DBs.
     async with AsyncSqliteSaver.from_conn_string(str(settings.sqlite_file)) as checkpointer:
-        await checkpointer.setup()
+        global _CHECKPOINTER_INITIALIZED
+        if not _CHECKPOINTER_INITIALIZED:
+            with _CHECKPOINTER_SETUP_LOCK:
+                if not _CHECKPOINTER_INITIALIZED:
+                    await checkpointer.setup()
+                    _CHECKPOINTER_INITIALIZED = True
         workflow = create_async_graph(checkpointer)
 
         # Stream completed node states so the API can persist progress while

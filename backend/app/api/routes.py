@@ -37,6 +37,7 @@ from app.api.schemas import (
 )
 from app.cache.pattern_cache import pattern_cache
 from app.config import settings
+from app.services.review_gate import evaluate_review_gate
 from app.orchestrator.graph import run_workflow
 from app.services.batch import describe_plan, plan_groups, run_batch
 from app.services.document_service import document_service
@@ -384,21 +385,15 @@ async def _run_case(
                 )
             result["require_human_review"] = True
 
-        human_review_required = bool(
-            result.get("require_human_review")
-            or result.get("require_human_escalation")
-            or result.get("human_review_reasons")
-            or result.get("business_gate_reasons")
-            or result.get("mandatory_review_reasons")
-            or result.get("security_review_reasons")
-        )
-        if human_review_required:
+        gate = evaluate_review_gate(result)
+        if gate["requires_human_review"]:
             final_status = "awaiting_human_review"
             result["final_status"] = final_status
             result["require_human_review"] = True
             result["require_human_escalation"] = True
             result["human_review_status"] = "awaiting_review"
             result["final_decision"] = "pending_human_review"
+            result["human_review_reasons"] = gate["reasons"]
 
         _save_state(
             case_id,

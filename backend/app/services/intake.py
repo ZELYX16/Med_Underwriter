@@ -115,12 +115,19 @@ def selected_conditions(form: dict[str, Any]) -> list[dict[str, Any]]:
         base = BY_KEY.get(key) or {}
         label = item.get("label") or base.get("label") or str(key or "Other condition").replace("_", " ").title()
         answers = item.get("answers") if isinstance(item.get("answers"), dict) else {}
+        group = item.get("group") or base.get("group")
+        clinical = base.get("clinical") or item.get("clinical") or label
+        if key == "kidney":
+            kind_ans = str(answers.get("kind") or "").lower()
+            if "disease" in kind_ans:
+                group = "renal"
+                clinical = "Chronic kidney disease"
         out.append({
             **item,
             "key": key,
             "label": label,
-            "group": item.get("group") or base.get("group"),
-            "clinical": base.get("clinical") or item.get("clinical") or label,
+            "group": group,
+            "clinical": clinical,
             "answers": answers,
         })
     return out

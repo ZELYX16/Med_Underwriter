@@ -9,8 +9,8 @@ import re
 from typing import Any
 
 _NEGATION_BEFORE = re.compile(
-    r"\b(no|not|without|denies|denied|negative for|nil|absence of|free of|family history|"
-    r"father|mother|parents?|sister|brother|quit|non[- ]?)\b[^.;\n]{0,45}$",
+    r"(?:\b(?:no|not|without|denies|denied|negative for|nil|absence of|free of|family history|"
+    r"father|mother|parents?|sister|brother|quit)\b|\bnon[- ]?)[^.;\n]{0,45}$",
     re.IGNORECASE,
 )
 
@@ -62,7 +62,7 @@ def has_affirmed_term(
     raw = str(text)
     custom_neg_regex = None
     if negations:
-        escaped = [rf"{re.escape(n.strip())}" for n in negations if n.strip()]
+        escaped = [rf"(?<!\w){re.escape(n.strip())}(?!\w)" for n in negations if n.strip()]
         if escaped:
             custom_neg_regex = re.compile("|".join(escaped), re.IGNORECASE)
 
@@ -72,7 +72,8 @@ def has_affirmed_term(
             before = raw[max(0, match.start() - window): match.start()]
             if _NEGATION_BEFORE.search(before):
                 continue
-            if custom_neg_regex and custom_neg_regex.search(before):
+            context_window = raw[max(0, match.start() - window): min(len(raw), match.end() + 20)]
+            if custom_neg_regex and custom_neg_regex.search(context_window):
                 continue
             return True
     return False

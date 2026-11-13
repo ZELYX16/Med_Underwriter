@@ -688,29 +688,9 @@ class RiskAssessmentAgent:
             resolved_group = group_from_cond or text_group(condition_text)
             assessment = (features.get("tier_by_group") or {}).get(resolved_group)
 
-            for keyword, weight in condition_weights.items():
-                if keyword in text:
-                    # A controlled, routine condition counts for less; a
-                    # serious one for more.
-                    if assessment and assessment.get("tier") == "routine" and assessment.get("control") == "controlled":
-                        medical_score += weight * 0.5
-                    else:
-                        medical_score += weight
-                    risk_factors.append(
-                        "Medical condition requiring assessment: "
-                        + condition_text
-                    )
-                    if assessment and assessment.get("tier") == "serious":
-                        medical_score += 10
-                        risk_factors.append(
-                            f"Serious condition: {assessment['label']} ("
-                            + "; ".join(assessment.get("reasons", [])) + ")"
-                        )
-                    matched = True
-                    break
-
-            if not matched and resolved_group:
-                weight = condition_weights.get(resolved_group, 3)
+            # Precedence: check resolved_group in condition_weights FIRST before substring keywords
+            if resolved_group and resolved_group in condition_weights:
+                weight = condition_weights[resolved_group]
                 if assessment and assessment.get("tier") == "routine" and assessment.get("control") == "controlled":
                     medical_score += weight * 0.5
                 else:
@@ -722,10 +702,32 @@ class RiskAssessmentAgent:
                 if assessment and assessment.get("tier") == "serious":
                     medical_score += 10
                     risk_factors.append(
-                        f"Serious condition: {assessment['label']} ("
+                        f"Serious condition: {assessment.get('label', condition_text)} ("
                         + "; ".join(assessment.get("reasons", [])) + ")"
                     )
                 matched = True
+
+            if not matched:
+                for keyword, weight in condition_weights.items():
+                    if re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text):
+                        # A controlled, routine condition counts for less; a
+                        # serious one for more.
+                        if assessment and assessment.get("tier") == "routine" and assessment.get("control") == "controlled":
+                            medical_score += weight * 0.5
+                        else:
+                            medical_score += weight
+                        risk_factors.append(
+                            "Medical condition requiring assessment: "
+                            + condition_text
+                        )
+                        if assessment and assessment.get("tier") == "serious":
+                            medical_score += 10
+                            risk_factors.append(
+                                f"Serious condition: {assessment.get('label', condition_text)} ("
+                                + "; ".join(assessment.get("reasons", [])) + ")"
+                            )
+                        matched = True
+                        break
 
             if not matched:
                 tier = assessment.get("tier", "routine") if assessment else "routine"

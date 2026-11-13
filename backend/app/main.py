@@ -121,6 +121,20 @@ def _error_body(code: str, message: str, retryable: bool) -> dict:
     }
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    message = detail if isinstance(detail, str) else str(detail.get("message", detail) if isinstance(detail, dict) else detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_body(
+            f"http_{exc.status_code}",
+            message,
+            exc.status_code >= 500,
+        ),
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     logger.info("Validation error on %s: %s", request.url.path, exc.errors())

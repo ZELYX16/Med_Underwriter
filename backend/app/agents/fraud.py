@@ -346,21 +346,27 @@ def _structured(
             b.flag("claim_record_mismatch", _WEIGHTS["claim_record_mismatch"],
                    f"{record['claim_id']}: " + "; ".join(problems) + ".", source=record["claim_id"])
 
-    declared_text = (sub.get("insurance") or [{}])[0].get("claims_declared", "") if sub.get("insurance") else ""
+    ins_list = _as_list(sub.get("insurance"))
+    declared_text = ins_list[0].get("claims_declared", "") if ins_list and isinstance(ins_list[0], dict) else ""
     declared_match = re.search(r"(\d+)\s+claims?\s+declared", declared_text, re.IGNORECASE)
     if declared_match and schedule and int(declared_match.group(1)) != len(schedule):
         b.flag("claim_count_mismatch", _WEIGHTS["claim_count_mismatch"],
                f"The proposal declares {declared_match.group(1)} claim(s); the insurer's schedule lists {len(schedule)}.")
 
-    # Key duplicate claims by claim_id, or by provider+event_date+approved when claim_id is missing or same
-    keyed = Counter(
-        (r.get("claim_id") or f"{r.get('provider')}_{r.get('event_date')}_{r.get('approved')}")
+    # Duplicate claim detection: check both duplicate claim IDs and duplicate event signatures independently
+    dup_ids = Counter(
+        str(r.get("claim_id")).strip().upper()
         for r in records
-        if r.get("claim_id") or (r.get("event_date") and r.get("approved"))
+        if r.get("claim_id")
     )
-    if any(count > 1 for count in keyed.values()):
+    dup_signatures = Counter(
+        (str(r.get("provider") or "").strip().lower(), str(r.get("event_date") or "").strip(), str(r.get("approved") or "").strip())
+        for r in records
+        if (r.get("event_date") and r.get("approved"))
+    )
+    if any(count > 1 for count in dup_ids.values()) or any(count > 1 for count in dup_signatures.values()):
         b.flag("duplicate_claim", _WEIGHTS["duplicate_claim"],
-               "Two claim records share the same event date and approved amount.")
+               "Two claim records share the same event date and approved amount, or duplicate claim ID.")
 
     for claim_id in _as_list(sub.get("claim_ids")):
         if claim_id not in {r["claim_id"] for r in records}:
@@ -423,6 +429,7 @@ def _legacy(
     high_sum_insured: float,
 ) -> dict[str, Any]:
     b = _Builder()
+    assessments: list[dict[str, Any]] = []
     declared = declared_groups(list(features.get("conditions") or []), None)
     declared_text = " ".join(
         str(c).lower()
@@ -455,6 +462,7 @@ def _legacy(
         assessment["material_missing"] = assessment["missing"] if (
             (age and age >= 45) or sum_insured >= 1_000_000
         ) else []
+        assessments.append(assessment)
         _undeclared(b, assessment, "the retrieved documents")
 
     smoker = profile.get("smoker")
@@ -495,7 +503,9 @@ def _legacy(
     if sum_insured >= high_sum_insured and int(features.get("condition_count", 0) or 0) >= 2:
         b.note("high_cover", "High sum insured requested with multiple medical conditions.")
 
-    return b.result()
+    result = b.result()
+    result["condition_assessments"] = assessments
+    return result
 
 
 def assess_fraud(
