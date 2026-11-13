@@ -72,37 +72,29 @@ def parse_bp(value: Any) -> tuple[int, int] | None:
 
 def lab_value(labs: list[dict[str, Any]], key: str) -> float | None:
     """Latest numeric value of a lab by canonical name (hba1c, egfr, ...), converted to standard units."""
-    pattern = re.compile(_LAB_PATTERNS[key], re.IGNORECASE)
+    from app.services.lab_normalizer import normalize_lab_entry
+    pattern = re.compile(_LAB_PATTERNS.get(key, key), re.IGNORECASE)
     found = [
         lab for lab in labs or []
-        if lab.get("value") is not None and pattern.search(str(lab.get("name", "")))
+        if lab.get("value") is not None and (
+            lab.get("canonical_name") == key or pattern.search(str(lab.get("name", "")))
+        )
     ]
     if not found:
         return None
     found.sort(key=lambda lab: lab.get("document_date") or "", reverse=True)
-    raw_val = found[0]["value"]
-    unit = str(found[0].get("unit", "")).strip().lower()
-    
-    val_str = str(raw_val).lstrip("<>=").strip()
-    try:
-        val = float(val_str)
-    except (ValueError, TypeError):
-        return None
+    first = found[0]
 
-    if key == "hba1c":
-        # Convert mmol/mol to %
-        if "mmol/mol" in unit or val > 20.0:
-            val = round((val * 0.09148) + 2.152, 2)
-    elif key in {"fasting_glucose", "glucose"}:
-        # Convert mmol/L to mg/dL
-        if "mmol" in unit or val < 30.0:
-            val = round(val * 18.0182, 1)
-    elif key == "creatinine":
-        # Convert umol/L to mg/dL
-        if "umol" in unit or "µmol" in unit or val > 30.0:
-            val = round(val / 88.4, 2)
+    # If already normalized by lab_normalizer, return its canonical value directly
+    if first.get("canonical_name") == key and first.get("normalized_value") is not None:
+        return float(first["normalized_value"])
 
-    return val
+    norm = normalize_lab_entry(
+        name=key,
+        raw_value=first.get("value") or first.get("raw_value") or "",
+        unit=str(first.get("unit") or ""),
+    )
+    return norm.normalized_value
 
 
 def _entry(

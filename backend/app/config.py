@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     max_upload_mb: int = 20
     llm_calls_per_case: int = 8  # cost guard: LLM calls per case run
     llm_calls_per_minute: int = 20  # cost guard: hosted providers only
+    llm_timeout_seconds: float = 8.0  # max seconds before LLM call times out
     max_material_unknowns: int = 2  # this many material unknowns -> verification review
     doc_medical_age_threshold: int = 45  # medical exam required from this age
     doc_medical_sum_insured_threshold: float = 1_000_000

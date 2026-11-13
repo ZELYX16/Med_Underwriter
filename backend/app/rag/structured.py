@@ -182,7 +182,8 @@ def _lab_rows(doc: dict[str, Any], document_id: str, document_date: str | None) 
                     "section": table.get("section", ""),
                 }
             )
-    return labs
+    from app.services.lab_normalizer import normalize_lab_list
+    return normalize_lab_list(labs)
 
 
 _NEGATIVE_CUE = re.compile(r"\b(no|denies|negative for|without|nil|absent|not (seen|detected|reported))\b", re.IGNORECASE)

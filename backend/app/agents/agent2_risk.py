@@ -1658,7 +1658,24 @@ RECOMMENDATION: {recommendation}{fraud_line}
 """.strip()
 
             llm_started = time.perf_counter()
-            response = self.llm.invoke(prompt)
+            import concurrent.futures
+            timeout_sec = getattr(settings, "llm_timeout_seconds", 8.0)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.llm.invoke, prompt)
+                    response = future.result(timeout=timeout_sec)
+            except concurrent.futures.TimeoutError:
+                logger.warning("LLM reasoning timed out after %s seconds; using fallback reasoning", timeout_sec)
+                self._last_llm_metrics = {
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                    "llm_latency_sec": round(time.perf_counter() - llm_started, 4),
+                    "token_source": "none", "llm_used": False,
+                    "llm_status": "skipped (timeout)",
+                }
+                return self._fallback_reasoning(
+                    risk=risk, pricing=pricing, recommendation=recommendation,
+                    error=f"LLM timed out after {timeout_sec}s",
+                )
             llm_latency = round(time.perf_counter() - llm_started, 4)
 
             usage = self._extract_token_usage(response)
@@ -1709,6 +1726,7 @@ RECOMMENDATION: {recommendation}{fraud_line}
                 features=features,
                 risk=risk,
                 recommendation=recommendation,
+                pricing=pricing,
             ):
                 self._last_llm_metrics["llm_status"] = "rejected (failed consistency check)"
                 return self._fallback_reasoning(
@@ -1759,6 +1777,7 @@ RECOMMENDATION: {recommendation}{fraud_line}
         features: dict[str, Any],
         risk: dict[str, Any],
         recommendation: str,
+        pricing: dict[str, Any] | None = None,
     ) -> bool:
         """
         Validate the generated rationale against deterministic facts.
@@ -1834,6 +1853,23 @@ RECOMMENDATION: {recommendation}{fraud_line}
 
         if not recommendation:
             return False
+
+        # Check decision outcome contradiction
+        rec = str(recommendation or "").lower()
+        if "standard" in rec or "accept" in rec:
+            if re.search(r"\b(declined?|reject(ed)?|refuse(d)?)\b", text):
+                return False
+        elif "decline" in rec or "reject" in rec:
+            if re.search(r"\b(approved?|accepted?|standard terms)\b", text):
+                return False
+
+        # Check loading percentage contradiction
+        if pricing:
+            loading = float(pricing.get("loading_percentage", 0.0) or 0.0)
+            if loading == 0.0 and re.search(r"\b(premium loading|loaded by|\d+%\s*loading)\b", text):
+                return False
+            if loading > 0.0 and re.search(r"\b(no loading|standard rate|without (any )?loading)\b", text):
+                return False
 
         return True
 
