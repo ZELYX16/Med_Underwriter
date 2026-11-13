@@ -145,5 +145,32 @@ def triage(path: Path, filename: str, requested_type: str | None, form: dict[str
         issues.append(f"You added this as a {requested_type.replace('_', ' ')} document, but it looks like a "
                       f"{detected.replace('_', ' ')} document. You can keep it or replace it.")
 
-    return {"status": status, "detected_type": detected, "folder": folder, "scanned": scanned,
-            "issues": issues, "sha256": digest, "timing_sec": round(time.perf_counter() - started, 3)}
+    from app.rag.structured import parse_date, evaluate_document_recency
+    doc_date = None
+    if text:
+        date_match = re.search(
+            r"(?i:(?:document|report|test|specimen|collection|consultation|visit|admission|exam(?:ination)?)\s*date|date of (?:report|collection|specimen|exam))\s*[:\-]?\s*([0-9A-Za-z\-/.]+)",
+            text,
+        )
+        if date_match:
+            doc_date = parse_date(date_match.group(1))
+        if not doc_date:
+            doc_date = parse_date(text)
+
+    submission_date = form.get("submission_date") or time.strftime("%Y-%m-%d")
+    recency = evaluate_document_recency(doc_date, submission_date)
+
+    return {
+        "status": status,
+        "detected_type": detected,
+        "folder": folder,
+        "scanned": scanned,
+        "issues": issues,
+        "sha256": digest,
+        "document_date": recency["document_date"],
+        "recency_days": recency["recency_days"],
+        "recency_status": recency["recency_status"],
+        "recency_label": recency["recency_label"],
+        "is_stale": recency["is_stale"],
+        "timing_sec": round(time.perf_counter() - started, 3),
+    }

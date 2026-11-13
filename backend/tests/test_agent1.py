@@ -40,10 +40,13 @@ KLAUS_PAYLOAD = {
     ],
 }
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Test functions
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_agent1_maria():
     """Maria — healthy young applicant, no conditions. Should complete cleanly."""
     print("\n=== TEST: Maria (Simple case) ===")
@@ -61,6 +64,7 @@ async def test_agent1_maria():
     return result
 
 
+@pytest.mark.asyncio
 async def test_agent1_klaus():
     """Klaus — complex multi-comorbidity case. Should detect risk flags."""
     print("\n=== TEST: Klaus (Complex case) ===")
@@ -86,6 +90,7 @@ async def test_agent1_klaus():
     return result
 
 
+@pytest.mark.asyncio
 async def test_agent1_audit_trail():
     """Verify audit trail is populated correctly."""
     print("\n=== TEST: Audit Trail ===")

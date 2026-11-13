@@ -367,11 +367,15 @@ class RiskAssessmentAgent:
         structured = enrichment_results.get("structured_facts") or {}
         vitals = structured.get("vitals") or {}
 
-        bmi = self._number(
-            applicant_profile.get("bmi")
-            or medical.get("bmi")
-            or vitals.get("bmi")
-        )
+        raw_bmi = applicant_profile.get("bmi") or medical.get("bmi") or vitals.get("bmi")
+        bmi = self._number(raw_bmi) if raw_bmi is not None else 0.0
+        if bmi <= 0:
+            raw_h = applicant_profile.get("height") or applicant_profile.get("height_cm") or vitals.get("height_cm")
+            raw_w = applicant_profile.get("weight") or applicant_profile.get("weight_kg") or vitals.get("weight_kg")
+            height = self._number(raw_h) if raw_h is not None else 0.0
+            weight = self._number(raw_w) if raw_w is not None else 0.0
+            if height > 0 and weight > 0:
+                bmi = round(weight / ((height / 100) ** 2), 1)
 
         # Claim records carry dates, amounts and status; the profile only has ids.
         records = structured.get("claim_records") or []

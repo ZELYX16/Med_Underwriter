@@ -904,7 +904,7 @@ def confidence_gate_node(
     if (
         confidence >= 0.85
         and risk_score < 60
-        and complexity_level == "standard"
+        and complexity_level in {"simple", "standard"}
     ):
         confidence_gate = "high"
     elif (

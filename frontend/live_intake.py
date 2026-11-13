@@ -194,7 +194,7 @@ def _documents_block(
 
     docs = view.get("documents", [])
     needs = view.get("required_documents", [])
-    later = set(form.get("docs_later", []))
+    form.pop("docs_later", None)
 
     template_meta = view.get("meta") or {}
     template_status = template_meta.get("template_documents_status")
@@ -303,28 +303,10 @@ def _documents_block(
                     st.success(
                         "Added: " + ", ".join(d["filename"] for d in have)
                     )
-
-                elif need["id"] in later:
-                    st.caption("You said you will add this later.")
-
                 else:
                     st.caption(
                         "If you have this document, include it in the upload area above."
                     )
-
-                if not need["blocking"]:
-                    will_add_later = st.checkbox(
-                        "I will add this later",
-                        value=need["id"] in later,
-                        key=f"live_later_{ver}_{need['id']}",
-                    )
-
-                    if will_add_later:
-                        later.add(need["id"])
-                    else:
-                        later.discard(need["id"])
-
-    form["docs_later"] = sorted(later)
 
     if docs:
         st.markdown("**Uploaded files**")
@@ -346,6 +328,9 @@ def _documents_block(
             if d.get("index_sec"):
                 timing += f", read {d['index_sec']:.1f}s"
 
+            if d.get("recency_label"):
+                timing += f" • {d['recency_label']}"
+
             cols[2].caption(timing)
 
             if cols[3].button(
@@ -360,6 +345,12 @@ def _documents_block(
                 if updated:
                     st.session_state.live_view = updated
                     st.rerun()
+
+            if d.get("is_stale"):
+                st.warning(
+                    f"⚠️ {d.get('filename')}: Document is outdated ({d.get('recency_days')} days old). "
+                    "Reports older than 6 months may require updated tests."
+                )
 
             for issue in d.get("issues", []):
                 st.warning(issue)
@@ -380,6 +371,8 @@ def _documents_block(
                             )
                         )
 
+                    if d.get("document_date"):
+                        st.caption(f"**Document Date:** {d['document_date']} ({d.get('recency_label', '')})")
                     st.caption(
                         d.get("extraction_summary")
                         or "Evidence extracted from this document."
@@ -433,134 +426,6 @@ def _documents_block(
             st.session_state.live_poll = 0
 
 
-def _clarifications_block(
-    view: dict[str, Any],
-    form: dict[str, Any],
-    ver: int,
-) -> None:
-    """Render only evidence-driven questions still open for this applicant."""
-    questions = view.get("clarifications") or []
-
-    if not questions:
-        st.markdown("### Additional information")
-        st.success(
-            "No additional clarification is currently needed based on the information provided."
-        )
-        return
-
-    st.markdown("### A few details to confirm")
-
-    st.caption(
-        "These questions are generated from your declarations and uploaded records. "
-        "If you are unsure, choose the reviewer option rather than guessing."
-    )
-
-    answers = dict(form.get("clarification_answers") or {})
-    seen_qids = set()
-
-    for index, item in enumerate(questions):
-        qid = item["id"]
-        if qid in seen_qids:
-            continue
-        seen_qids.add(qid)
-        saved = answers.get(qid, item.get("answer", ""))
-
-        with st.container(border=True):
-            st.markdown(
-                f"**{item.get('question', item.get('text', 'Please provide more information.'))}**"
-            )
-
-            st.caption(
-                item.get(
-                    "reason",
-                    "This information may help complete the assessment.",
-                )
-            )
-
-            if item.get("evidence"):
-                with st.expander("Evidence considered", expanded=False):
-                    for source in item["evidence"]:
-                        page = (
-                            f" · page {source.get('page')}"
-                            if source.get("page")
-                            else ""
-                        )
-
-                        st.write(
-                            f"{source.get('filename', 'Document')}{page}: "
-                            f"{source.get('value', '')}"
-                        )
-
-                        if source.get("excerpt"):
-                            st.caption(source["excerpt"])
-
-            input_type = item.get("input_type", "text")
-            key = f"live_clarification_{ver}_{qid}"
-
-            if input_type in {"choice", "confirmation", "yes_no_unsure"}:
-                options = item.get("options") or (
-                    ["Yes", "No", "Not sure"]
-                    if input_type == "yes_no_unsure"
-                    else []
-                )
-
-                if input_type == "yes_no_unsure":
-                    options = [
-                        "Yes",
-                        "No",
-                        "Not sure — reviewer should verify",
-                    ]
-
-                options = ["— Select an answer —"] + options
-
-                if saved and saved not in options:
-                    options.insert(1, saved)
-
-                value = st.selectbox(
-                    "Your answer",
-                    options,
-                    index=options.index(saved) if saved in options else 0,
-                    key=key,
-                )
-
-            else:
-                value = st.text_area(
-                    "Your answer",
-                    value=str(saved or ""),
-                    key=key,
-                    height=75,
-                    placeholder="Enter the details, or leave blank if you do not know.",
-                )
-
-            answers[qid] = value
-
-            if item.get("upload_category"):
-                st.caption("If this information is in a document, you can upload it here instead of typing it again.")
-                _upload_for_requirement(
-                    view, qid, item.get("upload_label") or "Upload supporting document", ver
-                )
-
-            if item.get("needs_human_review"):
-                st.warning(
-                    "This item is marked for underwriter verification. "
-                    "You can update your answer if you learn more."
-                )
-
-    form["clarification_answers"] = answers
-
-    # Keep the familiar form fields populated as well, so existing profile
-    # construction and downstream agents receive the applicant's response.
-    field_map = {
-        "history:hospital_details": "hospital_details",
-        "history:claims_details": "claims_details",
-        "history:previous_policy": "previous_insurance_details",
-    }
-
-    for qid, field in field_map.items():
-        if answers.get(qid):
-            form[field] = answers[qid]
-
-
 def _application_tab(
     view: dict[str, Any],
     catalog: dict[str, Any],
@@ -609,6 +474,43 @@ def _application_tab(
         else 0,
         key=f"live_sex_{ver}",
     )
+
+    c_h, c_w, c_bmi = st.columns(3)
+
+    default_height = float(form.get("height") or form.get("height_cm") or 170.0)
+    default_weight = float(form.get("weight") or form.get("weight_kg") or 70.0)
+
+    form["height"] = c_h.number_input(
+        "Height (cm)",
+        min_value=50.0,
+        max_value=250.0,
+        value=default_height,
+        step=1.0,
+        key=f"live_height_{ver}",
+        help="Applicant height in centimeters",
+    )
+    form["height_cm"] = form["height"]
+
+    form["weight"] = c_w.number_input(
+        "Weight (kg)",
+        min_value=20.0,
+        max_value=250.0,
+        value=default_weight,
+        step=0.5,
+        key=f"live_weight_{ver}",
+        help="Applicant weight in kilograms",
+    )
+    form["weight_kg"] = form["weight"]
+
+    h = float(form["height"] or 0)
+    w = float(form["weight"] or 0)
+    if h > 0 and w > 0:
+        bmi_val = round(w / ((h / 100) ** 2), 1)
+        form["bmi"] = bmi_val
+        c_bmi.metric("Calculated BMI", f"{bmi_val} kg/m²")
+    else:
+        form["bmi"] = None
+        c_bmi.metric("Calculated BMI", "—")
 
     c4, c5, c6 = st.columns(3)
 
@@ -823,7 +725,6 @@ def _application_tab(
     _save(form)
     view = st.session_state.live_view
     _documents_block(view, form, ver)
-    _clarifications_block(view, form, ver)
 
     form["remarks"] = st.text_area(
         "Anything else you would like us to know? (optional)",

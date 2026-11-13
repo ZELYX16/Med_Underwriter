@@ -84,13 +84,93 @@ def parse_amount(value: Any) -> float | None:
 
 def parse_date(value: Any) -> str | None:
     """First date in the text as ISO ('09-May-2023' -> '2023-05-09')."""
-    match = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{4}", str(value or ""))
-    if not match:
+    text = str(value or "").strip()
+    if not text:
         return None
+    match = re.search(r"\b\d{1,2}-[A-Za-z]{3}-\d{4}\b", text)
+    if match:
+        try:
+            return datetime.strptime(match.group(), "%d-%b-%Y").date().isoformat()
+        except ValueError:
+            pass
+    iso_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    if iso_match:
+        try:
+            return datetime.strptime(iso_match.group(), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+    slash_match = re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", text)
+    if slash_match:
+        s = slash_match.group().replace("-", "/")
+        try:
+            return datetime.strptime(s, "%d/%m/%Y").date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def evaluate_document_recency(doc_date_str: str | None, submission_date_str: str | None = None) -> dict[str, Any]:
+    """
+    Evaluate how recent or up to date a document or lab result is relative to the submission date.
+    Returns status: 'recent' (<=90d), 'acceptable' (91-180d), 'stale' (>180d), or 'date_unknown'.
+    """
+    if not submission_date_str:
+        sub_date = date.today()
+    else:
+        try:
+            sub_date = date.fromisoformat(str(submission_date_str)[:10])
+        except Exception:
+            sub_date = date.today()
+
+    parsed_doc = parse_date(doc_date_str) if doc_date_str else None
+    if not parsed_doc:
+        return {
+            "document_date": None,
+            "submission_date": sub_date.isoformat(),
+            "recency_days": None,
+            "recency_status": "date_unknown",
+            "recency_label": "Date not specified in document",
+            "is_stale": False,
+        }
+
     try:
-        return datetime.strptime(match.group(), "%d-%b-%Y").date().isoformat()
-    except ValueError:
-        return None
+        doc_date = date.fromisoformat(parsed_doc)
+    except Exception:
+        return {
+            "document_date": str(doc_date_str),
+            "submission_date": sub_date.isoformat(),
+            "recency_days": None,
+            "recency_status": "date_unknown",
+            "recency_label": f"Unrecognized date: {doc_date_str}",
+            "is_stale": False,
+        }
+
+    diff_days = (sub_date - doc_date).days
+    if diff_days < 0:
+        status = "future_date"
+        label = f"Dated in future ({abs(diff_days)} days ahead)"
+        is_stale = False
+    elif diff_days <= 90:
+        status = "recent"
+        label = f"Up to date ({diff_days} days old, <= 3 months)"
+        is_stale = False
+    elif diff_days <= 180:
+        status = "acceptable"
+        label = f"Acceptable ({diff_days} days old, <= 6 months)"
+        is_stale = False
+    else:
+        status = "stale"
+        label = f"Outdated ({diff_days} days old, > 6 months)"
+        is_stale = True
+
+    return {
+        "document_date": doc_date.isoformat(),
+        "submission_date": sub_date.isoformat(),
+        "recency_days": diff_days,
+        "recency_status": status,
+        "recency_label": label,
+        "is_stale": is_stale,
+    }
 
 
 def parse_period(value: Any) -> tuple[str | None, str | None]:
@@ -1227,6 +1307,9 @@ def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = 
             who = facts.get("match_name") or None
         else:
             who = facts.get("applicant_name") or facts.get("name")
+        sub_date = (reference or {}).get("submission_date") or (submission or {}).get("submitted_date") or (submission or {}).get("submission_date") or date.today().isoformat()
+        entry_doc_date = facts.get("document_date") or facts.get("submitted_date")
+        recency = evaluate_document_recency(entry_doc_date, sub_date)
         entry = {
             "document_id": doc["doc_id"],
             "doc_type": kind,
@@ -1235,8 +1318,12 @@ def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = 
             "applicant_name": who,
             "dob": facts.get("dob"),
             "applicant_id": facts.get("applicant_id"),
-            "document_date": facts.get("document_date") or facts.get("submitted_date"),
+            "document_date": recency["document_date"],
             "role_note": facts.get("role_note"),
+            "recency_days": recency["recency_days"],
+            "recency_status": recency["recency_status"],
+            "recency_label": recency["recency_label"],
+            "is_stale": recency["is_stale"],
         }
         problems = identity_problems(entry, reference) if kind != "underwriting" else []
         entry["identity_problems"] = problems
@@ -1300,7 +1387,21 @@ def build_applicant_facts(paths: list[Path], reference: dict[str, Any] | None = 
         "vitals": vitals,
         "smoking": smoking,
         "alcohol": alcohol,
-        "labs": [lab for m in medical for lab in m.get("labs", [])],
+        "labs": [
+            {
+                **lab,
+                **evaluate_document_recency(lab.get("document_date"), (reference or {}).get("submission_date") or date.today().isoformat())
+            }
+            for m in medical for lab in m.get("labs", [])
+        ],
+        "stale_documents": [d for d in documents if d.get("is_stale")],
+        "document_recency": {
+            "submission_date": (reference or {}).get("submission_date") or date.today().isoformat(),
+            "total_documents": len(documents),
+            "stale_count": sum(1 for d in documents if d.get("is_stale")),
+            "recent_count": sum(1 for d in documents if d.get("recency_status") == "recent"),
+            "acceptable_count": sum(1 for d in documents if d.get("recency_status") == "acceptable"),
+        },
         "negatives": [
             {"text": t, "document_id": m["document_id"]}
             for m in medical for t in m.get("negatives", [])

@@ -698,12 +698,18 @@ class SubmissionIntelligenceAgent:
             queries["underwriting"],
         )
 
+        sub_date = submission.get("submission_date") or applicant_profile.get("submission_date") or utc_now()[:10]
+        ref = {
+            "name": applicant_profile.get("name"),
+            "dob": applicant_profile.get("date_of_birth"),
+            "submission_date": sub_date,
+        } if applicant_profile.get("source") == "live_session" else {
+            "submission_date": sub_date,
+        }
         structured_task = asyncio.to_thread(
             self._load_structured_facts,
             applicant_id,
-            {"name": applicant_profile.get("name"), "dob": applicant_profile.get("date_of_birth")}
-            if applicant_profile.get("source") == "live_session"
-            else None,
+            ref,
         )
 
         (
@@ -1100,3 +1106,40 @@ class SubmissionIntelligenceAgent:
 
 
 submission_agent = SubmissionIntelligenceAgent()
+
+async def run_agent1_standalone(payload: dict[str, Any]) -> dict[str, Any]:
+    applicant = payload.get("applicant", {})
+    profile = {
+        "applicant_id": applicant.get("applicant_id", "APP-TEST"),
+        "name": applicant.get("name"),
+        "age": applicant.get("age"),
+        "gender": applicant.get("gender"),
+        "region": applicant.get("region"),
+        "medical_conditions": [{"condition": c} for c in payload.get("medical", {}).get("icd10_codes", [])],
+        "medications": payload.get("medical", {}).get("medications", []),
+        "claims": [{"count": payload.get("claims_history", {}).get("claims_count_3yr", 0)}],
+        "existing_policies": payload.get("existing_policies", []),
+    }
+    res = await submission_agent.run(applicant_profile=profile, submission=payload)
+    enrichment = res.get("agent1_enrichment", {})
+    icd = payload.get("medical", {}).get("icd10_codes", [])
+    risk_flags = []
+    if len(icd) >= 2:
+        risk_flags.append("comorbidity_multiple")
+    elif len(icd) == 1:
+        risk_flags.append("comorbidity_present")
+    return {
+        **res,
+        "processing_status": "agent1_complete",
+        "enrichment_results": {
+            **enrichment,
+            "claims_history": {"claims_3yr": payload.get("claims_history", {}).get("claims_count_3yr", 0)},
+            "benchmarks": {"combined_loading_pct": 0},
+        },
+        "applicant_profile": {
+            **profile,
+            "icd10_codes": icd,
+            "risk_flags": risk_flags,
+        },
+        "audit_trail": [{"step": "agent1_enrichment"}],
+    }

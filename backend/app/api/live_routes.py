@@ -74,14 +74,12 @@ def _customer(session: dict[str, Any]) -> dict[str, Any]:
 
 def _view(session: dict[str, Any]) -> dict[str, Any]:
     form = session["form"]
-    from app.services.clarification_engine import build_clarifications
-    clarifications = build_clarifications(form, session["documents"])
-    items = intake.open_items(form, session["documents"], clarifications)
+    items = intake.open_items(form, session["documents"])
     return {
         "token": session["token"], "status": session["status"], "case_id": session["case_id"],
         "form": form, "documents": session["documents"], "meta": session["meta"],
         "required_documents": intake.required_documents(form),
-        "open_items": items, "clarifications": clarifications,
+        "open_items": items, "clarifications": [],
         "can_submit": not [i for i in items if i["blocking"]],
         "customer": _customer(session),
     }
@@ -143,6 +141,11 @@ async def _ingest(token: str, filename: str, data: bytes, requirement: str | Non
         "status": result["status"] if result["status"] == "rejected" else "indexing",
         "triage": result["status"], "detected_type": result["detected_type"], "folder": result["folder"],
         "scanned": result["scanned"], "issues": result["issues"], "sha256": result["sha256"],
+        "document_date": result.get("document_date"),
+        "recency_days": result.get("recency_days"),
+        "recency_status": result.get("recency_status"),
+        "recency_label": result.get("recency_label"),
+        "is_stale": result.get("is_stale", False),
         "triage_sec": result["timing_sec"], "added_at": time.time(),
     }
     get_store().mutate_documents(token, lambda docs: docs + [entry])

@@ -42,7 +42,7 @@ CONDITIONS: list[dict[str, Any]] = [
     _c("heart", "Heart problem (heart attack, stent, bypass, angina)", "cardiac", "Heart disease",
        [{"id": "event", "ask": "Did you have a heart attack, a stent or a bypass? Which, and which year?", "type": "text"}],
        ["Hospital discharge summary or cardiology report"]),
-    _c("cholesterol", "High cholesterol", "lipids", "Dyslipidaemia", [], []),
+    _c("cholesterol", "High cholesterol", "lipids", "Dyslipidaemia", [{"id": "reading", "ask": "Your latest cholesterol reading, if known", "type": "text"}], ["Lipid profile report"]),
     _c("thyroid", "Thyroid problem", "thyroid", "Thyroid disorder", [], []),
     _c("asthma", "Asthma or breathing problem", "respiratory", "Chronic respiratory disease", [], []),
     _c("kidney", "Kidney problem (stones or kidney disease)", "urinary_calculi", "Kidney / urinary condition",
@@ -144,6 +144,8 @@ def required_documents(form: dict[str, Any]) -> list[dict[str, Any]]:
         reasons.append(f"you are {age}")
     if cover >= MEDICAL_EXAM_SUM:
         reasons.append("the cover amount is high")
+    if conditions:
+        reasons.append("you declared a health condition")
     if reasons:
         needs.append({"id": "medical_exam", "document": "Recent medical check-up report",
                       "why": "We ask for this because " + " and ".join(reasons) + ".",
@@ -180,7 +182,6 @@ def open_items(form: dict[str, Any], documents: list[dict[str, Any]],
     if not form.get("consent"):
         items.append({"id": "consent", "kind": "confirmation", "blocking": True,
                       "text": "Please confirm that the details are true and that we may use them to assess your application"})
-    later = set(form.get("docs_later") or [])
     live = [d for d in documents if d.get("status") not in {"rejected", "failed", "deleting", "delete_failed"}]
     attached = {d.get("requirement") for d in live}
     detected_folders = {d.get("folder") for d in live}
@@ -221,26 +222,9 @@ def open_items(form: dict[str, Any], documents: list[dict[str, Any]],
         )
         if need["id"] in attached or inferred_match or (need["id"] == "medical_exam" and has_exam):
             continue
-        if need["id"] in later:
-            items.append({"id": need["id"], "kind": "document", "blocking": False, "later": True,
-                          "text": f"{need['document']} (you said you will add this later)"})
-        else:
-            items.append({"id": need["id"], "kind": "document", "blocking": need["blocking"],
-                          "text": f"{need['document']}. {need['why']}"})
+        items.append({"id": need["id"], "kind": "document", "blocking": need["blocking"],
+                      "text": f"{need['document']}. {need['why']}"})
 
-    # Evidence-aware questions are generated only for material gaps,
-    # uncertain extraction and conflicting source records.
-    if clarifications is None:
-        from app.services.clarification_engine import build_clarifications
-        clarifications = build_clarifications(form, documents)
-    for question in clarifications:
-        if question.get("answered") and not question.get("needs_human_review"):
-            continue
-        items.append({
-            **question,
-            "kind": "clarification",
-            "text": question.get("question", "Please provide more information."),
-        })
     return items
 
 
@@ -257,8 +241,26 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
             hospitals.append({"details": a["hospital"].strip(), "reason": c.get("label", "")})
     if str(form.get("hospital_details") or "").strip():
         hospitals.append({"details": form["hospital_details"].strip(), "reason": "Declared hospital stay"})
-    height, weight = form.get("height_cm"), form.get("weight_kg")
-    bmi = round(weight / ((height / 100) ** 2), 1) if height and weight else form.get("bmi")
+    raw_h = form.get("height") if form.get("height") is not None else form.get("height_cm")
+    raw_w = form.get("weight") if form.get("weight") is not None else form.get("weight_kg")
+    try:
+        height = float(raw_h) if raw_h is not None else None
+    except (ValueError, TypeError):
+        height = None
+    try:
+        weight = float(raw_w) if raw_w is not None else None
+    except (ValueError, TypeError):
+        weight = None
+
+    if height and weight and height > 0:
+        bmi = round(weight / ((height / 100) ** 2), 1)
+    else:
+        raw_bmi = form.get("bmi")
+        try:
+            bmi = float(raw_bmi) if raw_bmi is not None else None
+        except (ValueError, TypeError):
+            bmi = None
+
     alcohol_value = str(form.get("alcohol_consumption") or "").strip().lower()
     alcohol_normalized = {
         "never": "none",
@@ -266,13 +268,8 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "regularly": "regular",
         "prefer not to say": "not_disclosed",
     }.get(alcohol_value, alcohol_value or None)
-    clarification_answers = form.get("clarification_answers", {}) or {}
-    clarification_review_required = any(
-        ("not sure" in str(value).strip().lower()
-         or "reviewer" in str(value).strip().lower()
-         or str(value).strip().lower() in {"not_sure", "unsure"})
-        for value in clarification_answers.values()
-    ) if isinstance(clarification_answers, dict) else False
+    clarification_answers = {}
+    clarification_review_required = False
     profile = {
         "applicant_id": applicant_id,
         "name": form.get("name"),
@@ -288,6 +285,10 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "alcohol_consumption": form.get("alcohol_consumption"),
         "alcohol_use": alcohol_normalized,
         "family_members": form.get("family_members", []) or [],
+        "height": height,
+        "height_cm": height,
+        "weight": weight,
+        "weight_kg": weight,
         "bmi": bmi,
         "source": "live_session",
         "medical_conditions": [
@@ -336,6 +337,7 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "term_years": int(form.get("term_years") or 1),
         "family_members": form.get("family_members", []) or [],
         "previous_insurance_details": form.get("previous_insurance_details") or "",
+        "submission_date": form.get("submission_date") or date.today().isoformat(),
         "jurisdiction": "India",
         "insurer": "DEMO_INSURER",
         "consent": bool(form.get("consent")),

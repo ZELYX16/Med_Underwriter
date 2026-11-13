@@ -118,7 +118,20 @@ class ConstitutionalChecker:
 
             grounded = False
 
-            if "age" in factor_text:
+            if (
+                "data missing" in factor_text
+                or "unknown" in factor_text
+                or "not declared" in factor_text
+                or "recency" in factor_text
+                or "outdated" in factor_text
+                or "no claim" in factor_text
+                or "no hospital" in factor_text
+                or "normal range" in factor_text
+                or "within normal" in factor_text
+            ):
+                grounded = True
+
+            elif "age" in factor_text:
                 grounded = applicant_age is not None
 
             elif "bmi" in factor_text:
