@@ -1,7 +1,7 @@
 # MedUnderwriter Frontend Modernization: Enterprise Design System, Step Inspectors, Document Viewer & Workflow Visualizer
 
 *   **Author:** B_Karthikeyan
-*   **Status:** Approved Draft
+*   **Status:** Approved Draft (Post-Readiness Audit)
 *   **Date:** 2026-11-16
 *   **Target Branch:** `v5.2`
 
@@ -42,7 +42,7 @@ The existing Streamlit user interface (`frontend/app.py`, ~5,300 lines of code) 
 
 *   **Goal 1 (Enterprise Design System):** Introduce a cohesive, modern visual theme in `frontend/styles.py` featuring tokenized elevation surfaces (`--color-surface-elevated`, `--shadow-card`), professional typographic scaling (Inter and Roboto Mono), and accessible WCAG 2.1 AA status badges for review tiers and decisions.
 *   **Goal 2 (Step-by-Step Verification Modals):** Provide dedicated `[🔎 Verify Step]` buttons across all seven pipeline stages (Intake, Agent 1, Router, Agent 2, Confidence Gate, Agent 3, Review Gate) opening `@st.dialog` modal inspectors with structured 3-tab layouts (Executive Summary, Formula & Calculation Trace, Raw State Snapshot).
-*   **Goal 3 (In-App Document Viewer):** Allow underwriters to view all uploaded files associated with a case directly within the Intake stage and Evidence workspace via an embedded viewer modal (`@st.dialog`) with PDF and text rendering.
+*   **Goal 3 (In-App Document Viewer):** Allow underwriters to view all uploaded files associated with a case directly within the Intake stage (embedded tab) and Evidence workspace (standalone modal) via PDF and text rendering.
 *   **Goal 4 (Workflow Path Visualizer):** Render an interactive Mermaid execution flowchart generated dynamically from `case["workflow_trace"]`, explicitly highlighting traversed nodes, bypassed branches, execution durations, and Boolean branch conditions.
 *   **Goal 5 (Execution Boundary Isolation):** Encapsulate all step verification modals, document viewers, and graph visualizers within `@st.fragment` to prevent top-level script reruns and ensure responsive interaction.
 
@@ -74,10 +74,10 @@ The existing Streamlit user interface (`frontend/app.py`, ~5,300 lines of code) 
     - Actuarial extra mortality percentage ($EMP = 179.75\%$) and resulting premium loading ($+79.75\%$).
     - The underwriter confirms the mathematical integrity of the loading before issuing approval.
 
-### CUJ 2: Underwriter Inspects Uploaded Medical Document (Intake)
+### CUJ 2: Underwriter Inspects Uploaded Medical Document (Intake & Evidence)
 *   **Given**: An applicant submitted a proposal declaring hypertension and uploaded a hospital discharge summary.
-*   **When**: In the Intake stage inspection card, the underwriter reviews the "Uploaded Files" table and clicks `[📄 View Document]` on `discharge_summary.pdf`.
-*   **Then**: A document viewer modal opens displaying the PDF document alongside extracted clinical metadata (document date, detected type, and recency status) so the underwriter can confirm that the dates and hospital diagnoses match the application.
+*   **When**: In the Intake stage inspector card, the underwriter opens the "Evidence & Documents" tab (or clicks `[📄 View Document]` in the top-level Evidence workspace).
+*   **Then**: The in-app document viewer displays the PDF document alongside extracted clinical metadata (document date, detected type, recency status, SHA-256 fingerprint) without nesting dialogs or breaking state context.
 
 ### CUJ 3: Underwriter Explains Workflow Path & Branch Routing
 *   **Given**: A regulatory auditor or senior underwriter needs to understand why an application was routed to Tier 2 Human Review instead of being auto-approved (Tier 0).
@@ -96,7 +96,7 @@ flowchart TD
         NAV["Workspace Navigation (Overview | Evidence | Assessment | Decision | Review & Audit)"]
     end
 
-    subgraph DESIGN_SYSTEM ["Design System (styles.py & design_system.py)"]
+    subgraph DESIGN_SYSTEM ["Design System (styles.py & components/design_system.py)"]
         CSS_TOKENS["CSS Variables & Typography (Inter / Roboto Mono)"]
         ELEV_CARD["Elevated Card Containers (Surface 1 & Surface 2)"]
         STATUS_BADGES["Semantic Badges (Tier 0..3, Approved, Review, Declined)"]
@@ -104,7 +104,7 @@ flowchart TD
 
     subgraph INSPECTION_LAYER ["Step Inspectors (@st.dialog + @st.fragment)"]
         direction TB
-        INS_INTAKE["01. Intake & File Manifest Inspector"]
+        INS_INTAKE["01. Intake & File Manifest Inspector (with embedded Doc Tab)"]
         INS_AG1["02. Agent 1 Submission Intelligence Inspector"]
         INS_ROUTER["03. Complexity Router Inspector"]
         INS_AG2["04. Agent 2 Risk & Actuarial Rating Inspector"]
@@ -113,11 +113,11 @@ flowchart TD
         INS_GATE["07. Review Gate & Tier Routing Inspector"]
     end
 
-    subgraph DOC_VIEWER ["In-App Document Viewer (@st.dialog)"]
-        DOC_MODAL["Document Modal (PDF Iframe / PyMuPDF Page Images / OCR Text)"]
+    subgraph DOC_VIEWER ["In-App Document Viewer (components/document_viewer.py)"]
+        DOC_MODAL["Document Viewer (Standalone @st.dialog from Evidence / Embedded in Intake Tab)"]
     end
 
-    subgraph GRAPH_VIS ["Execution Path Visualizer (graph_visualizer.py)"]
+    subgraph GRAPH_VIS ["Execution Path Visualizer (components/graph_visualizer.py)"]
         MERMAID_GEN["Dynamic Mermaid Generator (workflow_trace Parser)"]
         COND_ANNOT["Edge Predicate & Latency Annotator"]
         STEP_PILLS["Traversed Step Jump Pills [🔎 Verify Step]"]
@@ -125,14 +125,15 @@ flowchart TD
 
     subgraph BACKEND_API ["FastAPI Backend (backend/app/api)"]
         CASE_STATE["GET /api/case/{id} (State Snapshot)"]
-        DOC_STREAM["GET /api/case/{id}/documents/{doc_id}/content (FileResponse)"]
+        DOC_STREAM["GET /api/case/{id}/documents/{doc_id}/content (Secured FileResponse)"]
         CHECKPOINTS["LangGraph Checkpoint Store"]
     end
 
     UI_WORKSPACE --> DESIGN_SYSTEM
     UI_WORKSPACE -->|Click [🔎 Verify Step]| INSPECTION_LAYER
     UI_WORKSPACE -->|Click [🗺️ View Execution Path]| GRAPH_VIS
-    INS_INTAKE -->|Click [📄 View Doc]| DOC_VIEWER
+    UI_WORKSPACE -->|Click [📄 View Doc] on Evidence Tab| DOC_VIEWER
+    INS_INTAKE -->|Embedded Tab| DOC_VIEWER
 
     INSPECTION_LAYER -.->|State Slices| CASE_STATE
     DOC_VIEWER -.->|Stream PDF Bytes| DOC_STREAM
@@ -162,16 +163,19 @@ To prevent bloating `frontend/app.py`, inspection logic is partitioned into dedi
 2. `intake_inspector.py`:
    - Tab 1: Profile attributes (age, sex, BMI), declarations, and uploaded file manifest.
    - Tab 2: KYC check results, validation rules, and document type classifications.
-   - Tab 3: Raw `applicant_profile` and `submission` JSON.
-   - Includes embedded `[📄 View Document]` buttons for each uploaded file.
+   - Tab 3: Embedded Document Viewer (renders selected document directly inside the tab, avoiding nested dialog crashes).
+   - Tab 4: Raw `applicant_profile` and `submission` JSON.
+   - State Slicing Keys: `case.get("applicant_profile", {})`, `case.get("submission", {})`.
 3. `agent1_inspector.py`:
    - Tab 1: Extracted tables summary, total facts, evidence completeness score.
    - Tab 2: PyMuPDF layout tables, lab analyte normalized values against reference ranges, recency evaluation (recent/acceptable/stale), and confirmed vs. unconfirmed coverage gaps.
    - Tab 3: Raw `agent1_enrichment` and `structured_facts` JSON.
+   - State Slicing Keys: `case.get("agent1_enrichment", {})`, `case.get("structured_facts", [])`.
 4. `router_inspector.py`:
    - Tab 1: Selected complexity level (`standard` vs `complex`) and routing strategy.
    - Tab 2: Multi-morbidity score breakdown, high sum insured check, and rule triggers.
    - Tab 3: Raw `routing_result` JSON.
+   - State Slicing Keys: `case.get("routing_result", {})`.
 5. `agent2_inspector.py`:
    - Tab 1: Actuarial debits, Copula synergy multiplier ($\Phi$), extra mortality percentage ($EMP$), premium loading %, and calculated baseline premium ($P_{\text{base}}$).
    - Tab 2:
@@ -180,18 +184,22 @@ To prevent bloating `frontend/app.py`, inspection logic is partitioned into dedi
      - *Actuarial Mortality Table:* Biological age baseline mortality ($q_x$) from IALM 2012–14 Ultimate.
      - *PED Waiting Periods:* Ailment clauses with 24/36 month caps and permanent exclusion tags.
    - Tab 3: Raw `risk_assessment`, `copula_synergy_details`, `medication_records`, and `pricing_result` JSON.
+   - State Slicing Keys: `case.get("risk_assessment", {})`, `case.get("copula_synergy_details", {})`, `case.get("medication_records", [])`, `case.get("ped_waiting_periods", [])`.
 6. `confidence_gate_inspector.py`:
    - Tab 1: Composite confidence score, gate verdict (`pass` vs `reflection_required`).
    - Tab 2: Bayesian confidence layer breakdown, margin to threshold (0.70), and assigned reflection depth.
    - Tab 3: Raw confidence state snapshot.
+   - State Slicing Keys: `case.get("confidence_gate", {})`, `case.get("confidence_score")`.
 7. `agent3_inspector.py`:
    - Tab 1: Multi-Agent Reflection verdict (`pass`, `concern`, `rescore`), consensus status.
    - Tab 2: Individual persona critique transcripts (Chief Medical Officer, Senior Actuary, Regulatory Compliance Officer), constitutional evaluations, and rescore directives.
    - Tab 3: Raw `reflection_findings` and `agent3_metrics` JSON.
+   - State Slicing Keys: `case.get("reflection_findings", [])`, `case.get("agent3_metrics", {})`, `case.get("reflection_round", 0)`.
 8. `review_gate_inspector.py`:
    - Tab 1: Assigned review tier (`Tier 0` to `Tier 3`), human review requirement boolean.
    - Tab 2: Rule evaluation audit: Medical risk threshold (80.0), overall risk threshold (70.0), fraud discrepancy threshold (50.0), security quarantine checks, and mandatory reason list.
    - Tab 3: Raw review gate decision package JSON.
+   - State Slicing Keys: `case.get("review_tier")`, `case.get("final_status")`, `case.get("decision_basis", {})`.
 
 ### 3. Backend Document Streaming Endpoint & Frontend Document Viewer
 
@@ -199,17 +207,24 @@ To prevent bloating `frontend/app.py`, inspection logic is partitioned into dedi
   ```python
   @router.get("/case/{case_id}/documents/{document_id}/content")
   async def get_case_document_content(case_id: str, document_id: str):
-      doc = state_store.get_case_document(case_id, document_id)
-      if not doc or not doc.get("file_path"):
-          raise HTTPException(status_code=404, detail="Document content not found.")
-      file_path = Path(doc["file_path"])
-      if not file_path.exists():
-          raise HTTPException(status_code=404, detail="Physical document file missing on disk.")
+      # Single-argument lookup + explicit case ID matching to prevent IDOR
+      doc = state_store.get_case_document(document_id)
+      if not doc or str(doc.get("case_id")) != case_id or not doc.get("file_path"):
+          raise HTTPException(status_code=404, detail="Document not found for this application.")
+      
+      file_path = Path(doc["file_path"]).resolve()
+      storage_root = (settings.synthetic_data_directory / "uploads").resolve()
+      
+      # Canonical boundary check to prevent directory traversal attacks
+      if not file_path.is_relative_to(storage_root) or not file_path.exists():
+          raise HTTPException(status_code=404, detail="Physical document file missing or inaccessible.")
+          
       media_type = "application/pdf" if file_path.suffix.lower() == ".pdf" else "application/octet-stream"
       return FileResponse(path=file_path, media_type=media_type, filename=file_path.name)
   ```
 - **Streamlit In-App Viewer Modal (`frontend/components/document_viewer.py`):**
-  - Defines `@st.dialog("Document Viewer - {filename}", width="large")`.
+  - Defines `@st.dialog("Document Viewer - {filename}", width="large")` for standalone invocation from the Evidence workspace.
+  - Also exports `render_document_preview_content(doc_bytes, doc_meta)` for embedded inclusion inside tabs (e.g., `intake_inspector`).
   - For PDF documents: Renders an embedded `<iframe>` with base64 encoded PDF bytes, or page-by-page visualizer via PyMuPDF image rendering if iframes are restricted.
   - Side pane shows extracted document date, detected document type, document recency status, and SHA-256 fingerprint.
 
@@ -217,12 +232,16 @@ To prevent bloating `frontend/app.py`, inspection logic is partitioned into dedi
 
 - **Dynamic Mermaid Generator:**
   - Reads `case.get("workflow_trace", [])` and `case.get("audit_trail", [])`.
-  - Builds a topology graph of the LangGraph execution.
-  - Determines node state:
-    - `traversed`: Node executed and recorded in `workflow_trace`.
-    - `bypassed`: Alternative conditional branch never executed (e.g. `fast_finalize` bypassed when `confidence < 0.70`).
-    - `active`: Current terminal state (e.g., `human_review` awaiting underwriter action).
-  - Annotates edges with evaluated Boolean predicates (e.g., `Tier 2 Escalation (Risk 74 >= 70)`).
+  - Builds a static 7-stage topology graph with dynamic CSS class assignments (`traversed`, `bypassed`, `gate`, `active`):
+    - Display node `N_INTAKE`: Mapped from `"intake"` / `"applicant_profile"`
+    - Display node `N_AG1`: Mapped from `"agent1_submission"`
+    - Display node `N_ROUTER`: Mapped from `"complexity_router"`
+    - Display node `N_AG2`: Mapped from `"agent2_risk"`
+    - Display node `N_CONF`: Mapped from `"confidence_gate_node"`
+    - Display node `N_AG3`: Mapped from `"agent3_reflection"`
+    - Display node `N_DECISION`: Mapped from `"finalize"` or `"human_review"`
+  - **Reflection Cycle Collapsing:** When Agent 3 triggers a rescore loop (`reflection_requires_rescore == True`), repeated passes are displayed with a loopback arrow annotated with `Rescore (Round N)` rather than duplicating node IDs in the Mermaid graph.
+  - Annotates edges with sanitized Boolean predicates (e.g., `Tier 2 Escalation (Risk 74.2 &gt;= 70.0)`).
   - Below the graph, renders a responsive pill bar allowing the underwriter to click `[🔎 Inspect Intake]`, `[🔎 Inspect Agent 1]`, ..., `[🔎 Inspect Review Gate]` to trigger the respective inspector modal directly.
 
 ### 5. Execution Boundary Isolation (`@st.fragment`)
@@ -255,50 +274,65 @@ To prevent bloating `frontend/app.py`, inspection logic is partitioned into dedi
 
 ## Detailed Implementation Plan
 
-The implementation is structured into 5 sequential phases across 18 enumerated target files.
+The implementation is structured into 5 sequential phases across 20 enumerated target files.
 
 ### Phase 1: Backend Document Streaming Endpoint
 *   **Target File 1: `backend/app/api/routes.py`**
-    *   *Rationale:* Implement `GET /case/{case_id}/documents/{document_id}/content` returning `FileResponse` with media type `"application/pdf"` or `"application/octet-stream"`. Validates that the document belongs to the case, resolves the physical file path via `state_store.get_case_document()`, and verifies file existence to prevent arbitrary directory traversal.
+    *   *Rationale:* Implement `GET /case/{case_id}/documents/{document_id}/content` returning `FileResponse` with media type `"application/pdf"` or `"application/octet-stream"`. Validates that `doc = state_store.get_case_document(document_id)` matches `str(doc.get("case_id")) == case_id`, resolves canonical paths, and verifies `file_path.is_relative_to(storage_root)` to prevent arbitrary directory traversal.
 *   **Target File 2: `frontend/api_client.py`**
-    *   *Rationale:* Add `get_case_document_content(case_id, document_id) -> bytes` and helper `get_document_content_url(case_id, document_id) -> str` to enable the frontend to stream document bytes.
+    *   *Rationale:* Add raw byte streaming method `get_case_document_content(case_id, document_id) -> bytes` using direct `requests.get()` returning `response.content` (avoiding `response.text` UTF-8 decoding exceptions) and helper `get_document_content_url(case_id, document_id) -> str`.
 *   **Target File 3: `backend/tests/test_document_content_api.py`**
-    *   *Rationale:* Write unit tests verifying successful document content streaming, 404 for missing documents, and security validation for invalid document IDs.
+    *   *Rationale:* Write unit tests verifying:
+        - `test_document_content_streaming_success`: Successful PDF content delivery with correct headers.
+        - `test_document_content_idor_cross_case_denied`: 404 response when querying document of Case B under Case A.
+        - `test_document_content_traversal_blocked`: 404/403 response when document path attempts traversal (`../../`).
+        - `test_document_content_missing_404`: 404 response when document ID does not exist.
 
-### Phase 2: Design System Tokens & Modern UI Components
+### Phase 2: Design System Tokens & Component Package Migration
 *   **Target File 4: `frontend/styles.py`**
     *   *Rationale:* Add CSS variables for 3-surface elevation (`--color-surface-elevated`, `--shadow-card`, `--shadow-elevated`), font families (Inter and Roboto Mono), and accessible WCAG 2.1 AA status badge styles for review tiers (`Tier 0` to `Tier 3`).
-*   **Target File 5: `frontend/components/design_system.py`**
+*   **Target File 5: `frontend/components/legacy_components.py` & `frontend/components/__init__.py`**
+    *   *Rationale:* Move existing monolithic `frontend/components.py` into `frontend/components/legacy_components.py` and re-export all symbols in `frontend/components/__init__.py` (`from .legacy_components import *`). This eliminates package namespace shadowing and guarantees 100% backward compatibility for all existing imports in `frontend/app.py`.
+*   **Target File 6: `frontend/components/design_system.py`**
     *   *Rationale:* Create reusable UI primitives: `status_badge(text, level)`, `elevated_card()`, `formula_callout()`, and `metric_surface()`.
 
-### Phase 3: In-App Document Viewer Component
-*   **Target File 6: `frontend/components/document_viewer.py`**
-    *   *Rationale:* Implement `@st.dialog("Document Viewer - {filename}", width="large")` supporting PDF preview (via base64 encoded iframe with fallback to page-by-page PyMuPDF rendering) and raw text preview side-by-side with document metadata.
+### Phase 3: In-App Document Viewer & Dependencies
+*   **Target File 7: `frontend/requirements.txt`**
+    *   *Rationale:* Add `pymupdf>=1.23.0` to frontend requirements to support page-by-page rendering fallback when PDF iframe plugins are unavailable.
+*   **Target File 8: `frontend/components/document_viewer.py`**
+    *   *Rationale:* Implement:
+        1. `@st.dialog("Document Viewer - {filename}", width="large")` for standalone review from Evidence tab.
+        2. `render_document_preview_content(doc_bytes, doc_meta)` for embedded preview inside inspector tabs.
+        Supports base64 iframe with PyMuPDF page rendering fallback and raw text preview side-by-side with document metadata.
 
 ### Phase 4: Modular Step Verification Inspectors Package
-*   **Target File 7: `frontend/components/inspectors/__init__.py`**
+*   **Target File 9: `frontend/components/inspectors/__init__.py`**
     *   *Rationale:* Package initialization exposing inspector modal trigger functions.
-*   **Target File 8: `frontend/components/inspectors/base_inspector.py`**
+*   **Target File 10: `frontend/components/inspectors/base_inspector.py`**
     *   *Rationale:* Implement base layout wrapper rendering the standardized 3-tab structure (`Executive Summary`, `Formula & Rule Mechanics`, `Raw State Snapshot`) and copy buttons.
-*   **Target File 9: `frontend/components/inspectors/intake_inspector.py`**
-    *   *Rationale:* Implement `render_intake_inspector(case)` with applicant demographics, declarations, and file manifest table with `[📄 View Document]` buttons.
-*   **Target File 10: `frontend/components/inspectors/agent1_inspector.py`**
-    *   *Rationale:* Implement `render_agent1_inspector(case)` detailing PyMuPDF layout tables, normalized lab analytes, evidence recency flags, and confirmed coverage gaps.
-*   **Target File 11: `frontend/components/inspectors/router_inspector.py`**
-    *   *Rationale:* Implement `render_router_inspector(case)` displaying complexity scoring breakdown, multi-morbidity flags, and routing strategy selection rules.
-*   **Target File 12: `frontend/components/inspectors/agent2_inspector.py`**
-    *   *Rationale:* Implement `render_agent2_inspector(case)` displaying reverse pharmacotherapy drug-disease matches, Copula synergy comorbidity matrix ($\Phi$), individual actuarial debits, IALM 2012–14 baseline mortality lookup ($q_x$), and IRDAI 2024 PED waiting periods.
-*   **Target File 13: `frontend/components/inspectors/confidence_gate_inspector.py`**
-    *   *Rationale:* Implement `render_confidence_gate_inspector(case)` showing Bayesian confidence layers, distance to threshold (0.70), and reflection trigger justification.
-*   **Target File 14: `frontend/components/inspectors/agent3_inspector.py`**
-    *   *Rationale:* Implement `render_agent3_inspector(case)` rendering multi-persona debate transcripts (Chief Medical Officer, Actuary, Compliance Officer), constitutional check matrix, and rescore directive history.
-*   **Target File 15: `frontend/components/inspectors/review_gate_inspector.py`**
-    *   *Rationale:* Implement `render_review_gate_inspector(case)` displaying 4-Tier classification logic (Tier 0 to Tier 3), mandatory human escalation triggers, and business gate rules.
+*   **Target File 11: `frontend/components/inspectors/intake_inspector.py`**
+    *   *Rationale:* Implement `render_intake_inspector(case)` slicing `case.get("applicant_profile")` and `case.get("submission")`. Embeds document preview within a dedicated tab ("Evidence & Documents") using `render_document_preview_content()`, eliminating nested `@st.dialog` crashes.
+*   **Target File 12: `frontend/components/inspectors/agent1_inspector.py`**
+    *   *Rationale:* Implement `render_agent1_inspector(case)` slicing `case.get("agent1_enrichment")` and `case.get("structured_facts")`. Details PyMuPDF layout tables, normalized lab analytes, evidence recency flags, and confirmed coverage gaps.
+*   **Target File 13: `frontend/components/inspectors/router_inspector.py`**
+    *   *Rationale:* Implement `render_router_inspector(case)` slicing `case.get("routing_result")`. Displays complexity scoring breakdown, multi-morbidity flags, and routing strategy selection rules.
+*   **Target File 14: `frontend/components/inspectors/agent2_inspector.py`**
+    *   *Rationale:* Implement `render_agent2_inspector(case)` slicing `case.get("risk_assessment")`, `case.get("copula_synergy_details")`, `case.get("medication_records")`, and `case.get("ped_waiting_periods")`. Displays reverse pharmacotherapy drug-disease matches, Copula synergy comorbidity matrix ($\Phi$), individual actuarial debits, IALM 2012–14 baseline mortality lookup ($q_x$), and IRDAI 2024 PED waiting periods.
+*   **Target File 15: `frontend/components/inspectors/confidence_gate_inspector.py`**
+    *   *Rationale:* Implement `render_confidence_gate_inspector(case)` slicing `case.get("confidence_gate")` and `case.get("confidence_score")`. Shows Bayesian confidence layers, distance to threshold (0.70), and reflection trigger justification.
+*   **Target File 16: `frontend/components/inspectors/agent3_inspector.py`**
+    *   *Rationale:* Implement `render_agent3_inspector(case)` slicing `case.get("reflection_findings")`, `case.get("agent3_metrics")`, and `case.get("reflection_round")`. Renders multi-persona debate transcripts (Chief Medical Officer, Actuary, Compliance Officer), constitutional check matrix, and rescore directive history.
+*   **Target File 17: `frontend/components/inspectors/review_gate_inspector.py`**
+    *   *Rationale:* Implement `render_review_gate_inspector(case)` slicing `case.get("review_tier")`, `case.get("final_status")`, and `case.get("decision_basis")`. Displays 4-Tier classification logic (Tier 0 to Tier 3), mandatory human escalation triggers, and business gate rules.
 
 ### Phase 5: Workflow Visualizer & Case Workspace Integration
-*   **Target File 16: `frontend/components/graph_visualizer.py`**
-    *   *Rationale:* Implement pure function `generate_mermaid_graph(case: dict) -> str` that parses `case["workflow_trace"]`, highlights traversed nodes and bypassed branches, annotates Boolean edge predicates, and renders adjacent `[🔎 Verify Step]` pills within an `@st.fragment`.
-*   **Target File 17: `frontend/app.py`**
+*   **Target File 18: `frontend/components/graph_visualizer.py`**
+    *   *Rationale:* Implement pure function `generate_mermaid_graph(case: dict) -> str` that maps actual LangGraph node names to a static 7-stage topology, collapses reflection cycles with loopback counters, sanitizes edge predicates, and renders adjacent `[🔎 Verify Step]` pills within an `@st.fragment`.
+*   **Target File 19: `frontend/app.py`**
     *   *Rationale:* Integrate the elevated design system, embed `render_workflow_visualizer(case)` in the Case Workspace Overview tab, and inject dedicated `[🔎 Verify Step]` action buttons onto each agent card.
-*   **Target File 18: `frontend/tests/test_graph_visualizer.py`**
-    *   *Rationale:* Write unit tests verifying Mermaid string generation, node traversal classes, and edge condition annotations across sample cases.
+*   **Target File 20: `frontend/tests/test_graph_visualizer.py`**
+    *   *Rationale:* Write unit tests verifying:
+        - `test_mermaid_graph_traversal_mapping`: Traversed vs bypassed node CSS classes.
+        - `test_mermaid_graph_rescore_loop_handling`: Proper cycle collapsing on multi-pass reflection.
+        - `test_mermaid_edge_condition_escaping`: HTML special character escaping (`<`, `>`, `&`).
+        - `test_mermaid_empty_trace_fallback`: Graceful fallback on empty or initial application state.
