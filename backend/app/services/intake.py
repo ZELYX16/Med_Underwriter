@@ -270,6 +270,26 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
     }.get(alcohol_value, alcohol_value or None)
     clarification_answers = {}
     clarification_review_required = False
+
+    raw_family_hist = form.get("family_history") or form.get("family_medical_history") or []
+    if isinstance(raw_family_hist, str) and raw_family_hist.strip():
+        family_medical_history = [{"relation": "other", "condition": raw_family_hist.strip()}]
+    elif isinstance(raw_family_hist, list):
+        family_medical_history = raw_family_hist
+    else:
+        family_medical_history = []
+
+    occ_title = str(form.get("occupation") or "office_worker").strip()
+    try:
+        occ_hazard = int(form.get("hazard_class") or form.get("occupation_hazard_class") or 1)
+    except (ValueError, TypeError):
+        occ_hazard = 1
+    occupation_profile = {
+        "title": occ_title,
+        "hazard_class": occ_hazard,
+        "notes": str(form.get("occupation_notes") or ""),
+    }
+
     profile = {
         "applicant_id": applicant_id,
         "name": form.get("name"),
@@ -280,7 +300,10 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "email": form.get("email"),
         "phone": form.get("phone"),
         "address": form.get("address"),
-        "occupation": form.get("occupation"),
+        "occupation": occ_title,
+        "occupation_profile": occupation_profile,
+        "family_medical_history": family_medical_history,
+        "family_history": family_medical_history,
         "smoker": _yes(form.get("smoker")),
         "alcohol_consumption": form.get("alcohol_consumption"),
         "alcohol_use": alcohol_normalized,
@@ -345,6 +368,9 @@ def to_profile_submission(applicant_id: str, form: dict[str, Any]) -> tuple[dict
         "applicant_clarifications": clarification_answers,
         "clarification_review_required": clarification_review_required,
         "channel": "live_session",
+        "occupation_profile": occupation_profile,
+        "family_medical_history": family_medical_history,
+        "family_history": family_medical_history,
     }
     return profile, submission
 

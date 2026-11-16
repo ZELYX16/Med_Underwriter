@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, TypedDict
 
 from pydantic import BaseModel, Field
@@ -8,6 +9,64 @@ from pydantic import BaseModel, Field
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+# Domain Schemas & Value Objects
+# ----------------------------------------------------------------------
+class FamilyMemberRelation(str, Enum):
+    FATHER = "father"
+    MOTHER = "mother"
+    SIBLING = "sibling"
+    CHILD = "child"
+    OTHER = "other"
+
+
+class FamilyHistoryRecord(BaseModel):
+    relation: FamilyMemberRelation
+    condition: str
+    age_at_onset: int | None = None
+    cause_of_death: str | None = None
+
+
+class OccupationHazardClass(int, Enum):
+    CLASS_1 = 1  # Professional/Desk/Administrative (0 debits)
+    CLASS_2 = 2  # Supervised manual/Retail/Travel (10 debits)
+    CLASS_3 = 3  # Heavy manual/Industrial/Construction (25 debits)
+    CLASS_4 = 4  # Extreme hazard/Mining/Offshore/Aviation (50 debits)
+
+
+class OccupationHazardRecord(BaseModel):
+    title: str
+    hazard_class: OccupationHazardClass
+    notes: str = ""
+
+
+class MedicationVerificationItem(BaseModel):
+    drug_name: str
+    inferred_condition: str
+    is_declared: bool
+    discrepancy_score: int
+    context_exception_applied: bool = False
+    context_exception_tag: str | None = None
+
+
+class PEDWaitingPeriod(BaseModel):
+    condition: str
+    waiting_period_months: int
+    statutory_cap_months: int = 36
+    permanent_exclusion: bool = False
+
+
+class LabAnalyteRecord(BaseModel):
+    analyte_name: str
+    measured_value: float
+    measured_unit: str
+    normalized_value: float
+    normalized_unit: str
+    reference_low: float | None = None
+    reference_high: float | None = None
+    is_abnormal: bool
 
 
 class UnderwritingState(TypedDict, total=False):
@@ -21,6 +80,12 @@ class UnderwritingState(TypedDict, total=False):
     applicant_profile: dict[str, Any]
     submission: dict[str, Any]
     raw_request: dict[str, Any]
+
+    family_medical_history: list[dict[str, Any]]
+    occupation_profile: dict[str, Any]
+    medication_records: list[dict[str, Any]]
+    ped_waiting_periods: list[dict[str, Any]]
+    lab_analyte_records: list[dict[str, Any]]
 
     # ------------------------------------------------------------------
     # Agent 1 - Submission Intelligence
@@ -61,6 +126,9 @@ class UnderwritingState(TypedDict, total=False):
     claims_risk_score: float
     coverage_gap_score: float
     overall_risk_score: float
+    extra_mortality_percentage: float
+    actuarial_debits: float
+    copula_synergy_details: dict[str, Any]
 
     pricing_result: dict[str, Any]
 
@@ -106,6 +174,7 @@ class UnderwritingState(TypedDict, total=False):
     # ------------------------------------------------------------------
     require_human_escalation: bool
     require_human_review: bool
+    review_tier: str
     human_review_reasons: list[str]
     business_gate_reasons: list[str]
 
@@ -185,6 +254,9 @@ class UnderwriteResult(BaseModel):
     base_premium: float = 0.0
     loading_percentage: float = 0.0
     final_premium: float = 0.0
+    extra_mortality_percentage: float = 100.0
+    actuarial_debits: float = 0.0
+    ped_waiting_periods: list[dict[str, Any]] = Field(default_factory=list)
 
     confidence_gate: str = ""
     reflection_type: str = ""
@@ -193,6 +265,7 @@ class UnderwriteResult(BaseModel):
 
     require_human_escalation: bool = False
     require_human_review: bool = False
+    review_tier: str = "Tier 0"
 
     human_review_status: str = ""
     human_review_reasons: list[str] = Field(default_factory=list)

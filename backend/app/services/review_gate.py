@@ -110,16 +110,24 @@ def evaluate_review_gate(state: dict[str, Any]) -> dict[str, Any]:
 
     requires_review = bool(reasons or blocking_reasons)
 
-    if blocking_reasons:
+    # 4-Tier routing with legacy review_level alias
+    if state.get("security_review_reasons") or medical_risk >= HUMAN_REVIEW_MEDICAL_RISK_THRESHOLD or verdict in {"fail", "failed"}:
+        tier = "Tier 3"
+        level = "full_review"
+    elif overall_risk >= HUMAN_REVIEW_OVERALL_RISK_THRESHOLD or fraud_score >= fraud_thresh or len(blocking_reasons) >= 1:
+        tier = "Tier 2"
         level = "full_review"
     elif requires_review:
+        tier = "Tier 1"
         level = "assisted_review"
     else:
+        tier = "Tier 0"
         level = "straight_through"
 
     return {
         "requires_human_review": requires_review,
         "reasons": reasons,
         "review_level": level,
+        "review_tier": tier,
         "blocking_reasons": blocking_reasons,
     }

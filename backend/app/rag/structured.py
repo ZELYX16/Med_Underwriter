@@ -629,6 +629,89 @@ def parse_pdf(path: str | Path) -> dict[str, Any] | None:
     return result
 
 
+def extract_tables_fitz(path: str | Path) -> list[dict[str, Any]]:
+    """
+    Extracts tabular data directly using PyMuPDF Page.find_tables().
+    Returns list of tables with 'headers' and 'rows' (as list of dicts).
+    """
+    tables: list[dict[str, Any]] = []
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(path))
+        for page_idx, page in enumerate(doc):
+            tabs = page.find_tables()
+            for t_idx, tab in enumerate(tabs.tables):
+                extracted = tab.extract()
+                if not extracted or len(extracted) < 2:
+                    continue
+                raw_headers = [str(h or "").strip() for h in extracted[0]]
+                headers = [h if h else f"col_{i}" for i, h in enumerate(raw_headers)]
+                rows = []
+                for row_data in extracted[1:]:
+                    row_dict = {}
+                    for col_idx, cell in enumerate(row_data):
+                        h_name = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
+                        row_dict[h_name] = str(cell or "").strip()
+                    rows.append(row_dict)
+                tables.append({
+                    "page": page_idx + 1,
+                    "table_index": t_idx,
+                    "headers": headers,
+                    "rows": rows,
+                })
+    except Exception as exc:
+        logger.warning("PyMuPDF find_tables failed on %s: %s", path, exc)
+    return tables
+
+
+def extract_unstructured_clinical_notes_llm(
+    clinical_text: str,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """
+    Targeted fallback for extracting unstructured clinical entities (diagnoses,
+    medications, vitals, procedures) using a single batch prompt.
+    Gracefully degrades with a timeout indicator if the external LLM is slow or fails.
+    """
+    import concurrent.futures
+    from app.llm.factory import get_llm
+
+    clean_text = str(clinical_text or "").strip()
+    if not clean_text:
+        return {"entities": {}, "status": "empty_input"}
+
+    prompt = (
+        "Extract clinical entities from the following medical notes into JSON with keys: "
+        "'diagnoses' (list of strings), 'medications' (list of strings), 'vitals' (dict), 'procedures' (list of strings).\n\n"
+        f"Notes:\n{clean_text[:2000]}\n\nJSON:"
+    )
+
+    def _call_llm():
+        try:
+            llm = get_llm()
+            resp = llm.generate([prompt])
+            text_out = resp.generations[0][0].text if resp and resp.generations else ""
+            import json, re
+            match = re.search(r"\{.*\}", text_out, re.DOTALL)
+            if match:
+                return {"entities": json.loads(match.group()), "status": "success"}
+            return {"entities": {"raw": text_out}, "status": "unstructured_response"}
+        except Exception as err:
+            return {"entities": {}, "status": "llm_error", "error": str(err)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_call_llm)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            logger.warning("Targeted clinical LLM fallback timed out after %.1fs", timeout_seconds)
+            return {
+                "entities": {},
+                "status": "timeout",
+                "route_reason": "Tier 1 Fast-Track: Clinical note extraction timeout",
+            }
+
+
 def doc_type_of(doc_id: str, path: str | Path | None = None) -> str:
     prefix = str(doc_id or "").upper()
     if prefix.startswith("UW-"):

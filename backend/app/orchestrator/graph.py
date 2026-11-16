@@ -783,6 +783,11 @@ async def agent2_node(
                 "final_premium",
                 0.0,
             ),
+            "extra_mortality_percentage": result.get("extra_mortality_percentage", 100.0),
+            "actuarial_debits": result.get("actuarial_debits", 0.0),
+            "copula_synergy_details": result.get("copula_synergy_details", {}),
+            "medication_records": result.get("medication_records", []),
+            "ped_waiting_periods": result.get("ped_waiting_periods", []),
             "reasoning_cache_key": result.get("reasoning_cache_key"),
             "fraud_risk_score": result.get("fraud_risk_score", 0.0),
             "fraud_risk_level": result.get("fraud_risk_level", "low"),
@@ -1357,7 +1362,19 @@ def _outcome_fields(state: UnderwritingState) -> dict[str, Any]:
 def post_reflection_router(
     state: UnderwritingState,
 ) -> str:
+    reflection_round = int(state.get("reflection_round") or 0)
+    MAX_REFLECTION_ROUNDS = getattr(settings, "max_reflection_rounds", 3)
+    if state.get("reflection_requires_rescore"):
+        if reflection_round >= MAX_REFLECTION_ROUNDS and not state.get("reflection_consensus", False):
+            return "human_review"
+        return "rescore"
+
     gate = evaluate_review_gate(state)
+    tier = gate.get("review_tier")
+    if tier == "Tier 0":
+        return "finalize"
+    elif tier in {"Tier 1", "Tier 2", "Tier 3"}:
+        return "human_review"
     if gate["requires_human_review"]:
         return "human_review"
     return "finalize"
@@ -1495,6 +1512,10 @@ def finalize_node(
         "final_status": status,
         "final_recommendation": recommendation,
         "final_confidence": confidence,
+        "review_tier": state.get("review_tier", "Tier 0"),
+        "extra_mortality_percentage": state.get("extra_mortality_percentage", 100.0),
+        "actuarial_debits": state.get("actuarial_debits", 0.0),
+        "ped_waiting_periods": state.get("ped_waiting_periods", []),
         "review_notes": _review_notes(state),
         "decision_basis": state.get("decision_basis", {}),
         "reasoning": state.get("agent2_reasoning", ""),
@@ -1642,6 +1663,10 @@ def build_graph() -> StateGraph:
             "rescore": "agent2_risk",
             "human_review": "human_review",
             "finalize": "finalize",
+            "tier_0": "finalize",
+            "tier_1": "human_review",
+            "tier_2": "human_review",
+            "tier_3": "human_review",
         },
     )
 

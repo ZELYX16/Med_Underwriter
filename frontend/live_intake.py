@@ -532,6 +532,21 @@ def _application_tab(
         key=f"live_occupation_{ver}",
     )
 
+    hazard_options = [
+        "Class 1 (Administrative / Desk / Low Hazard)",
+        "Class 2 (Supervised Manual / Retail / Travel)",
+        "Class 3 (Heavy Manual / Industrial / Construction)",
+        "Class 4 (Extreme Hazard / Aviation / Mining)",
+    ]
+    cur_hc = int(form.get("hazard_class") or 1) - 1
+    selected_hc = st.selectbox(
+        "Occupation Hazard Level",
+        hazard_options,
+        index=max(0, min(3, cur_hc)),
+        key=f"live_hazard_{ver}",
+    )
+    form["hazard_class"] = hazard_options.index(selected_hc) + 1
+
     form["address"] = st.text_area(
         "Residential address",
         value=form.get("address", ""),
@@ -725,6 +740,16 @@ def _application_tab(
     _save(form)
     view = st.session_state.live_view
     _documents_block(view, form, ver)
+
+    st.markdown("### Family Medical History (Optional)")
+    form["family_history_notes"] = st.text_input(
+        "Any family history of heart disease, stroke, diabetes, or cancer before age 55 in parents or siblings?",
+        value=form.get("family_history_notes", ""),
+        placeholder="e.g. Father had myocardial infarction at age 48",
+        key=f"live_fam_hist_{ver}",
+    )
+    if form.get("family_history_notes"):
+        form["family_history"] = [{"relation": "other", "condition": form["family_history_notes"]}]
 
     form["remarks"] = st.text_area(
         "Anything else you would like us to know? (optional)",

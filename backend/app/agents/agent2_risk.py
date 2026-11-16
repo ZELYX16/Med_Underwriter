@@ -59,6 +59,20 @@ class RiskAssessmentAgent:
         features["reflection_findings"] = reflection_findings or []
         features["reflection_round"] = reflection_round
 
+        # Reverse pharmacotherapy verification
+        from app.services.reverse_pharmacotherapy import verify_medications
+        prescriptions = (
+            list(applicant_profile.get("medications") or [])
+            + list((features.get("structured") or {}).get("medications") or [])
+        )
+        verified_meds = verify_medications(
+            prescriptions=prescriptions,
+            declared_conditions=applicant_profile.get("medical_conditions") or features.get("conditions") or [],
+            applicant_sex=applicant_profile.get("sex") or applicant_profile.get("gender") or "",
+            questionnaire=(features.get("structured") or {}).get("submission", {}).get("questionnaire"),
+        )
+        features["verified_medications"] = verified_meds
+
         # Rule-based fraud indicators: no LLM call, no extra retrieval.
         # Run first so conditions found in documents but not declared are
         # counted in the medical risk score.
@@ -67,6 +81,7 @@ class RiskAssessmentAgent:
             submission,
             features,
             high_sum_insured=settings.fraud_high_sum_insured,
+            verified_medications=verified_meds,
         )
         features["condition_assessments"] = fraud.get("condition_assessments", [])
         features["tier_by_group"] = {
@@ -135,6 +150,21 @@ class RiskAssessmentAgent:
                 + "; ".join(v["action"] for v in material_unknown)
                 + ")."
             )
+
+        from app.services.medical_synergy import (
+            calculate_numerical_rating,
+            calculate_actuarial_premium,
+            generate_ped_waiting_periods,
+        )
+        synergy_rating = calculate_numerical_rating(
+            features=features,
+            applicant_profile=applicant_profile,
+            submission=submission,
+        )
+        ped_waiting_periods = generate_ped_waiting_periods(
+            conditions=applicant_profile.get("medical_conditions") or features.get("conditions") or [],
+            condition_assessments=features.get("condition_assessments") or [],
+        )
 
         pricing = self._calculate_pricing(
             submission=submission,
@@ -260,6 +290,11 @@ class RiskAssessmentAgent:
             "base_premium": pricing["base_premium"],
             "loading_percentage": pricing["loading_percentage"],
             "final_premium": pricing["final_premium"],
+            "extra_mortality_percentage": synergy_rating["extra_mortality_percentage"],
+            "actuarial_debits": synergy_rating["actuarial_debits"],
+            "copula_synergy_details": synergy_rating,
+            "medication_records": verified_meds,
+            "ped_waiting_periods": ped_waiting_periods,
             "agent2_recommendation": recommendation,
             "agent2_confidence": confidence,
             "agent2_reasoning": reasoning,

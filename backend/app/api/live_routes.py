@@ -344,8 +344,17 @@ async def submit(token: str, background: BackgroundTasks, proceed: bool = False)
     profile, submission = intake.to_profile_submission(applicant_id, session["form"])
     state_store.update_applicant(applicant_id=applicant_id, applicant_profile=profile)
     state = state_store.get_case(case_id) or {}
-    state.update(applicant_profile=profile, submission=submission, case_id=case_id, applicant_id=applicant_id,
-                 final_status="draft", final_decision="", final_recommendation="")
+    state.update(
+        applicant_profile=profile,
+        submission=submission,
+        case_id=case_id,
+        applicant_id=applicant_id,
+        family_medical_history=profile.get("family_medical_history", []),
+        occupation_profile=profile.get("occupation_profile", {}),
+        final_status="draft",
+        final_decision="",
+        final_recommendation="",
+    )
     state_store.save_case(case_id, state, status="draft")
     cost_guard.reset(case_id)
 

@@ -513,8 +513,31 @@ def assess_fraud(
     submission: dict[str, Any],
     features: dict[str, Any],
     high_sum_insured: float = 5_000_000.0,
+    verified_medications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     facts = features.get("structured") or {}
     if facts.get("available"):
-        return _structured(applicant_profile, submission, features, facts)
-    return _legacy(applicant_profile, submission, features, high_sum_insured)
+        res = _structured(applicant_profile, submission, features, facts)
+    else:
+        res = _legacy(applicant_profile, submission, features, high_sum_insured)
+
+    vmeds = verified_medications or features.get("verified_medications") or []
+    for vm in vmeds:
+        if not vm.get("is_declared") and vm.get("discrepancy_score", 0) > 0:
+            drug = vm.get("drug_name")
+            cond = vm.get("inferred_condition")
+            score = vm.get("discrepancy_score", 15)
+            res["fraud_flags"].append({
+                "code": "undeclared_prescription_indication",
+                "score": score,
+                "reason": f"Prescribed medication '{drug}' indicates underlying {cond} which was not declared in the application.",
+                "requires_review": True,
+                "source": f"Rx: {drug}",
+            })
+            res["fraud_risk_score"] = float(res.get("fraud_risk_score", 0.0) + score)
+            if res["fraud_risk_score"] >= 30:
+                res["fraud_risk_level"] = "high"
+            elif res["fraud_risk_score"] >= 15:
+                res["fraud_risk_level"] = "medium"
+
+    return res

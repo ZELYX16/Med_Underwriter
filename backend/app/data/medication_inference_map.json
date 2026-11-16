@@ -1,0 +1,315 @@
+{
+  "metadata": {
+    "source": "MedUnderwriter Reverse Pharmacotherapy Knowledge Graph",
+    "version": "1.0",
+    "description": "Standard mapping of prescription pharmaceutical agents to clinical pathology (ICD-10)"
+  },
+  "drugs": {
+    "metformin": {
+      "generic_name": "metformin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": true,
+      "context_exceptions": ["pcos", "polycystic", "prediabetes", "insulin_resistance"],
+      "discrepancy_weight": 10,
+      "default_severity": "moderate"
+    },
+    "glimepiride": {
+      "generic_name": "glimepiride",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "glipizide": {
+      "generic_name": "glipizide",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "gliclazide": {
+      "generic_name": "gliclazide",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "dapagliflozin": {
+      "generic_name": "dapagliflozin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "empagliflozin": {
+      "generic_name": "empagliflozin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "sitagliptin": {
+      "generic_name": "sitagliptin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "vildagliptin": {
+      "generic_name": "vildagliptin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "insulin": {
+      "generic_name": "insulin",
+      "icd10_code": "E11",
+      "clinical_group": "diabetes_type2",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "amlodipine": {
+      "generic_name": "amlodipine",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "telmisartan": {
+      "generic_name": "telmisartan",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "losartan": {
+      "generic_name": "losartan",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "ramipril": {
+      "generic_name": "ramipril",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "atenolol": {
+      "generic_name": "atenolol",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "metoprolol": {
+      "generic_name": "metoprolol",
+      "icd10_code": "I10",
+      "clinical_group": "hypertension",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 35,
+      "default_severity": "routine"
+    },
+    "atorvastatin": {
+      "generic_name": "atorvastatin",
+      "icd10_code": "E78",
+      "clinical_group": "dyslipidemia",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 30,
+      "default_severity": "routine"
+    },
+    "rosuvastatin": {
+      "generic_name": "rosuvastatin",
+      "icd10_code": "E78",
+      "clinical_group": "dyslipidemia",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 30,
+      "default_severity": "routine"
+    },
+    "clopidogrel": {
+      "generic_name": "clopidogrel",
+      "icd10_code": "I25",
+      "clinical_group": "cad_ischemic",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "ticagrelor": {
+      "generic_name": "ticagrelor",
+      "icd10_code": "I25",
+      "clinical_group": "cad_ischemic",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "aspirin": {
+      "generic_name": "aspirin",
+      "icd10_code": "I25",
+      "clinical_group": "cardiovascular_prophylaxis",
+      "context_required": true,
+      "context_exceptions": ["prophylaxis", "primary_prevention", "headache", "pain"],
+      "discrepancy_weight": 15,
+      "default_severity": "routine"
+    },
+    "nitroglycerin": {
+      "generic_name": "nitroglycerin",
+      "icd10_code": "I20",
+      "clinical_group": "angina_cad",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "isosorbide": {
+      "generic_name": "isosorbide",
+      "icd10_code": "I20",
+      "clinical_group": "angina_cad",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "warfarin": {
+      "generic_name": "warfarin",
+      "icd10_code": "I48",
+      "clinical_group": "anticoagulation_arrhythmia",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "apixaban": {
+      "generic_name": "apixaban",
+      "icd10_code": "I48",
+      "clinical_group": "anticoagulation_arrhythmia",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 50,
+      "default_severity": "serious"
+    },
+    "levothyroxine": {
+      "generic_name": "levothyroxine",
+      "icd10_code": "E03",
+      "clinical_group": "hypothyroidism",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 20,
+      "default_severity": "routine"
+    },
+    "budesonide": {
+      "generic_name": "budesonide",
+      "icd10_code": "J45",
+      "clinical_group": "asthma",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 25,
+      "default_severity": "routine"
+    },
+    "formoterol": {
+      "generic_name": "formoterol",
+      "icd10_code": "J45",
+      "clinical_group": "asthma",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 25,
+      "default_severity": "routine"
+    },
+    "montelukast": {
+      "generic_name": "montelukast",
+      "icd10_code": "J45",
+      "clinical_group": "asthma",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 20,
+      "default_severity": "routine"
+    },
+    "tiotropium": {
+      "generic_name": "tiotropium",
+      "icd10_code": "J44",
+      "clinical_group": "copd",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 40,
+      "default_severity": "moderate"
+    },
+    "methotrexate": {
+      "generic_name": "methotrexate",
+      "icd10_code": "M06",
+      "clinical_group": "rheumatoid_autoimmune",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "moderate"
+    },
+    "hydroxychloroquine": {
+      "generic_name": "hydroxychloroquine",
+      "icd10_code": "M06",
+      "clinical_group": "rheumatoid_autoimmune",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 40,
+      "default_severity": "moderate"
+    },
+    "allopurinol": {
+      "generic_name": "allopurinol",
+      "icd10_code": "M10",
+      "clinical_group": "hyperuricemia_gout",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 25,
+      "default_severity": "routine"
+    },
+    "levetiracetam": {
+      "generic_name": "levetiracetam",
+      "icd10_code": "G40",
+      "clinical_group": "epilepsy",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 45,
+      "default_severity": "serious"
+    },
+    "escitalopram": {
+      "generic_name": "escitalopram",
+      "icd10_code": "F32",
+      "clinical_group": "mental_health",
+      "context_required": false,
+      "context_exceptions": [],
+      "discrepancy_weight": 25,
+      "default_severity": "routine"
+    }
+  }
+}
