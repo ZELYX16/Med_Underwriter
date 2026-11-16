@@ -21,6 +21,16 @@ from components import (
     review_summary,
     risk_factors,
     workflow_timeline,
+    render_tier_badge,
+    render_workflow_visualizer,
+    open_intake_inspector,
+    open_agent1_inspector,
+    open_router_inspector,
+    open_agent2_inspector,
+    open_confidence_gate_inspector,
+    open_agent3_inspector,
+    open_review_gate_inspector,
+    open_document_viewer_dialog,
 )
 from config import settings
 from live_intake import render_live_intake
@@ -2505,6 +2515,9 @@ def render_case_workspace() -> None:
 
     if section == "Overview":
         render_case_overview(case)
+        st.divider()
+        render_workflow_visualizer(case)
+        st.divider()
         with st.expander("Applicant profile", expanded=False):
             render_case_applicant(case)
         with st.expander("Submission details", expanded=False):
@@ -3772,13 +3785,17 @@ def render_case_evidence(
                 or "Provided"
             )
 
-            columns = st.columns([3, 1.5, 1.5])
+            columns = st.columns([3, 1.5, 1.5, 1.2])
             with columns[0]:
                 st.markdown(f"**{esc(filename)}**")
             with columns[1]:
                 st.caption(document_type)
             with columns[2]:
                 st.caption(status)
+            with columns[3]:
+                doc_id = document.get("document_id")
+                if doc_id and st.button("📄 View", key=f"view_doc_btn_{doc_id}"):
+                    open_document_viewer_dialog(case_id, doc_id, filename, document)
 
         st.divider()
 
@@ -3840,6 +3857,15 @@ def render_agent_section(
         title,
         subtitle,
     )
+
+    col_btn, _ = st.columns([2, 4])
+    with col_btn:
+        if number == 1:
+            if st.button("🔎 Inspect Step 02: Agent 1", key="btn_verify_ag1_head"):
+                open_agent1_inspector(case)
+        elif number == 2:
+            if st.button("🔎 Inspect Step 04: Agent 2", key="btn_verify_ag2_head"):
+                open_agent2_inspector(case)
 
     result = get_agent_result(
         case,
@@ -4154,6 +4180,11 @@ def render_agent3_section(
         "Agent 3 · Reflection & Quality",
         "Mandatory quality gate applied to every underwriting case; reflection depth varies by risk and confidence.",
     )
+
+    col_btn, _ = st.columns([2, 4])
+    with col_btn:
+        if st.button("🔎 Inspect Step 06: Agent 3", key="btn_verify_ag3_head"):
+            open_agent3_inspector(case)
 
     result = get_agent_result(case, 3)
     complexity = humanize(case.get("complexity_level") or "standard")

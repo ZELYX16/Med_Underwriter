@@ -7,6 +7,114 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
+        :root {
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-mono: 'Roboto Mono', Menlo, Consolas, monospace;
+            --color-surface-0: #f8fafc;
+            --color-surface-1: #ffffff;
+            --color-surface-2: #ffffff;
+            --color-surface-elevated: #ffffff;
+            --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+            --shadow-elevated: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+            --shadow-modal: 0 20px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+
+        .elevated-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+            padding: 20px 24px;
+            margin-bottom: 18px;
+            transition: box-shadow 0.2s ease, border-color 0.2s ease;
+        }
+
+        .elevated-card:hover {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+            border-color: #cbd5e1;
+        }
+
+        .elevated-surface-2 {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
+            padding: 22px 26px;
+            margin-bottom: 18px;
+        }
+
+        .formula-callout {
+            background: #f8fafc;
+            border-left: 4px solid #2563eb;
+            border-top: 1px solid #e2e8f0;
+            border-right: 1px solid #e2e8f0;
+            border-bottom: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin: 12px 0;
+            font-family: 'Roboto Mono', Menlo, Consolas, monospace;
+            font-size: 13px;
+            color: #1e293b;
+        }
+
+        .metric-surface {
+            font-family: 'Roboto Mono', Menlo, Consolas, monospace;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        /* Semantic Badges */
+        .status-tier-0,
+        .status-stp {
+            background: #ecfdf5 !important;
+            color: #065f46 !important;
+            border: 1px solid #a7f3d0 !important;
+        }
+
+        .status-tier-1,
+        .status-fast-track {
+            background: #eff6ff !important;
+            color: #1e40af !important;
+            border: 1px solid #bfdbfe !important;
+        }
+
+        .status-tier-2,
+        .status-comprehensive {
+            background: #fffbeb !important;
+            color: #92400e !important;
+            border: 1px solid #fde68a !important;
+        }
+
+        .status-tier-3,
+        .status-cmo-escalation,
+        .status-escalated {
+            background: #fef2f2 !important;
+            color: #991b1b !important;
+            border: 1px solid #fecaca !important;
+        }
+
+        /* Flowchart styling */
+        .node.traversed > rect, .node.traversed > polygon, .node.traversed > circle {
+            fill: #eff6ff !important;
+            stroke: #2563eb !important;
+            stroke-width: 2px !important;
+        }
+        .node.bypassed > rect, .node.bypassed > polygon, .node.bypassed > circle {
+            fill: #f8fafc !important;
+            stroke: #cbd5e1 !important;
+            stroke-dasharray: 4 4 !important;
+            opacity: 0.6 !important;
+        }
+        .node.gate > rect, .node.gate > polygon {
+            fill: #fffbeb !important;
+            stroke: #d97706 !important;
+            stroke-width: 2px !important;
+        }
+        .node.active > rect, .node.active > polygon {
+            fill: #f0fdf4 !important;
+            stroke: #16a34a !important;
+            stroke-width: 2.5px !important;
+        }
         /* =========================================================
            GLOBAL
         ========================================================= */
@@ -863,3 +971,20 @@ def footer(
         """,
         unsafe_allow_html=True,
     )
+
+def elevated_card_container(html_content: str) -> None:
+    """Render content within an elevated card container."""
+    st.markdown(
+        f'<div class="elevated-card">{html_content}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def formula_callout(formula_text: str, title: str = "") -> None:
+    """Render an actuarial formula or calculation rule callout box."""
+    header = f'<div style="font-weight: 700; margin-bottom: 6px; color: #1e3a8a;">{title}</div>' if title else ""
+    st.markdown(
+        f'<div class="formula-callout">{header}<code>{formula_text}</code></div>',
+        unsafe_allow_html=True,
+    )
+

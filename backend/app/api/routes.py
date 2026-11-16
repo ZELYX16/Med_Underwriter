@@ -18,6 +18,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import FileResponse
 
 from app.models.state import (
     HumanEscalationInput,
@@ -1001,6 +1002,61 @@ async def list_case_documents(
         },
         "error": None,
     }
+
+
+@router.get(
+    "/case/{case_id}/documents/{document_id}/content",
+)
+async def get_case_document_content(
+    case_id: str,
+    document_id: str,
+):
+    doc = state_store.get_case_document(document_id)
+    if not doc or str(doc.get("case_id")) != case_id or not doc.get("file_path"):
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found for this application.",
+        )
+
+    file_path = Path(doc["file_path"]).resolve()
+    storage_root = (settings.synthetic_data_directory / "uploads").resolve()
+    alt_root = settings.synthetic_data_directory.resolve()
+
+    is_contained = False
+    for root in (storage_root, alt_root):
+        try:
+            if file_path.is_relative_to(root):
+                is_contained = True
+                break
+        except (ValueError, AttributeError):
+            pass
+
+    if not is_contained or not file_path.exists() or not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Physical document file missing or inaccessible.",
+        )
+
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        media_type = "application/pdf"
+    elif suffix in {".png", ".jpg", ".jpeg"}:
+        media_type = f"image/{suffix.lstrip('.')}"
+        if media_type == "image/jpg":
+            media_type = "image/jpeg"
+    elif suffix == ".txt":
+        media_type = "text/plain"
+    elif suffix == ".json":
+        media_type = "application/json"
+    else:
+        media_type = "application/octet-stream"
+
+    filename = str(doc.get("filename") or file_path.name)
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        filename=filename,
+    )
 
 
 @router.delete(

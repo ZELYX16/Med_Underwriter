@@ -336,6 +336,39 @@ class APIClient:
             f"/api/case/{case_id}/documents/{document_id}",
         )
 
+    def get_document_content_url(
+        self,
+        case_id: str,
+        document_id: str,
+    ) -> str:
+        return f"{self.base_url}/api/case/{case_id}/documents/{document_id}/content"
+
+    def get_case_document_content(
+        self,
+        case_id: str,
+        document_id: str,
+    ) -> bytes:
+        url = self.get_document_content_url(case_id, document_id)
+        try:
+            response = requests.get(url, timeout=self.timeout)
+        except requests.RequestException as exc:
+            logger.warning("Failed to stream document %s: %s", document_id, exc)
+            raise APIError(
+                f"Unable to connect to backend: {exc}",
+                user_message="Document streaming failed. Please try again.",
+            ) from exc
+
+        if not response.ok:
+            code = response.status_code
+            detail = response.text
+            raise APIError(
+                f"Backend returned {code}: {detail}",
+                user_message="Document content could not be retrieved.",
+                status_code=code,
+                retryable=code >= 500,
+            )
+        return response.content
+
     # ========================================================
     # WORKFLOW
     # ========================================================
