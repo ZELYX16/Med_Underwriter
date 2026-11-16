@@ -1,7 +1,7 @@
 # Goldfish Annotated Review Report
 
 **Target:** `docs/designs/enterprise_underwriting_engine.md` (Lines 296–416)  
-**Status:** In Review / Ready for Resolution
+**Status:** Resolved (All 10 Proposed Fixes Applied)
 
 ---
 
