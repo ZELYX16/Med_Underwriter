@@ -79,7 +79,7 @@ def render_document_preview_content(
                         pix = page.get_pixmap(dpi=150)
                         img_bytes = pix.tobytes("png")
                         st.caption(f"Page {page_num + 1} of {total_pages}")
-                        st.image(img_bytes, use_container_width=True)
+                        st.image(img_bytes, width="stretch")
                     pdf_doc.close()
                 except Exception as exc:
                     st.error(f"PyMuPDF rendering failed: {exc}")
@@ -101,7 +101,7 @@ def render_document_preview_content(
                 st.info("PyMuPDF required to extract text directly from PDF.")
 
     elif is_image:
-        st.image(doc_bytes, caption=filename, use_container_width=True)
+        st.image(doc_bytes, caption=filename, width="stretch")
 
     else:
         # Text/JSON/Other

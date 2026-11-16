@@ -22,6 +22,7 @@ from components import (
     risk_factors,
     workflow_timeline,
     render_tier_badge,
+    render_dashboard_metric,
     render_workflow_visualizer,
     open_intake_inspector,
     open_agent1_inspector,
@@ -1056,20 +1057,24 @@ def render_sidebar() -> None:
         ]
 
         for label, page in navigation:
+            is_active = (st.session_state.page == page)
             if st.button(
                 label,
                 key=f"nav_{page}",
-                use_container_width=True,
+                width="stretch",
+                type="primary" if is_active else "secondary",
             ):
                 st.session_state.page = page
                 st.rerun()
 
         st.caption("OPERATIONS")
 
+        is_sys_active = (st.session_state.page == "system")
         if st.button(
             "Performance & Audit",
             key="nav_system",
-            use_container_width=True,
+            width="stretch",
+            type="primary" if is_sys_active else "secondary",
         ):
             st.session_state.page = "system"
             st.rerun()
@@ -1099,67 +1104,18 @@ def render_dashboard() -> None:
             status_counts.get(current, 0) + 1
         )
 
-    metrics = [
-        (
-            "Total Cases",
-            len(cases),
-        ),
-        (
-            "Pending",
-            status_counts.get("draft", 0)
-            + status_counts.get("pending", 0),
-        ),
-        (
-            "In Progress",
-            sum(
-                status_counts.get(
-                    value,
-                    0,
-                )
-                for value in (
-                    "in-progress",
-                    "running",
-                    "processing",
-                    "agent1",
-                    "agent2",
-                    "agent3",
-                )
-            ),
-        ),
-        (
-            "Human Review",
-            status_counts.get(
-                "human-review",
-                0,
-            )
-            + status_counts.get(
-                "review",
-                0,
-            ),
-        ),
-        (
-            "Completed",
-            status_counts.get(
-                "completed",
-                0,
-            ),
-        ),
+    kpi_configs = [
+        ("Total Cases", len(cases), "📁", "#2563eb", "#eff6ff", "All submissions"),
+        ("Pending Intake", status_counts.get("draft", 0) + status_counts.get("pending", 0), "⏳", "#d97706", "#fffbeb", "Awaiting ingestion"),
+        ("In Progress", sum(status_counts.get(val, 0) for val in ("in-progress", "running", "processing", "agent1", "agent2", "agent3")), "⚙️", "#0284c7", "#f0f9ff", "Pipeline processing"),
+        ("Human Review", status_counts.get("human-review", 0) + status_counts.get("review", 0), "👤", "#7c3aed", "#f5f3ff", "Action required"),
+        ("Completed", status_counts.get("completed", 0), "✅", "#16a34a", "#f0fdf4", "Approved / Decided"),
     ]
 
     columns = st.columns(5)
-
-    for column, (
-        label,
-        value,
-    ) in zip(
-        columns,
-        metrics,
-    ):
-        with column:
-            st.metric(
-                label,
-                value,
-            )
+    for col, (label, val, icon, accent, bg, sub) in zip(columns, kpi_configs):
+        with col:
+            render_dashboard_metric(label, val, icon, accent, bg, sub)
 
     st.divider()
 
@@ -1322,123 +1278,91 @@ def render_case_row(
     case: dict[str, Any],
     key_suffix: str = "cases",
 ) -> None:
-    case_id = str(
-        case.get("case_id")
-        or "—"
-    )
-
+    case_id = str(case.get("case_id") or "—")
     name = applicant_name(case)
     app_id = applicant_id(case)
+    current_status = status_key(case.get("status") or case.get("processing_status"))
+    action_label, action_kind = action_for_case(case)
+    prod = product(case)
 
-    current_status = status_key(
-        case.get("status")
-        or case.get("processing_status")
-    )
+    # Calculate initials
+    name_parts = [p for p in name.split() if p]
+    initials = "".join(p[0].upper() for p in name_parts[:2]) or "AP"
 
-    action_label, action_kind = (
-        action_for_case(case)
-    )
+    # Risk score pill
+    risk_score = case.get("overall_risk_score")
+    if risk_score is not None:
+        try:
+            r_val = float(risk_score)
+            if r_val < 40:
+                risk_pill = f'<span class="risk-pill-low">Score: {r_val:.1f} (Low)</span>'
+            elif r_val < 70:
+                risk_pill = f'<span class="risk-pill-med">Score: {r_val:.1f} (Moderate)</span>'
+            else:
+                risk_pill = f'<span class="risk-pill-high">Score: {r_val:.1f} (High)</span>'
+        except (ValueError, TypeError):
+            risk_pill = '<span class="risk-pill-none">Risk: Pending</span>'
+    else:
+        risk_pill = '<span class="risk-pill-none">Risk: Pending</span>'
 
-    columns = st.columns(
-        [
-            1.1,
-            1.8,
-            2.5,
-            1.3,
-            1.25,
-        ]
-    )
+    status_disp = status_label(current_status)
 
-    with columns[0]:
-        st.caption("CASE")
-        st.markdown(
-            f"**{esc(case_id)}**",
-            unsafe_allow_html=True,
-        )
+    with st.container(border=True):
+        col_avatar, col_meta, col_risk, col_action = st.columns([2.2, 2.5, 2.3, 1.2], vertical_alignment="center")
 
-    with columns[1]:
-        st.caption("APPLICANT")
-        st.markdown(
-            f"**{esc(name)}**",
-            unsafe_allow_html=True,
-        )
-
-        if app_id:
-            st.caption(app_id)
-
-    with columns[2]:
-        st.caption("PRODUCT")
-        st.write(
-            product(case)
-        )
-
-    with columns[3]:
-        st.caption("STATUS")
-        status_badge(
-            current_status,
-            status_label(current_status),
-        )
-
-    with columns[4]:
-
-        if action_kind == "start":
-
-            if st.button(
-                "Underwrite",
-                key=f"underwrite_{case_id}_{key_suffix}",
-                use_container_width=True,
-                disabled=st.session_state.underwriting_running,
-            ):
-                run_underwriting(
-                    case_id
-                )
-
-        elif action_kind == "running":
-
-            st.button(
-                "Processing...",
-                key=f"processing_{case_id}_{key_suffix}",
-                use_container_width=True,
-                disabled=True,
+        with col_avatar:
+            st.markdown(
+                f"""
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <div style="width: 38px; height: 38px; border-radius: 50%; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; display: flex; align-items: center; justify-content: center; font-weight: 750; font-size: 14px; flex-shrink: 0;">
+                        {esc(initials)}
+                    </div>
+                    <div>
+                        <div style="font-weight: 700; font-size: 14px; color: #0f172a; line-height: 1.2;">{esc(name)}</div>
+                        <div style="font-size: 11px; color: #64748b; margin-top: 2px;">{esc(app_id or "Applicant")}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        elif action_kind == "review":
+        with col_meta:
+            st.markdown(
+                f"""
+                <div>
+                    <span class="case-id-pill">{esc(case_id)}</span>
+                    <div style="font-size: 12px; color: #334155; font-weight: 500; margin-top: 4px;">{esc(prod)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            if st.button(
-                "Review",
-                key=f"review_{case_id}_{key_suffix}",
-                use_container_width=True,
-            ):
-                open_case(
-                    case_id,
-                    "Human Review",
-                )
+        with col_risk:
+            st.markdown(
+                f"""
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <div>{risk_pill}</div>
+                    <div><span class="status-badge status-{current_status}">{esc(status_disp)}</span></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        elif action_kind == "continue":
-
-            if st.button(
-                "Continue",
-                key=f"continue_{case_id}_{key_suffix}",
-                use_container_width=True,
-            ):
-                open_case(
-                    case_id,
-                    "Overview",
-                )
-
-        else:
-
-            if st.button(
-                "View Case",
-                key=f"view_{case_id}_{key_suffix}",
-                use_container_width=True,
-            ):
-                open_case(
-                    case_id,
-                    "Overview",
-                )
-
-    st.divider()
+        with col_action:
+            if action_kind == "start":
+                if st.button("Underwrite", key=f"underwrite_{case_id}_{key_suffix}", width="stretch", type="primary", disabled=st.session_state.underwriting_running):
+                    run_underwriting(case_id)
+            elif action_kind == "running":
+                st.button("Processing...", key=f"processing_{case_id}_{key_suffix}", width="stretch", disabled=True)
+            elif action_kind == "review":
+                if st.button("Review", key=f"review_{case_id}_{key_suffix}", width="stretch", type="primary"):
+                    open_case(case_id, "Human Review")
+            elif action_kind == "continue":
+                if st.button("Continue", key=f"continue_{case_id}_{key_suffix}", width="stretch"):
+                    open_case(case_id, "Overview")
+            else:
+                if st.button("View Case", key=f"view_{case_id}_{key_suffix}", width="stretch"):
+                    open_case(case_id, "Overview")
 
 
 # ============================================================

@@ -76,3 +76,34 @@ def metric_surface(label: str, value: Any, unit: str = "", help_text: str = "") 
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_dashboard_metric(
+    label: str,
+    value: Any,
+    icon: str,
+    accent_color: str = "#2563eb",
+    bg_color: str = "#eff6ff",
+    subtext: str = "",
+) -> None:
+    """Render an Enterprise HealthTech Light elevated metric card with top accent and category icon."""
+    sub_html = f'<div style="font-size: 11px; color: #64748b; margin-top: 5px;">{html.escape(subtext)}</div>' if subtext else ""
+    st.markdown(
+        f"""
+        <div class="elevated-metric-card" style="border-top: 3.5px solid {accent_color};">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                <span class="elevated-metric-label">
+                    {html.escape(label)}
+                </span>
+                <span class="metric-icon-badge" style="background: {bg_color}; width: 28px; height: 28px; font-size: 14px; margin-bottom: 0;">
+                    {icon}
+                </span>
+            </div>
+            <div class="elevated-metric-val">
+                {html.escape(str(value))}
+            </div>
+            {sub_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )

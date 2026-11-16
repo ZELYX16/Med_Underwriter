@@ -34,6 +34,136 @@ def inject_css() -> None:
             border-color: #cbd5e1;
         }
 
+        /* Elevated Metric Card */
+        .elevated-metric-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 16px 18px;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.03);
+            transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+            position: relative;
+            overflow: hidden;
+            min-height: 102px;
+        }
+
+        .elevated-metric-card:hover {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+            border-color: #cbd5e1;
+        }
+
+        .metric-icon-badge {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+
+        .elevated-metric-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #64748b;
+        }
+
+        .elevated-metric-val {
+            font-family: 'Roboto Mono', Menlo, Consolas, monospace;
+            font-size: 27px;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.15;
+            margin-top: 4px;
+        }
+
+        /* Case Card UI Elements */
+        [data-testid="stVerticalBlockBorderWrapper"] > div {
+            border-radius: 10px !important;
+            border-color: #e2e8f0 !important;
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.03) !important;
+            transition: all 0.15s ease !important;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"] > div:hover {
+            border-color: #cbd5e1 !important;
+            box-shadow: 0 4px 8px -1px rgba(0, 0, 0, 0.06), 0 2px 4px -2px rgba(0, 0, 0, 0.04) !important;
+        }
+
+        .case-id-pill {
+            font-family: 'Roboto Mono', Menlo, monospace;
+            font-size: 11px;
+            font-weight: 600;
+            background: #f1f5f9;
+            color: #334155;
+            padding: 2px 8px;
+            border-radius: 5px;
+            border: 1px solid #e2e8f0;
+            display: inline-block;
+        }
+
+        .product-chip {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            color: #475569;
+            font-size: 12px;
+            font-weight: 500;
+            border-radius: 6px;
+            padding: 2px 7px;
+            display: inline-block;
+        }
+
+        .risk-pill-low {
+            background: #ecfdf5;
+            border: 1px solid #a7f3d0;
+            color: #065f46;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+
+        .risk-pill-med {
+            background: #fffbeb;
+            border: 1px solid #fde68a;
+            color: #92400e;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+
+        .risk-pill-high {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #991b1b;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+
+        .risk-pill-none {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            color: #64748b;
+            font-size: 12px;
+            font-weight: 500;
+            padding: 2px 8px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+
+
         .elevated-surface-2 {
             background: #ffffff;
             border: 1px solid #e2e8f0;
@@ -131,27 +261,39 @@ def inject_css() -> None:
         }
 
         [data-testid="stSidebar"] {
-            background: #101b2d;
-            border-right: 1px solid #24334a;
+            background: #0f172a;
+            border-right: 1px solid #1e293b;
         }
 
         [data-testid="stSidebar"] * {
-            color: #d9e2ef;
+            color: #f1f5f9;
         }
 
         [data-testid="stSidebar"] .stButton > button {
             background: transparent;
             border: 1px solid transparent;
-            color: #c9d4e3;
+            color: #cbd5e1;
             text-align: left;
             justify-content: flex-start;
-            border-radius: 7px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 14px;
+            transition: all 0.15s ease;
         }
 
         [data-testid="stSidebar"] .stButton > button:hover {
-            background: #1c2b43;
-            border-color: #2d405f;
+            background: #1e293b;
+            border-color: #334155;
             color: #ffffff;
+        }
+
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+            background: #1e293b !important;
+            border: 1px solid #334155 !important;
+            border-left: 3.5px solid #3b82f6 !important;
+            color: #ffffff !important;
+            font-weight: 600 !important;
         }
 
         /* =========================================================

@@ -1,96 +1,137 @@
-# Modernizing MedUnderwriter Frontend: Enterprise Design System, Step Inspectors, Document Viewer & Workflow Graph Visualizer
+# Concepts Brief: MedUnderwriter Enterprise HealthTech Light Visual System & Runtime Hardening
 
-* **Author:** B_Karthikeyan
-* **Date:** 2026-11-16
+*   **Author:** B_Karthikeyan
+*   **Status:** Synthesized Brainstorm Brief
+*   **Date:** 2026-11-16
+*   **Target Branch:** `v5.2`
 
----
+--------------------------------------------------------------------------------
 
-## Overview
+## 1. Executive Summary
 
-MedUnderwriter currently runs a Streamlit-based underwriter desktop (`frontend/app.py`, ~5,300 lines of code) backed by a FastAPI orchestrator that executes a multi-agent LangGraph pipeline:
-`Intake -> Agent 1 (Submission Intelligence) -> Complexity Router -> Agent 2 (Risk & Actuarial Rating) -> Confidence Gate -> Agent 3 (Multi-Persona Reflection) -> Review Gate -> Finalize`.
+This concept hardens MedUnderwriter's Streamlit frontend (`frontend/styles.py`, `frontend/app.py`, `frontend/components/`) by resolving critical runtime defects and upgrading the UI to a modern **Enterprise HealthTech Light** design system.
 
-While the backend engine provides actuarial copula calculations, reverse pharmacotherapy cross-validation, and 4-tier routing, the frontend interface currently lacks:
-1. **Design System & Elevation:** Monolithic layout with flat `#f4f6f9` backgrounds, basic text blocks, unstyled borders, and uncalibrated visual hierarchy.
-2. **Intermediate Step Auditing:** Underwriters cannot verify exact intermediate outputs, rule criteria, or formula inputs at each step (e.g., PyMuPDF table extractions, copula synergy interaction terms, extra mortality percentages, reflection persona debate transcripts, review tier triggers) without digging through raw JSON payloads.
-3. **Uploaded Document Accessibility:** Underwriters cannot inspect the original uploaded PDFs, discharge summaries, or lab reports directly in the browser to verify extracted facts against the source documents.
-4. **Execution Path Traceability:** No visual representation of the path an application traveled through the LangGraph state machine, leaving underwriters unaware of why specific branches were chosen or bypassed.
+The initiative resolves three specific technical failure modes:
+1. `KeyError: slice(None, 15, None)` in `agent1_inspector.py` caused by unvalidated slicing of dictionary-formatted `structured_facts`.
+2. Mermaid flowchart parsing failures caused by unquoted edge labels containing parentheses `(78%)`, comparison operators (`<`, `>=`), and percentages.
+3. Streamlit 1.65+ deprecation warnings regarding `use_container_width=True` in favor of `width="stretch"`.
 
-This proposal modernizes the Streamlit user interface without rewriting it from scratch. It introduces a modern enterprise design system tokenized in CSS, dedicated read-only step verification modals (`@st.dialog`) with `@st.fragment` boundary isolation for each of the seven pipeline stages, an in-app interactive document viewer for uploaded files under the Intake stage, and an interactive execution graph visualizer rendering traversed nodes, bypassed branches, and exact edge conditions.
-
----
-
-## Analysis
-
-### 1. Multi-Lens Architectural Findings
-
-- **Contrarian / Complexity Minimization (`egm-zoom-out`):**
-  - Completely replacing Streamlit with React/Vue would discard thousands of working lines of underwriting verification and require writing separate REST serialization layers, authentication, and state synchronization.
-  - Modern Streamlit (version 1.34+) natively supports `@st.dialog` (isolated modal popups) and `@st.fragment` (isolated component reruns). Leveraging these native primitives achieves modal drill-downs without page-level rerun flickering.
-  - Native Mermaid diagram blocks (`st.markdown("```mermaid ...```")`) render clean flowchart graphs directly in the browser with zero additional JavaScript dependencies or heavy third-party packages.
-
-- **Frontend Rerun Economics & Latency (`egm-codebase-details`):**
-  - In Streamlit, user interactions (such as expanding an element or clicking a button) rerun the top-level script from line 1. `frontend/app.py` is 5,306 lines long; recalculating data or re-parsing multi-megabyte PDF chunks during button clicks introduces noticeable UI lag (>1.5s).
-  - *Remediation:*
-    1. Wrap all step verification modals and graph visualizers inside `@st.fragment` so modal interactions do not trigger parent script reruns.
-    2. Extract only targeted state slices for each inspector (e.g., passing strictly `copula_synergy_details`, `pricing_result`, and `medication_records` to Agent 2 inspector) rather than hydrating the entire multi-megabyte case dictionary.
-
-- **Document Viewing Architecture (`egm-design` & `egm-codebase-details`):**
-  - Uploaded case files are tracked in SQLite `applicant_documents` and stored on the filesystem. Currently, no endpoint streams these bytes to the frontend.
-  - *Remediation:* Add a lightweight FastAPI endpoint `GET /api/case/{case_id}/documents/{document_id}/content` returning `FileResponse(path, media_type="application/pdf")`. In Streamlit, render an embedded document viewer modal (`@st.dialog`) supporting PDF preview (via base64 iframe or PyMuPDF page images) and text fallback so underwriters can verify the physical document without downloading it to their local machine.
-
-- **Auditability & Explainable AI Governance (`egm-design` & `egm-comprehension`):**
-  - Underwriters spend 60–90 seconds per routine case. Exposing raw ASTs or unprocessed state dictionaries causes cognitive fatigue.
-  - Each step inspector modal must follow a standardized 3-tab progressive disclosure pattern:
-    1. **Summary Tab:** Clean cards displaying decision status, key inputs, and high-level outputs.
-    2. **Formula & Calculation Trace Tab:** Exact mathematical formulas and rule inputs (e.g., Copula synergy coefficient $\Phi = 1.45$, individual condition debits, IALM 2012–14 baseline mortality $q_x$, IRDAI statutory PED waiting period caps).
-    3. **Raw State Snapshot Tab:** Formatted, copyable, read-only JSON.
-
-- **System Contradiction & Inventive Resolutions (`egm-inventive-catalyst` / TRIZ):**
-  - *Contradiction:* Underwriters require exhaustive forensic auditability, but rendering complete historical state clutters the UI and slows rendering.
-  - *Resolution (TRIZ Principle 1 - Segmentation & Principle 2 - Extraction):* The primary case workspace remains elevated and compact. Granular forensic audits are segmented into dedicated `@st.dialog` modal inspectors that load intermediate state slices on demand.
-  - *Contradiction:* Dynamic visual graphs in Streamlit either require heavy third-party canvas libraries (`streamlit-agraph`) that break responsive themes or static Markdown diagrams that lack click callbacks.
-  - *Resolution (TRIZ Principle 10 - Prior Action & Combining):* Render a Mermaid graph highlighting traversed nodes and bypassed branches, paired directly with an adjacent grid of inspection buttons (`[🔎 Verify Step]`) mapped directly to the corresponding `@st.dialog` functions.
+In addition to bug fixes, the visual layer is upgraded from flat generic styling to a clinical-grade design system with elevated metric cards, category icons, interactive case cards with applicant avatars, and a refined navigation sidebar.
 
 ---
 
-## Goals vs. Non-Goals
+## 2. Technical Bug Fixes
 
-### In-Scope Goals
+### Bugfix 1: Robust Slicing & Normalization in `agent1_inspector.py`
+* **Problem**: In `agent1_inspector.py#L42`, `structured_facts = case.get("structured_facts") or enrichment.get("structured_facts") or []`. The backend frequently stores `structured_facts` as a dictionary mapping categories to lists or strings (e.g. `{"diagnoses": [...], "vitals": [...], "medications": [...]}`). Slicing `structured_facts[:15]` raises `KeyError: slice(None, 15, None)`.
+* **Remedy**: Implement dynamic data normalization:
+  ```python
+  if isinstance(structured_facts, dict):
+      display_facts = [
+          {"Category": k.replace("_", " ").title(), "Extracted Statement": str(v)}
+          for k, v in structured_facts.items()
+      ]
+  elif isinstance(structured_facts, list):
+      display_facts = [
+          item if isinstance(item, dict) else {"Extracted Statement": str(item)}
+          for item in structured_facts
+      ]
+  else:
+      display_facts = []
 
-1. **Enterprise Design System & Tokenized Styling (`frontend/styles.py` & `frontend/components/design_system.py`):**
-   - Modern typographic scale using Inter and Roboto Mono for numerical and financial figures.
-   - Three-level surface elevation (`--color-surface-elevated`, `--shadow-card`, `--shadow-elevated`).
-   - Semantic status badge system for review tiers (`Tier 0` to `Tier 3`), decisions (`Approved`, `Approved with Loading`, `Human Review`, `Declined`), and node execution states (`Completed`, `Active`, `Bypassed`).
-   - WCAG 2.1 AA accessible color contrast ratios.
+  if display_facts:
+      st.table(display_facts[:15])
+  ```
 
-2. **Dedicated Step Verification Modals (`@st.dialog`):**
-   - Provide dedicated audit buttons across all 7 pipeline steps:
-     1. **Intake Stage:** Applicant profile, KYC parameters, declared ailments, file manifest, and interactive document viewer trigger.
-     2. **Agent 1 (Intelligence):** PyMuPDF table structures, normalized lab analytes, evidence recency flags, declared vs. documented discrepancies.
-     3. **Complexity Router:** Multi-morbidity score breakdown, high-sum-insured threshold checks, and selected routing strategy.
-     4. **Agent 2 (Risk & Actuarial Engine):** Reverse pharmacotherapy verification, Copula synergy multiplier ($\Phi$), individual actuarial debits, IALM 2012–14 mortality baseline, and IRDAI 2024 PED waiting periods.
-     5. **Confidence Gate:** Bayesian confidence layer breakdown, score margin from review thresholds, and reflection depth trigger.
-     6. **Agent 3 (Reflection):** Persona debate records (Medical Director, Chief Actuary, Compliance Officer), constitutional compliance checks, and rescore mandates.
-     7. **Review Gate:** 4-Tier classification logic, mandatory review triggers, and escalation reason codes.
-   - All modals operate in strictly read-only mode to prevent uncommitted state mutation.
+### Bugfix 2: Mermaid Grammar Quote Encapsulation in `graph_visualizer.py`
+* **Problem**: Mermaid syntax treats raw parentheses `(...)` and comparison operators inside edge pipe delimiters (`-->|text|`) as syntax errors.
+* **Remedy**: Wrap all edge annotations in double quotes `-->|"..."|`:
+  ```python
+  if is_ag3_traversed:
+      lines.append(f'    N_CONF -->|"Low Confidence < 0.70 ({conf_pct})"| N_AG3')
+      lines.append('    N_AG3 -->|"Consensus Reached"| N_GATE')
+      if rescore_edge:
+          lines.append(f'    N_AG3 -.->|"Rescore Loop (Round {rescore_round})"| N_AG2')
+  else:
+      lines.append(f'    N_CONF -.->|"High Confidence >= 0.70 ({conf_pct})"| N_GATE')
+      lines.append('    N_CONF -.->|"Bypassed Reflection"| N_AG3')
 
-3. **Uploaded Document Viewer:**
-   - Listing of all uploaded files associated with the case under the Intake stage and Evidence workspace.
-   - Interactive document viewer modal (`@st.dialog`) displaying PDF pages, scanned reports, and OCR text side-by-side with extracted clinical attributes.
-   - Backend endpoint `GET /api/case/{case_id}/documents/{document_id}/content` delivering file bytes safely via FastAPI `FileResponse`.
+  if is_stp_traversed:
+      lines.append('    N_GATE -->|"Tier 0 (Risk < 40)"| N_STP')
+      lines.append('    N_GATE -.->|"Bypassed Review"| N_REVIEW')
+  elif is_declined_traversed:
+      lines.append('    N_GATE -->|"Critical Risk / Fraud"| N_DECLINED')
+  else:
+      lines.append(f'    N_GATE -->|"Escalated (Risk {risk_disp} >= 70)"| N_REVIEW')
+      lines.append('    N_GATE -.->|"Bypassed Auto-Approve"| N_STP')
+  ```
 
-4. **Interactive Workflow Graph Visualizer (`frontend/components/graph_visualizer.py`):**
-   - Render a high-fidelity Mermaid execution graph generated dynamically from `case["workflow_trace"]`.
-   - Visually distinguish traversed nodes (solid border, elevated fill), bypassed branches (dashed border, muted gray), active nodes (pulsing green/amber), and decision gates (hexagonal/diamond yellow).
-   - Display node latency, execution timestamps, and exact Boolean edge conditions (e.g., `Confidence < 0.70 => Route to Agent 3`).
+### Bugfix 3: Streamlit 1.65+ Parameter Standardization
+* **Problem**: Streamlit 1.65+ deprecates `use_container_width=True` on buttons, tables, and metrics.
+* **Remedy**: Replace `use_container_width=True` with `width="stretch"` across `frontend/components/graph_visualizer.py`, `frontend/components/inspectors/`, and `frontend/app.py`.
 
-5. **Component Modularization & Performance:**
-   - De-monolithize `frontend/app.py` by organizing inspectors into `frontend/components/inspectors/`.
-   - Protect modal interactions using `@st.fragment` to prevent full page script reruns.
+---
 
-### Out-of-Scope Non-Goals
+## 3. UI/UX Design System: Enterprise HealthTech Light
 
-1. **Complete Single-Page App Framework Rewrite:** No migration to React, Next.js, or Angular; the solution remains fully within Python and Streamlit.
-2. **Interactive Intermediate State Mutation:** Underwriters cannot edit intermediate calculations (e.g. manually tampering with Copula debits or changing extracted lab values inside the modal); manual overrides remain strictly reserved for the final human review action bar.
-3. **Database Migration:** No modifications to SQLite checkpoint storage or schema models.
+### Surface Hierarchy & Color Palette
+* **Canvas (`Surface 0`)**: Light clinical slate `#f8fafc`.
+* **Elevated Cards (`Surface 1`)**: `#ffffff` with 1px border `#e2e8f0` and multi-layered soft drop shadows (`box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 6px -1px rgba(0,0,0,0.03)`).
+* **Modal / Inspector Drawers (`Surface 2`)**: `#ffffff` with frosted backdrop and deep elevation (`box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1)`).
+* **Color Accents**:
+  - Medical Teal (`#0891b2`) and Actuarial Cobalt (`#2563eb`) for primary interactions and active tabs.
+  - Emerald (`#10b981`) for Tier 0 (Straight-Through Processing).
+  - Amber (`#f59e0b`) for Tier 2 (Comprehensive Review) and Pending queue.
+  - Crimson (`#ef4444`) for Tier 3 (CMO Escalation) and Declined states.
+
+### Component Revamp Specifications
+
+#### 1. Elevated Metric Cards (`frontend/components/design_system.py`)
+Replace flat counters with rich metric cards featuring:
+- Category icon badge (e.g., 📁 Total, ⏳ Pending, ⚙️ In Progress, 👤 Review, ✅ Completed).
+- Color-coded top or left accent borders.
+- Monospaced typography for large numeric values (`Roboto Mono`).
+- Subtitle or delta context indicators.
+
+#### 2. Interactive Case Cards (`frontend/components/design_system.py` & `frontend/app.py`)
+Replace flat tabular rows in `render_case_row` with elevated card containers:
+- Left: Applicant Avatar / Initials circle + Name + Application ID.
+- Middle: Product badge + Sum Insured (formatted currency) + Risk score pill.
+- Right: WCAG 2.1 AA Tier Status Chip + High-contrast "Underwrite / Open Case" action button.
+- Micro-interaction: Subtle hover elevation (`translateY(-2px)`).
+
+#### 3. Modern Navigation Sidebar (`frontend/styles.py`)
+- Clean deep slate navigation (`#0f172a`) with subtle border separator.
+- Active item indicator with 3px accent bar (`#3b82f6`) and high-contrast text.
+- Clean category grouping ("WORKSPACE", "OPERATIONS").
+
+---
+
+## 4. Multi-Lens Goldfish Review Summary
+
+| Lens | Assessment | Recommendation |
+| :--- | :--- | :--- |
+| **UX & Ergonomics** | Current dashboard lacks visual depth and clear status hierarchy. | Implement elevated cards with category icons, micro-shadows, and distinct status color coding. |
+| **Codebase Details** | Slicing dictionaries causes immediate crash; Mermaid requires quotes around parentheses. | Normalize `structured_facts` dynamically and quote all Mermaid edge labels. |
+| **Skeptical Architect** | Heavy custom HTML in loops could slow down Streamlit rendering on large case sets. | Keep component HTML lightweight and paginate case lists (8-12 per page). |
+| **Comprehension** | Underwriters must grasp risk level and pending actions within 2 seconds. | Use semantic color mapping (green STP, blue Fast-Track, amber Review, red Escalation). |
+| **Implementation** | Fixes are well-scoped across 5 files: `styles.py`, `design_system.py`, `graph_visualizer.py`, `agent1_inspector.py`, `app.py`. | Proceed directly to targeted implementation and unit testing. |
+| **Structural** | Reusable card components should be centralized in `design_system.py`. | Cleanly export all new primitives via `frontend/components/__init__.py`. |
+| **Inventive Catalyst** | Solves the conflict between high data density and clean modern aesthetics. | Leverage two-layer progressive disclosure: summary card $\to$ modal drill-down inspector. |
+
+---
+
+## 5. Implementation Roadmap
+
+1. **Step 1: Runtime Bug Fixes**:
+   - Patch `frontend/components/inspectors/agent1_inspector.py` (dictionary normalization).
+   - Patch `frontend/components/graph_visualizer.py` (quote Mermaid labels + `width="stretch"`).
+2. **Step 2: CSS & Design System Upgrade**:
+   - Update `frontend/styles.py` with Enterprise HealthTech Light tokens, metric card styles, and sidebar styling.
+   - Add `elevated_metric_card` and `render_case_card` in `frontend/components/design_system.py`.
+3. **Step 3: Dashboard & Workspace Modernization**:
+   - Update `render_dashboard_metrics` and `render_case_row` in `frontend/app.py` to use modern elevated cards.
+4. **Step 4: Verification & Automated Tests**:
+   - Run `test_graph_visualizer.py` and `test_document_content_api.py`.
+   - Verify Streamlit startup without warnings or runtime errors.
+   - Commit locally on branch `v5.2`.

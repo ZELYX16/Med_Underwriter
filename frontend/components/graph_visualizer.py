@@ -54,9 +54,9 @@ def generate_mermaid_graph(case: dict[str, Any]) -> str:
 
     # Rescore handling
     rescore_round = int(case.get("reflection_round") or (agent2_count - 1 if agent2_count > 1 else 0))
-    rescore_edge = f"N_AG3 -.->|Rescore Loop (Round {rescore_round})| N_AG2\n" if rescore_round > 0 else ""
+    rescore_edge = f'N_AG3 -.->|"Rescore Loop (Round {rescore_round})"| N_AG2\n' if rescore_round > 0 else ""
 
-    # Sanitize edge condition text (avoiding <, >, & raw HTML breakages)
+    # Sanitize edge condition text (avoiding raw < or > breakages, wrapping labels in quotes)
     conf_pct = f"{confidence * 100:.0f}%"
     risk_disp = f"{overall_risk:.1f}"
 
@@ -75,27 +75,27 @@ def generate_mermaid_graph(case: dict[str, Any]) -> str:
         "",
         "    N_INTAKE --> N_AG1",
         "    N_AG1 --> N_ROUTER",
-        f"    N_ROUTER -->|Complexity Triage| N_AG2",
+        '    N_ROUTER -->|"Complexity Triage"| N_AG2',
         "    N_AG2 --> N_CONF",
     ]
 
     if is_ag3_traversed:
-        lines.append(f"    N_CONF -->|Low Confidence &lt; 0.70 ({conf_pct})| N_AG3")
-        lines.append("    N_AG3 -->|Consensus Reached| N_GATE")
+        lines.append(f'    N_CONF -->|"Low Confidence &lt; 0.70 ({conf_pct})"| N_AG3')
+        lines.append('    N_AG3 -->|"Consensus Reached"| N_GATE')
         if rescore_edge:
             lines.append(f"    {rescore_edge.strip()}")
     else:
-        lines.append(f"    N_CONF -.->|High Confidence &gt;= 0.70 ({conf_pct})| N_GATE")
-        lines.append("    N_CONF -.->|Bypassed Reflection| N_AG3")
+        lines.append(f'    N_CONF -.->|"High Confidence &gt;= 0.70 ({conf_pct})"| N_GATE')
+        lines.append('    N_CONF -.->|"Bypassed Reflection"| N_AG3')
 
     if is_stp_traversed:
-        lines.append(f"    N_GATE -->|Tier 0 (Risk &lt; 40)| N_STP")
-        lines.append(f"    N_GATE -.->|Bypassed Review| N_REVIEW")
+        lines.append(f'    N_GATE -->|"Tier 0 (Risk &lt; 40)"| N_STP')
+        lines.append(f'    N_GATE -.->|"Bypassed Review"| N_REVIEW')
     elif is_declined_traversed:
-        lines.append(f"    N_GATE -->|Critical Risk / Fraud| N_DECLINED")
+        lines.append(f'    N_GATE -->|"Critical Risk / Fraud"| N_DECLINED')
     else:
-        lines.append(f"    N_GATE -->|Escalated (Risk {risk_disp} &gt;= 70)| N_REVIEW")
-        lines.append(f"    N_GATE -.->|Bypassed Auto-Approve| N_STP")
+        lines.append(f'    N_GATE -->|"Escalated (Risk {risk_disp} &gt;= 70)"| N_REVIEW')
+        lines.append(f'    N_GATE -.->|"Bypassed Auto-Approve"| N_STP')
 
     # Add classDef styles
     lines.extend([
@@ -135,23 +135,23 @@ def render_workflow_visualizer(case: dict[str, Any]) -> None:
     # Render pill buttons
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     with c1:
-        if st.button("01. Intake", use_container_width=True, key="pill_intake", help="Verify demographics & files"):
+        if st.button("01. Intake", width="stretch", key="pill_intake", help="Verify demographics & files"):
             open_intake_inspector(case)
     with c2:
-        if st.button("02. Agent 1", use_container_width=True, key="pill_ag1", help="Verify extraction & lab normalization"):
+        if st.button("02. Agent 1", width="stretch", key="pill_ag1", help="Verify extraction & lab normalization"):
             open_agent1_inspector(case)
     with c3:
-        if st.button("03. Router", use_container_width=True, key="pill_router", help="Verify triage & complexity classification"):
+        if st.button("03. Router", width="stretch", key="pill_router", help="Verify triage & complexity classification"):
             open_router_inspector(case)
     with c4:
-        if st.button("04. Agent 2", use_container_width=True, key="pill_ag2", help="Verify Copula synergies & actuarial rating"):
+        if st.button("04. Agent 2", width="stretch", key="pill_ag2", help="Verify Copula synergies & actuarial rating"):
             open_agent2_inspector(case)
     with c5:
-        if st.button("05. Conf Gate", use_container_width=True, key="pill_conf", help="Verify confidence scoring & reflection triggers"):
+        if st.button("05. Conf Gate", width="stretch", key="pill_conf", help="Verify confidence scoring & reflection triggers"):
             open_confidence_gate_inspector(case)
     with c6:
-        if st.button("06. Agent 3", use_container_width=True, key="pill_ag3", help="Verify multi-agent adversarial debate"):
+        if st.button("06. Agent 3", width="stretch", key="pill_ag3", help="Verify multi-agent adversarial debate"):
             open_agent3_inspector(case)
     with c7:
-        if st.button("07. Review Gate", use_container_width=True, key="pill_gate", help="Verify 4-tier calibration & escalation rules"):
+        if st.button("07. Review Gate", width="stretch", key="pill_gate", help="Verify 4-tier calibration & escalation rules"):
             open_review_gate_inspector(case)

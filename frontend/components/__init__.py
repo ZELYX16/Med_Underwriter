@@ -7,6 +7,7 @@ from .design_system import (
     elevated_card,
     formula_callout,
     metric_surface,
+    render_dashboard_metric,
 )
 from .document_viewer import (
     open_document_viewer_dialog,
