@@ -302,26 +302,60 @@ class LabAnalyteRecord(BaseModel):
 *   **Proposed Changes**:
     *   Define Pydantic v2 models: `FamilyMemberRelation`, `FamilyHistoryRecord`, `OccupationHazardClass`, `OccupationHazardRecord`, `MedicationVerificationItem`, `PEDWaitingPeriod`, and `LabAnalyteRecord`.
     *   Update `UnderwritingState` TypedDict to include optional channels: `family_medical_history`, `occupation_profile`, `medication_records`, `ped_waiting_periods`, `lab_analyte_records`, `copula_synergy_details`, and `review_tier`.
-*   **Rationale**: Establishes strong typing across pipeline nodes and eliminates silent key-dropping in LangGraph channels.
+    *   *Serialization Contract*: Pydantic v2 schemas are used strictly at domain service boundaries. `UnderwritingState` channels store primitive serialized dictionaries (`list[dict[str, Any]]`) via `.model_dump()`, guaranteeing zero `TypeError` serialization failures in SQLite checkpointers (`AsyncSqliteSaver`) and preserving dictionary subscripting (`item.get(...)`) across existing nodes.
+*   **Rationale**: Establishes strong typing across pipeline nodes while preventing SQLite checkpointer crashes.
 
 #### 2. `backend/app/data/ialm_mortality_table.json` (Create)
 *   **Type / Scope**: Actuarial Reference Data.
 *   **Proposed Changes**:
     *   Create single-year biological age baseline mortality rate lookup table for ages 18–75 for males and females referencing Indian Assured Lives Mortality (IALM 2012–14 Ultimate) $q_x$ values.
+    *   *Canonical Schema*:
+        ```json
+        {
+          "metadata": {"source": "IALM 2012-14 Ultimate", "base_currency": "INR"},
+          "male": {"18": 0.000889, "19": 0.000912, "75": 0.038450},
+          "female": {"18": 0.000750, "19": 0.000768, "75": 0.032120}
+        }
+        ```
+    *   *Boundary Handling*: Ages $<18$ clamp to age 18 rate with mandatory juvenile rider flag; ages $>75$ automatically route to Tier 3 Senior Escalation / Decline.
 *   **Rationale**: Replaces the flat 3% base rate with real-world actuarial mortality baselines.
 
 #### 3. `backend/app/data/medication_inference_map.json` (Create)
 *   **Type / Scope**: Pharmacotherapy Knowledge Graph.
 *   **Proposed Changes**:
     *   Map standard prescription drugs to ICD-10 clinical pathologies.
-    *   Mark single-indication critical therapies (e.g., Insulin $\rightarrow$ T2D, Clopidogrel $\rightarrow$ CAD, Methotrexate $\rightarrow$ RA) as `context_required: false`.
-    *   Mark multi-indication maintenance therapies (e.g., Metformin $\rightarrow$ PCOS/T2D, Aspirin $\rightarrow$ Prophylaxis/CAD) as `context_required: true`.
+    *   *Canonical Schema*:
+        ```json
+        {
+          "metformin": {
+            "icd10_code": "E11",
+            "clinical_group": "diabetes_type2",
+            "context_required": true,
+            "context_exceptions": ["pcos", "prediabetes"],
+            "discrepancy_weight": 10
+          },
+          "clopidogrel": {
+            "icd10_code": "I25",
+            "clinical_group": "cad_ischemic",
+            "context_required": false,
+            "context_exceptions": [],
+            "discrepancy_weight": 45
+          },
+          "insulin": {
+            "icd10_code": "E11",
+            "clinical_group": "diabetes_type2",
+            "context_required": false,
+            "context_exceptions": [],
+            "discrepancy_weight": 45
+          }
+        }
+        ```
 *   **Rationale**: Enables reverse pathology inference while preventing false-positive fraud spikes on multi-indication drugs.
 
 #### 4. `backend/app/services/reverse_pharmacotherapy.py` (Create)
 *   **Type / Scope**: Clinical Triage Service.
 *   **Proposed Changes**:
-    *   Implement `verify_medications(prescriptions, declared_conditions, applicant_sex)`: cross-references active drugs against declarations.
+    *   Implement `verify_medications(prescriptions: list[dict[str, Any]], declared_conditions: list[str], applicant_sex: str) -> list[dict[str, Any]]`: cross-references active drugs against declarations.
     *   Differentiates confirmed undisclosed conditions from contextual maintenance drugs requiring Tier 1 micro-verification.
 *   **Rationale**: Automates drug-to-disease reverse inference without relying on brittle regex patterns.
 
@@ -332,6 +366,9 @@ class LabAnalyteRecord(BaseModel):
         *   Metabolic Syndrome Triad ($\text{T2D} + \text{HTN} + \text{BMI} \ge 30$): $\Phi_{\text{metabolic}} = 1.45$.
         *   Cardiorenal Syndrome ($\text{CAD/CHF} + \text{CKD}$): $\Phi_{\text{cardiorenal}} = 2.10$.
         *   Respiratory Multimorbidity ($\text{COPD} + \text{Asthma} + \text{Smoker}$): $\Phi_{\text{respiratory}} = 1.75$.
+    *   *Scale Separation*: Maintain two distinct channels:
+        *   `extra_mortality_percentage` / `actuarial_debits`: Unbounded actuarial multiplier ($EM = 100 + \sum D_i \times \Phi(\mathbf{C}) + \sum \Delta_{\text{synergy}}$) used strictly for premium loading.
+        *   `medical_risk_score` / `overall_risk_score`: Calibrated $0–100$ scale calculated as $\text{medical\_risk\_score} = \min(100.0, \text{debits} \times 0.5)$, ensuring standard copula calculations do not trip legacy $80.0/70.0$ review thresholds inappropriately.
     *   Implement `calculate_actuarial_premium(sum_insured, age, sex, term_years, extra_mortality_percentage)` referencing `ialm_mortality_table.json`.
     *   Implement `generate_ped_waiting_periods(conditions)` applying IRDAI 2024 rules (maximum 36-month statutory waiting period).
 *   **Rationale**: Replaces linear point scoring and flat pricing with real-world actuarial copula calculations.
@@ -341,20 +378,23 @@ class LabAnalyteRecord(BaseModel):
 *   **Proposed Changes**:
     *   Implement `extract_tables_fitz(doc)` utilizing PyMuPDF `Page.find_tables()` to parse diagnostic lab panels in $<15\text{ms}$.
     *   Implement `extract_unstructured_clinical_notes_llm(page_text)` for non-tabular narrative pages (discharge summaries, physician notes) with JSON schema constraints.
-    *   Implement a 10-second timeout guard: upon timeout, attaches `fallback_reason` and tags case for Tier 1 review.
+    *   *Thread-Safe Execution*: Wrap LLM call using `concurrent.futures.ThreadPoolExecutor` with a 10s timeout, executing a single batch prompt across all narrative text to preserve `cost_guard` budget. Upon timeout, attaches `fallback_reason` and tags case for Tier 1 review.
 *   **Rationale**: Eliminates regex fragility on multi-column tables while ensuring resilient fallback.
 
 #### 7. `backend/app/agents/agent2_risk.py` (Modify)
 *   **Type / Scope**: Risk Assessment Agent.
 *   **Proposed Changes**:
-    *   Refactor `_calculate_risk` and `_calculate_pricing` to delegate to `services/medical_synergy.py` and `services/reverse_pharmacotherapy.py`.
+    *   *Execution Order*: In `RiskAssessmentAgent.run()`:
+        1. Invoke `reverse_pharmacotherapy.verify_medications(prescriptions, declared_conditions, sex)` at step 1.
+        2. Attach `verified_medications` to `features` *before* invoking `assess_fraud()`.
+        3. Delegate `_calculate_risk()` and `_calculate_pricing()` to `medical_synergy.py`.
     *   Populate `copula_synergy_details`, `ped_waiting_periods`, and loaded premiums.
-*   **Rationale**: Transitions Agent 2 from heuristic additive scoring to the Numerical Rating System.
+*   **Rationale**: Transitions Agent 2 from heuristic additive scoring to the Numerical Rating System with correct dependency sequencing.
 
 #### 8. `backend/app/agents/fraud.py` (Modify)
 *   **Type / Scope**: Discrepancy & Fraud Engine.
 *   **Proposed Changes**:
-    *   Update discrepancy scoring to consume context-aware medication verification results from `reverse_pharmacotherapy.py`.
+    *   Update discrepancy scoring to consume context-aware medication verification results from `features["verified_medications"]`.
     *   Assign high discrepancy ($+45$) to critical single-indication undisclosed drugs, but low discrepancy ($+10$) to contextual drugs.
 *   **Rationale**: Prevents false fraud escalations for benign off-label prescriptions.
 
@@ -362,7 +402,7 @@ class LabAnalyteRecord(BaseModel):
 *   **Type / Scope**: Agent 3 Multi-Agent Reflection (MAR).
 *   **Proposed Changes**:
     *   Update system prompts to enforce forward adversarial falsification tests against raw source facts rather than post-hoc score justifications.
-    *   Restrain personas from modifying mathematical risk scores; any verified contradiction emits an `advisory_finding` adjusting review tier.
+    *   *Advisory Finding Schema*: Emits `{"finding": str, "source": str, "severity": "escalation" | "caution", "tier_override": "tier_2" | "tier_3" | None}`.
 *   **Rationale**: Eliminates LLM post-hoc rationalization.
 
 #### 10. `backend/app/services/review_gate.py` (Modify)
@@ -373,13 +413,24 @@ class LabAnalyteRecord(BaseModel):
         *   `Tier 1`: Fast-Track Micro-Verification.
         *   `Tier 2`: Standard Underwriter Review.
         *   `Tier 3`: Senior Escalation / CMO Dual-Sign.
-*   **Rationale**: Replaces binary review tripwires with calibrated 4-tier routing, eliminating queue choking.
+    *   *Backward Compatibility*: Retain `review_level` as an alias alongside `review_tier` (`Tier 0` $\rightarrow$ `"straight_through"`, `Tier 1` $\rightarrow$ `"assisted_review"`, `Tiers 2-3` $\rightarrow$ `"full_review"`), and retain `requires_human_review: bool` (`False` for Tier 0, `True` for Tiers 1–3).
+    *   Inspect `state["reflection_findings"]` to apply any `tier_override`.
+*   **Rationale**: Replaces binary review tripwires with calibrated 4-tier routing, eliminating queue choking while preserving test compatibility.
 
 #### 11. `backend/app/orchestrator/graph.py` (Modify)
 *   **Type / Scope**: LangGraph Workflow Graph.
 *   **Proposed Changes**:
-    *   Update conditional edge routing to branch across Tiers 0, 1, 2, and 3.
-    *   Direct Tier 0 cases directly to `finalize` and policy schedule emission.
+    *   *Routing Edge Map*: Define explicit conditional edge dictionary:
+        ```python
+        {
+            "tier_0": "finalize",
+            "tier_1": "human_review",
+            "tier_2": "human_review",
+            "tier_3": "human_review",
+            "rescore": "agent2_risk",
+        }
+        ```
+    *   `human_review_node` mutates `state["human_review_status"]` and `state["decision_level"]` based on `state["review_tier"]`.
 *   **Rationale**: Enforces automated straight-through processing at the orchestration layer.
 
 #### 12. `frontend/live_intake.py` (Modify)
@@ -387,6 +438,7 @@ class LabAnalyteRecord(BaseModel):
 *   **Proposed Changes**:
     *   Add collapsible form section for **Family Medical History** (first-degree relative, condition, age of onset).
     *   Add dropdown for **Occupation** mapped to ISCO-08 hazard classes.
+    *   Register default session keys (`family_history: []`, `occupation: "desk"`) in `backend/app/services/sessions.py` to prevent Streamlit reload flickers.
 *   **Rationale**: Collects missing real-world underwriting inputs from applicants.
 
 #### 13. `backend/tests/test_enterprise_engine.py` (Create)
@@ -397,6 +449,13 @@ class LabAnalyteRecord(BaseModel):
     *   Test reverse pharmacotherapy: verify Metformin with declared PCOS avoids fraud penalty; verify Clopidogrel triggers critical escalation.
     *   Test calibrated 4-tier routing: clean applicant reaches Tier 0 STP; minor gap routes to Tier 1; multi-morbid routes to Tier 2; severe pathology routes to Tier 3.
 *   **Rationale**: Guarantees test verification and regression safety.
+
+#### 14. `backend/app/services/intake.py` (Modify)
+*   **Type / Scope**: Intake Translation & Validation Service.
+*   **Proposed Changes**:
+    *   Update `to_profile_submission()` and `case_from_session()` to extract `family_history` and `occupation` from `form` and assign them to `applicant_profile` and `submission`.
+    *   Update `open_items()` to validate family history and occupation inputs without blocking clean applicants.
+*   **Rationale**: Prevents submitted UI fields from being silently dropped before LangGraph initializes.
 
 ---
 
